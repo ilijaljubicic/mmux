@@ -1,6 +1,7 @@
 use clap::Parser;
 use mmux_microsandbox_node::{
-    launch, logs, resume, snapshot, snapshot_export, snapshot_import, status, stop, Cli, Command,
+    launch, logs, prepare, resume, snapshot, snapshot_export, snapshot_import, status, stop, Cli,
+    Command,
 };
 use std::process::ExitCode;
 
@@ -8,6 +9,9 @@ use std::process::ExitCode;
 async fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
+        Command::Prepare(args) => prepare(args).await.map(|report| {
+            println!("{}", serde_json::to_string_pretty(&report).unwrap());
+        }),
         Command::Launch(args) => launch(args).await.map(|report| {
             println!("{}", serde_json::to_string_pretty(&report).unwrap());
         }),

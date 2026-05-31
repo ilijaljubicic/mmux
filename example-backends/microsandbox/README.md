@@ -3,13 +3,15 @@
 This directory contains the example config and Make targets for running an
 `mmux node` inside Microsandbox.
 
-The host builds and runs the `mmux-microsandbox-node` launcher crate. That
-launcher creates or resumes a Microsandbox instance, injects the node config
-and configured assets, then starts `mmux node` inside the guest.
+The host builds and runs the `mmux-microsandbox-node` launcher crate. In
+prepare mode, the launcher creates a Microsandbox instance, injects the node
+config and configured assets, runs setup scripts, and finishes without node
+registration. In runtime launch mode, it starts `mmux node` inside an already
+prepared guest.
 
 For first-time setup from a stock image, the guest installs `mmux` from source
 using the `[microsandbox.assets]` `mmux_source` entry in
-`mmux-setup.toml`:
+`microsandbox-setup.toml`:
 
 ```toml
 mmux_source = { repo = "https://github.com/ilijaljubicic/mmux.git", ref = "v0.1.0" }
@@ -20,11 +22,11 @@ reproducible sandbox launches. If you point the ref at a private repository,
 the sandbox needs credentials that can fetch it.
 
 To avoid installer network access at launch time, use either a prepared
-snapshot or a prepared Docker/OCI image. Bundle launches skip setup scripts and
-rootfs patches, so the prepared sandbox must already contain the installed
-mmux binary, node config, and guest toolchain state. Image launches with
-`mmux-image.toml.example` also skip setup scripts by config, so the image must
-already contain `tmux`, `mmux`, and the coder CLIs you plan to use.
+snapshot or a prepared Docker/OCI image. Bundle launches skip setup scripts,
+so the prepared sandbox must already contain the installed mmux binary and
+guest toolchain state. The runtime config is still copied into the guest before
+`mmux node` starts. Image launches use the same `mmux.toml`; set
+`[sandbox.runtime].image` to the prepared image.
 
 ## Layout
 
@@ -38,31 +40,14 @@ mmux_sources/
     10_devtools.sh
     20_toolchains.sh
     25_install_mmux.sh
-
-profile_sources/
-  codex/
-    assets/
-    scripts/
-      00_install.sh
-  opencode/
-    assets/
-    scripts/
-      00_install.sh
-  kimi/
-    assets/
-    scripts/
-      00_install.sh
-  claude/
-    assets/
-    scripts/
-      00_install.sh
+    30_install_codex.sh
+    31_install_opencode.sh
+    32_install_kimi.sh
+    33_install_claude.sh
 ```
 
-`mmux_sources/scripts` contains the shared sandbox setup. The profile-specific
-`profile_sources/<name>/scripts` directories contain the per-coder install
-steps, so `codex`, `opencode`, `kimi`, and `claude` can be prepared
-independently. The backend registers every script and runs them in alphabetical
-order, first the shared scripts and then the profile-specific ones.
+`mmux_sources/scripts` contains the sandbox setup. The backend registers every
+script from that directory and runs them in alphabetical order.
 
 `mmux_sources/assets/tmux.conf` is copied into `/mmux/tmux.conf` and sourced
 from `/etc/tmux.conf`, so a root SSH shell inside the sandbox picks up the same
@@ -78,12 +63,20 @@ rooted at `/mmux/tmux.conf`.
 Choose one launch path:
 
 ```bash
-# First-time preparation from a stock image. This temporarily allows DNS plus
-# public HTTP/HTTPS so apt/curl/git/npm/cargo installers can run.
-export MMUX_TOKEN="...controller bearer token..."
+# First-time preparation from a stock image. make prepare uses open setup
+# egress by default so apt/curl/git/npm/cargo installers can run. It does not
+# start mmux node and does not need the controller token.
 cd /mnt/Radni/aitools/mmux/example-backends/microsandbox
 make build
-make launch NODE_CONFIG="mmux-setup.toml"
+make prepare NODE_CONFIG="microsandbox-setup.toml"
+make bundle-export SANDBOX=mmux-node SNAPSHOT_NAME=mmux-node-seed BUNDLE=.artifacts/mmux-node-seed.tar.zst
+```
+
+```bash
+# Runtime from the prepared bundle. This is the step that starts mmux node and
+# registers it with the controller.
+export MMUX_TOKEN="...controller bearer token..."
+make bundle-launch BUNDLE=.artifacts/mmux-node-seed.tar.zst NODE_CONFIG="mmux.toml"
 ```
 
 ```bash
@@ -92,9 +85,8 @@ make launch NODE_CONFIG="mmux-setup.toml"
 export MMUX_TOKEN="...controller bearer token..."
 cd /mnt/Radni/aitools/mmux/example-backends/microsandbox
 make build
-cp mmux-image.toml.example mmux-image.toml
-# Edit [microsandbox.runtime].image in mmux-image.toml.
-make launch NODE_CONFIG="mmux-image.toml"
+# Edit [sandbox.runtime].image in mmux.toml.
+make launch NODE_CONFIG="mmux.toml"
 ```
 
 The default `CONTROLLER_URL` is
@@ -104,18 +96,17 @@ that alias, the launcher automatically allows exactly the URL's host TCP port
 for controller communication. The controller token secret is scoped to
 `allowed_host = "host.microsandbox.internal"`.
 
-The runtime `mmux.toml` denies egress and ingress by default. A fresh source
-install from GitHub or profile installer scripts that call external services
-need temporary egress during preparation. Use `mmux-setup.toml` for
-that preparation launch, export a prepared snapshot, then relaunch from the
-snapshot with `mmux.toml` for controller-only runtime access.
+The runtime `mmux.toml` denies egress and ingress by default. First-time source
+and profile installation needs installer network access, so `make prepare
+NODE_CONFIG="microsandbox-setup.toml"` uses open setup egress by default. Export a
+prepared snapshot, then relaunch from the snapshot with `mmux.toml` for
+controller-only runtime access.
 
-If you use a prepared Docker/OCI image instead, use
-`mmux-image.toml.example` as the template for a real image config. Set
-`[microsandbox.runtime].image` to the prepared image. That config deliberately
-omits shared setup scripts and per-profile launch scripts, so launch only
-copies static config/assets, auto-allows the controller URL, and starts
-`mmux node`. Installer network access is not opened at launch time.
+If you use a prepared Docker/OCI image instead, set `[sandbox.runtime].image`
+in `mmux.toml` to that image. The runtime config deliberately omits setup
+scripts, so launch only applies runtime policy, writes the selected node config
+into the guest, auto-allows the controller URL, and starts `mmux node`.
+Installer network access is not opened at launch time.
 
 To capture and export it as a bundle:
 
@@ -136,46 +127,35 @@ make bundle-launch BUNDLE=.artifacts/mmux-node-seed.tar.zst NODE_CONFIG="mmux.to
 ## Node config
 
 `mmux.toml` owns the controller-only runtime config for prepared sandboxes.
-`mmux-setup.toml` extends that shape with shared setup and per-profile
-launch scripts for first-time preparation. `mmux-image.toml.example` omits
-setup scripts and expects a prepared Docker/OCI image. None of these files
-should restate built-in coder profile fields unless you intentionally want to
-replace them:
+`microsandbox-setup.toml` owns first-time preparation from a stock image. It
+adds shared setup scripts plus `mmux_source`; `make prepare` provides open
+setup egress by default. It does not include controller secrets and does not
+start `mmux node`. `mmux.toml` is also used for prepared Docker/OCI images by
+setting `[sandbox.runtime].image`. None of these files should restate built-in
+coder profile fields unless you intentionally want to replace them:
+
+Runtime, network, secret bindings, volumes, and mounts use the backend-agnostic
+`[sandbox.*]` namespace. Microsandbox-only setup assets and patches stay under
+`[microsandbox.*]`.
 
 ```toml
 [microsandbox.runtime]
-memory_mib = 1024
-cpus = 2
+image = "debian:bookworm-slim"
+# memory_mib = 1024
+# cpus = 2
 
 [microsandbox.assets]
 mmux_source = { repo = "https://github.com/ilijaljubicic/mmux.git", ref = "v0.1.0" }
 scripts_dir = "./mmux_sources/scripts"
 assets_dir = "./mmux_sources/assets"
-tmux_conf = "./mmux_sources/assets/tmux.conf"
-
-[microsandbox.network]
-default_egress = "deny"
-default_ingress = "deny"
-
-[coder_profile.codex.launch]
-scripts_dir = "./profile_sources/codex/scripts"
-assets_dir = "./profile_sources/codex/assets"
-
-[coder_profile.claude.launch]
-scripts_dir = "./profile_sources/claude/scripts"
-assets_dir = "./profile_sources/claude/assets"
 ```
 
-Coder interaction profiles are built into mmux. The Microsandbox TOML only
-needs backend-specific launch sections for the profiles that require sandbox
-setup. Omitted fields keep their built-in values; scalar and list fields that
-you set replace the built-in value. The backend loads shared scripts from
-`mmux_sources/scripts`, then loads each profile launch directory in
-profile-name order. Host-side paths for
-`copy_file`, `copy_dir`, and launch directories are resolved relative to the
-directory that contains `mmux.toml`.
+Coder interaction profiles are built into mmux. TOML files only need profile
+sections when you intentionally override or extend those built-ins. Host-side
+paths for `copy_file`, `copy_dir`, `scripts_dir`, and `assets_dir` are resolved
+relative to the directory that contains the selected config file.
 
-Secrets also live in `mmux.toml`. Use `[[microsandbox.secrets]]` entries with a
+Secrets also live in `mmux.toml`. Use `[[sandbox.secrets]]` entries with a
 guest env name, a host env reference like `host.MMUX_TOKEN`, and an allowed
 host. The Rust backend resolves the host env var and injects the secret through
 the Microsandbox SDK. The controller token is injected this way into
@@ -188,18 +168,36 @@ Controller access is not configured in TOML. If `CONTROLLER_URL` targets
 Host-group TCP port rule from the URL. TOML network rules are for additional
 policy that the user intentionally applies.
 
-The default source/profile install scripts fetch from the internet. Use
-`mmux-setup.toml` for that one-time preparation run, create/export a
-snapshot after setup, then relaunch from the prepared snapshot with `mmux.toml`.
+For service access, prefer exact domain rules over broad public egress. DNS is
+also policy-gated under default deny:
+
+```toml
+[[sandbox.network.egress]]
+action = "allow"
+destination_domain = "api.openai.com"
+protocol = "udp"
+ports = [53]
+
+[[sandbox.network.egress]]
+action = "allow"
+destination_domain = "api.openai.com"
+protocol = "tcp"
+ports = [443]
+```
+
+The default setup scripts fetch from the internet. Use
+`microsandbox-setup.toml` for that one-time preparation run, create/export a
+snapshot after setup, then relaunch from the prepared snapshot with
+`mmux.toml`.
 
 Volumes are declared separately and mounts consume them:
 
 ```toml
-[[microsandbox.volumes]]
+[[sandbox.volumes]]
 name = "my-data"
 quota_mib = 5120
 
-[[microsandbox.mounts]]
+[[sandbox.mounts]]
 kind = "named"
 guest = "/data"
 name = "my-data"

@@ -1,14 +1,14 @@
 # Microsandbox node config example.
 #
-# This file shows backend config plus profile launch extensions. Coder
-# interaction profiles are built into mmux; do not repeat cmd, prompt markers,
-# busy markers, or action keys here unless you intentionally want to change the
-# built-in profile.
+# This file shows portable sandbox runtime config plus Microsandbox-specific
+# setup assets. Coder interaction profiles are built into mmux; do not repeat
+# cmd, prompt markers, busy markers, or action keys here unless you
+# intentionally want to change the built-in profile.
 #
 # Copy this file to the config path you pass as --node-config, or use it as a
 # reference for example-backends/microsandbox/mmux.toml.
 
-[microsandbox.runtime]
+[sandbox.runtime]
 # memory_mib = 1024
 # cpus = 2
 
@@ -16,55 +16,28 @@
 mmux_source = { repo = "https://github.com/ilijaljubicic/mmux.git", ref = "v0.1.0" }
 scripts_dir = "./mmux_sources/scripts"
 assets_dir = "./mmux_sources/assets"
-tmux_conf = "./mmux_sources/assets/tmux.conf"
 
-# These launch sections extend the built-in coder profiles with sandbox setup
-# assets. Omitted backend-agnostic fields continue to come from code defaults.
-
-[coder_profile.codex.launch]
-scripts_dir = "./profile_sources/codex/scripts"
-assets_dir = "./profile_sources/codex/assets"
-
-[coder_profile.opencode.launch]
-scripts_dir = "./profile_sources/opencode/scripts"
-assets_dir = "./profile_sources/opencode/assets"
-
-[coder_profile.kimi.launch]
-scripts_dir = "./profile_sources/kimi/scripts"
-assets_dir = "./profile_sources/kimi/assets"
-
-[coder_profile.claude.launch]
-scripts_dir = "./profile_sources/claude/scripts"
-assets_dir = "./profile_sources/claude/assets"
-
-[microsandbox.network]
+[sandbox.network]
 default_egress = "deny"
 default_ingress = "deny"
-# The launcher automatically allows the controller URL when it targets
-# host.microsandbox.internal, including the URL port. Add rules here only for
-# extra access that this sandbox should have.
-#
-# For a separate setup-only config, add resolver and public HTTP/HTTPS egress:
-# [[microsandbox.network.egress]]
+# The launcher automatically allows the controller URL when it targets the
+# sandbox host alias, including the URL port. Add rules here only for extra
+# access that this sandbox should have.
+# For narrow runtime access to a service, prefer domain rules:
+# [[sandbox.network.egress]]
 # action = "allow"
-# destination_group = "host"
+# destination_domain = "api.openai.com"
 # protocol = "udp"
 # ports = [53]
 #
-# [[microsandbox.network.egress]]
+# [[sandbox.network.egress]]
 # action = "allow"
-# destination_group = "host"
+# destination_domain = "api.openai.com"
 # protocol = "tcp"
-# ports = [53]
-#
-# [[microsandbox.network.egress]]
-# action = "allow"
-# destination_group = "public"
-# protocol = "tcp"
-# ports = [80, 443]
+# ports = [443]
 # trust_host_cas = true
 
-[[microsandbox.secrets]]
+[[sandbox.secrets]]
 env = "MMUX_CONTROLLER_TOKEN"
 value_from = "host.MMUX_TOKEN"
 allowed_host = "host.microsandbox.internal"
@@ -75,7 +48,7 @@ inject_query = false
 inject_body = false
 require_tls_identity = false
 
-# [[microsandbox.secrets]]
+# [[sandbox.secrets]]
 # env = "OPENAI_API_KEY"
 # value_from = "host.OPENAI_API_KEY"
 # allowed_host = "api.openai.com"

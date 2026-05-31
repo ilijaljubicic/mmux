@@ -7,12 +7,13 @@ CONTROLLER_URL ?= http://host.microsandbox.internal:3000
 NODE_CONFIG ?= mmux.toml
 SNAPSHOT_NAME ?= $(SANDBOX)-seed
 BUNDLE ?= .artifacts/$(SANDBOX)-seed.tar.zst
-.PHONY: help build launch bundle-launch bundle-export status logs stop resume
+.PHONY: help build prepare launch bundle-launch bundle-export status logs stop resume
 
 help:
 	@printf 'Microsandbox mmux backend example\n'
 	@printf '\n'
 	@printf '  make build       Build the microsandbox launcher\n'
+	@printf '  make prepare     Prepare sandbox from NODE_CONFIG without starting mmux node\n'
 	@printf '  make launch      Launch mmux node from NODE_CONFIG\n'
 	@printf '  make bundle-launch  Import a bundle and launch from that snapshot\n'
 	@printf '  make bundle-export  Stop, snapshot, and export a bundle\n'
@@ -23,6 +24,12 @@ help:
 
 build:
 	cd ../.. && cargo build -p mmux-microsandbox-node
+
+prepare: build
+	cargo run -p mmux-microsandbox-node -- prepare \
+		--name $(SANDBOX) \
+		--node-config $(NODE_CONFIG)
+
 launch: build
 	cargo run -p mmux-microsandbox-node -- launch \
 		--name $(SANDBOX) \
