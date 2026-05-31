@@ -8,17 +8,17 @@ launcher creates a Microsandbox instance, injects the node config and
 configured assets, runs setup scripts, and finishes without node registration.
 In runtime launch mode, it starts `mmux node` inside an already prepared guest.
 
-For first-time setup from a stock image, the guest installs `mmux` from source
-using the `[microsandbox.assets]` `mmux_source` entry in
+For first-time setup from a stock image, the guest installs `mmux` from a
+GitHub release archive using the `[microsandbox.assets]` `mmux_version` entry in
 `microsandbox-setup.toml`:
 
 ```toml
-mmux_source = { repo = "https://github.com/ilijaljubicic/mmux.git", ref = "v0.1.0" }
+mmux_version = "v0.1.0"
 ```
 
-Use a branch or commit for development, or a release tag such as `v0.1.0` for
-reproducible sandbox launches. If you point the ref at a private repository,
-the sandbox needs credentials that can fetch it.
+Use a release tag such as `v0.1.0` for reproducible sandbox launches. For
+local development, use `make build-dev` and `make dev-prepare`; that copies the
+host-built `mmux` binary into the guest and skips release download.
 
 To avoid installer network access at launch time, use either a prepared
 snapshot or a prepared Docker/OCI image. Bundle launches skip setup scripts,
@@ -63,7 +63,7 @@ Choose one launch path:
 
 ```bash
 # First-time preparation from a stock image. make prepare uses open setup
-# egress by default so apt/curl/git/npm/cargo installers can run. It does not
+# egress by default so apt/curl/npm and tool installers can run. It does not
 # start mmux node and does not need the controller token.
 cd /mnt/Radni/aitools/mmux/example-backends/microsandbox
 make prepare NODE_CONFIG="microsandbox-setup.toml"
@@ -93,7 +93,7 @@ that alias, the launcher automatically allows exactly the URL's host TCP port
 for controller communication. The controller token secret is scoped to
 `allowed_host = "host.microsandbox.internal"`.
 
-The runtime `mmux.toml` denies egress and ingress by default. First-time source
+The runtime `mmux.toml` denies egress and ingress by default. First-time release
 and profile installation needs installer network access, so `make prepare
 NODE_CONFIG="microsandbox-setup.toml"` uses open setup egress by default. Export a
 prepared snapshot, then relaunch from the snapshot with `mmux.toml` for
@@ -127,7 +127,7 @@ make bundle-launch BUNDLE=.artifacts/mmux-node-seed.tar.zst NODE_CONFIG="mmux.to
 
 `mmux.toml` owns the controller-only runtime config for prepared sandboxes.
 `microsandbox-setup.toml` owns first-time preparation from a stock image. It
-adds shared setup scripts plus `mmux_source`; `make prepare` provides open
+adds shared setup scripts plus `mmux_version`; `make prepare` provides open
 setup egress by default. It does not include controller secrets and does not
 start `mmux node`. `mmux.toml` is also used for prepared Docker/OCI images by
 setting `[sandbox.runtime].image`. None of these files should restate built-in
@@ -140,11 +140,11 @@ Runtime, network, secret bindings, volumes, and mounts use the backend-agnostic
 ```toml
 [microsandbox.runtime]
 image = "debian:bookworm-slim"
-# memory_mib = 1024
-# cpus = 2
+memory_mib = 4096
+cpus = 2
 
 [microsandbox.assets]
-mmux_source = { repo = "https://github.com/ilijaljubicic/mmux.git", ref = "v0.1.0" }
+mmux_version = "v0.1.0"
 scripts_dir = "./mmux_sources/scripts"
 assets_dir = "./mmux_sources/assets"
 ```
@@ -219,7 +219,10 @@ sudo apt install -y libcap-ng-dev
 ```
 
 Normal example targets use the installed `mmux-microsandbox-node` binary from
-`PATH`. For local development, use the dev targets:
+`PATH`. For local development, use the dev targets. `make build-dev` builds the
+launcher and a musl-linked Linux `mmux` binary; `make dev-prepare` passes that
+binary through `--mmux-binary` so the guest does not compile `mmux` or download
+a release:
 
 ```bash
 make build-dev

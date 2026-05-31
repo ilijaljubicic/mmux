@@ -130,10 +130,10 @@ registration and command polling. The controller token secret is scoped to
 `allowed_host = "host.microsandbox.internal"`.
 
 `microsandbox-setup.toml` is for first-time preparation only. `make prepare`
-uses an open setup egress policy by default so apt/curl/git/npm/cargo
-installers can run, but it does not inject the controller token and does not
-start `mmux node`. Export a snapshot after setup, then relaunch that snapshot
-with `mmux.toml` for the controller-only runtime policy.
+uses an open setup egress policy by default so apt/curl/npm and tool installers
+can run, but it does not inject the controller token and does not start
+`mmux node`. Export a snapshot after setup, then relaunch that snapshot with
+`mmux.toml` for the controller-only runtime policy.
 
 If you already have a prepared Docker/OCI image with `tmux`, `mmux`, and the
 coder CLIs installed, set `[sandbox.runtime].image` in `mmux.toml` to that
@@ -425,8 +425,9 @@ The canonical controller/node wire schema lives in
   default and does not start/register `mmux node`.
 The Microsandbox backend:
 
-- can install `mmux` from the configured git ref during setup, or use a
-  prepared image/snapshot that already contains `/usr/local/bin/mmux`;
+- can install `mmux` from the configured release version during setup, copy a
+  host-built `mmux` binary for development, or use a prepared image/snapshot
+  that already contains `/usr/local/bin/mmux`;
 - loads shared scripts from `mmux_sources/scripts` when the selected config
   declares them;
 - copies `mmux_sources/assets/tmux.conf` into the guest during setup when that
@@ -436,7 +437,7 @@ The Microsandbox backend:
 - can snapshot/export/import prepared sandboxes for faster relaunch.
 
 Sandbox-wide runtime, network, secret bindings, volumes, and mounts live under
-`[sandbox.*]`. Microsandbox-only setup inputs, such as source installs,
+`[sandbox.*]`. Microsandbox-only setup inputs, such as release installs,
 scripts, and patches, stay under `[microsandbox.*]`.
 
 The checked-in sandbox config uses `default_egress = "deny"` and

@@ -1,9 +1,9 @@
 [microsandbox.runtime]
 image = "debian:bookworm-slim"
-# memory_mib = 1024
-# cpus = 2
+memory_mib = 4096
+cpus = 2
 
 [microsandbox.assets]
-mmux_source = { repo = "https://github.com/ilijaljubicic/mmux.git", ref = "main" }
+mmux_version = "v0.1.0"
 scripts_dir = "./mmux_sources/scripts"
 assets_dir = "./mmux_sources/assets"

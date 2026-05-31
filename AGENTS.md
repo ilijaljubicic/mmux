@@ -77,7 +77,7 @@ capture_output(session="myapp", lines=40)
 ### 4. Detach without killing (keep session running in background)
 When inside a tmux session via `sandbox-tmux-attach` or direct tmux:
 ```
-Ctrl+b  then  d      → detach, session keeps running
+Ctrl+a  then  d      → detach, session keeps running
 ```
 Or run from inside the session:
 ```

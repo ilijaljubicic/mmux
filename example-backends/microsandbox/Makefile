@@ -9,6 +9,8 @@ SNAPSHOT_NAME ?= $(SANDBOX)-seed
 BUNDLE ?= .artifacts/$(SANDBOX)-seed.tar.zst
 MMUX_MICROSANDBOX ?= mmux-microsandbox-node
 MMUX_MICROSANDBOX_DEV = cargo run -p mmux-microsandbox-node --
+MMUX_DEV_TARGET ?= x86_64-unknown-linux-musl
+MMUX_DEV_BINARY ?= ../../target/$(MMUX_DEV_TARGET)/release/mmux
 .PHONY: help build-dev dev-build dev-prepare dev-launch dev-bundle-launch dev-bundle-export dev-status dev-logs dev-resume dev-stop prepare-dev launch-dev bundle-launch-dev prepare launch bundle-launch bundle-export status logs stop resume
 
 help:
@@ -30,11 +32,13 @@ help:
 
 build-dev:
 	cd ../.. && cargo build -p mmux-microsandbox-node
+	cd ../.. && rustup target add $(MMUX_DEV_TARGET)
+	cd ../.. && cargo build --release --target $(MMUX_DEV_TARGET) --bin mmux
 
 dev-build: build-dev
 
 dev-prepare:
-	$(MAKE) prepare MMUX_MICROSANDBOX="$(MMUX_MICROSANDBOX_DEV)"
+	$(MAKE) prepare MMUX_MICROSANDBOX="$(MMUX_MICROSANDBOX_DEV)" PREPARE_ARGS="--mmux-binary $(MMUX_DEV_BINARY)"
 
 dev-launch:
 	$(MAKE) launch MMUX_MICROSANDBOX="$(MMUX_MICROSANDBOX_DEV)"
@@ -66,7 +70,8 @@ bundle-launch-dev: dev-bundle-launch
 prepare:
 	$(MMUX_MICROSANDBOX) prepare \
 		--name $(SANDBOX) \
-		--node-config $(NODE_CONFIG)
+		--node-config $(NODE_CONFIG) \
+		$(PREPARE_ARGS)
 
 launch:
 	$(MMUX_MICROSANDBOX) launch \

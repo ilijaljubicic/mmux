@@ -75,6 +75,9 @@ pub struct PrepareArgs {
 
     #[arg(long, default_value_os_t = default_node_config())]
     pub node_config: PathBuf,
+
+    #[arg(long)]
+    pub mmux_binary: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -166,7 +169,7 @@ pub async fn launch(args: LaunchArgs) -> Result<LaunchReport, Box<dyn Error + Se
         && microsandbox_config
             .microsandbox
             .assets
-            .mmux_source
+            .mmux_version
             .is_none()
         && script_assets.is_empty()
     {
@@ -191,6 +194,7 @@ pub async fn launch(args: LaunchArgs) -> Result<LaunchReport, Box<dyn Error + Se
         coder_profiles: &microsandbox_config.coder_profiles,
         config_base_dir: &microsandbox_config.base_dir,
         script_assets: &script_assets,
+        mmux_binary: None,
     })
     .await?;
 
@@ -223,12 +227,13 @@ pub async fn prepare(args: PrepareArgs) -> Result<PrepareReport, Box<dyn Error +
         && microsandbox_config
             .microsandbox
             .assets
-            .mmux_source
+            .mmux_version
             .is_none()
+        && args.mmux_binary.is_none()
         && script_assets.is_empty()
     {
         return Err(
-            "prepare config does not install or copy anything into a stock image; add setup scripts, mmux_source, or set a prepared image in the config".into(),
+            "prepare config does not install or copy anything into a stock image; add setup scripts, mmux_version, --mmux-binary, or set a prepared image in the config".into(),
         );
     }
 
@@ -245,6 +250,7 @@ pub async fn prepare(args: PrepareArgs) -> Result<PrepareReport, Box<dyn Error +
         coder_profiles: &microsandbox_config.coder_profiles,
         config_base_dir: &microsandbox_config.base_dir,
         script_assets: &script_assets,
+        mmux_binary: args.mmux_binary.as_deref(),
     })
     .await?;
 
@@ -360,7 +366,9 @@ pub async fn logs(args: SharedArgs) -> Result<String, Box<dyn Error + Send + Syn
     }
     if let Ok(sandbox) = handle.connect().await {
         if let Ok(output) = sandbox
-            .shell("cat /tmp/mmux-node.log 2>/dev/null || true")
+            .shell(
+                "cat /mmux/mmux-node.log 2>/dev/null || cat /tmp/mmux-node.log 2>/dev/null || true",
+            )
             .await
         {
             out.push_str("== guest log ==\n");
@@ -396,6 +404,7 @@ struct SandboxLaunchSpec<'a> {
     coder_profiles: &'a [CliProfile],
     config_base_dir: &'a Path,
     script_assets: &'a [MicrosandboxScriptAsset],
+    mmux_binary: Option<&'a Path>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -419,6 +428,7 @@ async fn create_sandbox(spec: SandboxLaunchSpec<'_>) -> Result<(), Box<dyn Error
         coder_profiles,
         config_base_dir,
         script_assets,
+        mmux_binary,
     } = spec;
     ensure_configured_volumes(&sandbox_config.volumes).await?;
     let policy = if setup_network && !sandbox_config.has_network_policy {
@@ -487,10 +497,11 @@ async fn create_sandbox(spec: SandboxLaunchSpec<'_>) -> Result<(), Box<dyn Error
         });
     }
 
-    if let Some(mmux_source) = microsandbox_config.assets.mmux_source.as_ref() {
-        builder = builder
-            .env("MMUX_SOURCE_REPO", &mmux_source.repo)
-            .env("MMUX_SOURCE_REF", &mmux_source.revision);
+    if let Some(mmux_version) = microsandbox_config.assets.mmux_version.as_ref() {
+        builder = builder.env("MMUX_VERSION", mmux_version);
+    }
+    if mmux_binary.is_some() {
+        builder = builder.env("MMUX_SKIP_RELEASE_INSTALL", "1");
     }
 
     if snapshot.is_none() {
@@ -499,35 +510,44 @@ async fn create_sandbox(spec: SandboxLaunchSpec<'_>) -> Result<(), Box<dyn Error
         }
     }
 
-    let mmux_assets_dir = microsandbox_config
-        .assets
-        .assets_dir
-        .as_ref()
-        .map(|path| resolve_host_path(config_base_dir, path));
-    let tmux_conf = microsandbox_config
-        .assets
-        .tmux_conf
-        .as_ref()
-        .map(|path| resolve_host_path(config_base_dir, path))
-        .or_else(|| {
-            mmux_assets_dir
-                .as_ref()
-                .map(|assets_dir| assets_dir.join("tmux.conf"))
-                .filter(|path| path.is_file())
-        });
-    builder = builder.patch(|p: microsandbox::sandbox::PatchBuilder| {
-        let p = p.mkdir("/etc/mmux", Some(0o755)).copy_file(
-            node_config,
-            "/etc/mmux/mmux-node.toml",
-            None,
-            true,
-        );
-        if snapshot.is_some() {
-            p
-        } else {
+    if snapshot.is_none() {
+        let mmux_assets_dir = microsandbox_config
+            .assets
+            .assets_dir
+            .as_ref()
+            .map(|path| resolve_host_path(config_base_dir, path));
+        let tmux_conf = microsandbox_config
+            .assets
+            .tmux_conf
+            .as_ref()
+            .map(|path| resolve_host_path(config_base_dir, path))
+            .or_else(|| {
+                mmux_assets_dir
+                    .as_ref()
+                    .map(|assets_dir| assets_dir.join("tmux.conf"))
+                    .filter(|path| path.is_file())
+            });
+        builder = builder.patch(|p: microsandbox::sandbox::PatchBuilder| {
+            let p = p.mkdir("/etc/mmux", Some(0o755)).copy_file(
+                node_config,
+                "/etc/mmux/mmux-node.toml",
+                None,
+                true,
+            );
             let p = p
                 .mkdir("/mmux", Some(0o755))
+                .mkdir("/usr/local/bin", Some(0o755))
                 .mkdir("/workspace", Some(0o755));
+            let p = if let Some(mmux_binary) = mmux_binary {
+                p.copy_file(
+                    resolve_host_path(config_base_dir, mmux_binary),
+                    "/usr/local/bin/mmux",
+                    Some(0o755),
+                    true,
+                )
+            } else {
+                p
+            };
             let p = if let Some(tmux_conf) = tmux_conf.as_ref() {
                 p.copy_file(tmux_conf, "/mmux/tmux.conf", None, true).text(
                     "/etc/tmux.conf",
@@ -545,11 +565,14 @@ async fn create_sandbox(spec: SandboxLaunchSpec<'_>) -> Result<(), Box<dyn Error
                 p
             };
             apply_config_patches(p, &microsandbox_config.patches, config_base_dir)
-        }
-    });
+        });
+    }
 
     let sandbox = builder.create_detached().await?;
 
+    if snapshot.is_some() {
+        install_node_config(&sandbox, node_config).await?;
+    }
     if snapshot.is_none() {
         run_scripts(&sandbox, script_assets).await?;
     }
@@ -561,26 +584,49 @@ async fn create_sandbox(spec: SandboxLaunchSpec<'_>) -> Result<(), Box<dyn Error
     Ok(())
 }
 
+async fn install_node_config(
+    sandbox: &Sandbox,
+    node_config: &Path,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let content = std::fs::read_to_string(node_config)?;
+    let delimiter = "__MMUX_NODE_CONFIG_EOF__";
+    if content.contains(delimiter) {
+        return Err(format!(
+            "node config contains reserved heredoc delimiter '{}'",
+            delimiter
+        )
+        .into());
+    }
+    let command = format!(
+        "set -eu\nmkdir -p /etc/mmux\ncat > /etc/mmux/mmux-node.toml <<'{}'\n{}\n{}\nchmod 0644 /etc/mmux/mmux-node.toml\n",
+        delimiter, content, delimiter
+    );
+    run_shell_checked(sandbox, "install runtime node config", &command).await
+}
+
 async fn launch_mmux_node(sandbox: &Sandbox) -> Result<(), Box<dyn Error + Send + Sync>> {
     let command = r#"set -eu
-mkdir -p /tmp
+mkdir -p /mmux
 nohup /usr/local/bin/mmux node \
   --controller-url "$MMUX_CONTROLLER_URL" \
   --node-id "$MMUX_NODE_ID" \
   --node-name "$MMUX_NODE_NAME" \
   --node-config "$MMUX_NODE_CONFIG" \
   --poll-interval-ms "$MMUX_POLL_INTERVAL_MS" \
-  >/tmp/mmux-node.log 2>&1 &
+  >/mmux/mmux-node.log 2>&1 &
 "#;
 
     run_shell_checked(sandbox, "launch mmux node", command).await?;
 
-    let ready_check = r#"for _ in 1 2 3 4 5; do
+    let ready_check = r#"for _ in 1 2 3 4 5 6 7 8 9 10 11 12 13 14 15; do
   if ps -ef 2>/dev/null | grep '[m]mux node' >/dev/null 2>&1; then
     exit 0
   fi
   sleep 1
 done
+if [ -f /mmux/mmux-node.log ]; then
+  cat /mmux/mmux-node.log >&2
+fi
 exit 1
 "#;
     run_shell_checked(sandbox, "check mmux node readiness", ready_check).await?;
@@ -670,20 +716,13 @@ struct SandboxRuntimeConfig {
 #[derive(Debug, Clone, Deserialize, Default)]
 struct MicrosandboxAssetsConfig {
     #[serde(default)]
-    mmux_source: Option<MicrosandboxSourceConfig>,
+    mmux_version: Option<String>,
     #[serde(default)]
     tmux_conf: Option<PathBuf>,
     #[serde(default)]
     scripts_dir: Option<PathBuf>,
     #[serde(default)]
     assets_dir: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone, Deserialize)]
-struct MicrosandboxSourceConfig {
-    repo: String,
-    #[serde(rename = "ref", alias = "branch")]
-    revision: String,
 }
 
 impl Default for SandboxRuntimeConfig {
@@ -1386,11 +1425,8 @@ mod tests {
         fs::write(
             &config_path,
             r#"
-[microsandbox.assets.mmux_source]
-repo = "https://github.com/ilijaljubicic/mmux.git"
-ref = "v0.1.0"
-
 [microsandbox.assets]
+mmux_version = "v0.1.0"
 scripts_dir = "./mmux_sources/scripts"
 assets_dir = "./mmux_sources/assets"
 "#,
@@ -1408,21 +1444,7 @@ assets_dir = "./mmux_sources/assets"
         );
         assert!(loaded.microsandbox.assets.tmux_conf.is_none());
         assert_eq!(
-            loaded
-                .microsandbox
-                .assets
-                .mmux_source
-                .as_ref()
-                .map(|source| source.repo.as_str()),
-            Some("https://github.com/ilijaljubicic/mmux.git")
-        );
-        assert_eq!(
-            loaded
-                .microsandbox
-                .assets
-                .mmux_source
-                .as_ref()
-                .map(|source| source.revision.as_str()),
+            loaded.microsandbox.assets.mmux_version.as_deref(),
             Some("v0.1.0")
         );
         let _ = fs::remove_dir_all(base_dir);
