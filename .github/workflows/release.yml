@@ -49,6 +49,7 @@ jobs:
           if [[ "$RUNNER_OS" == "Linux" ]]; then
             rustup target add x86_64-unknown-linux-musl
             cargo build --release --locked --target x86_64-unknown-linux-musl --bin mmux
+            cargo build --release --locked -p mmux-microsandbox-node --bin mmux-microsandbox-node
           elif [[ "$RUNNER_OS" == "macOS" ]]; then
             if [[ "$(uname -m)" == "arm64" ]]; then
               rustup target add aarch64-apple-darwin
@@ -68,17 +69,24 @@ jobs:
           set -euo pipefail
           mkdir -p artifacts
           if [[ "$RUNNER_OS" == "Linux" ]]; then
-            cp target/x86_64-unknown-linux-musl/release/mmux artifacts/mmux-linux-x86_64
+            package_dir="artifacts/mmux-linux-x86_64"
+            mkdir -p "$package_dir"
+            cp target/x86_64-unknown-linux-musl/release/mmux "$package_dir/mmux"
+            cp target/release/mmux-microsandbox-node "$package_dir/mmux-microsandbox-node"
           elif [[ "$RUNNER_OS" == "macOS" ]]; then
             if [[ "$(uname -m)" == "arm64" ]]; then
-              cp target/aarch64-apple-darwin/release/mmux artifacts/mmux-darwin-arm64
+              package_dir="artifacts/mmux-darwin-arm64"
+              mkdir -p "$package_dir"
+              cp target/aarch64-apple-darwin/release/mmux "$package_dir/mmux"
             else
-              cp target/x86_64-apple-darwin/release/mmux artifacts/mmux-darwin-x86_64
+              package_dir="artifacts/mmux-darwin-x86_64"
+              mkdir -p "$package_dir"
+              cp target/x86_64-apple-darwin/release/mmux "$package_dir/mmux"
             fi
           fi
           cd artifacts
-          for file in mmux-*; do
-            tar -czf "${file}.tar.gz" "$file"
+          for dir in mmux-*; do
+            tar -czf "${dir}.tar.gz" -C "$dir" .
           done
 
       - name: Upload archive

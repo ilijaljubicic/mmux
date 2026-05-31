@@ -45,12 +45,30 @@ echo "Downloading ${ARCHIVE} (${VERSION}) from ${URL}"
 curl -fsSL "$URL" -o "$TMPDIR/$ARCHIVE"
 tar -xzf "$TMPDIR/$ARCHIVE" -C "$TMPDIR"
 
-EXTRACTED="$(find "$TMPDIR" -maxdepth 1 -type f -name 'mmux*' ! -name "$ARCHIVE" | head -n 1)"
-if [ -z "$EXTRACTED" ]; then
+MMUX_BIN=""
+for candidate in "$TMPDIR/mmux" "$TMPDIR/mmux-${PLATFORM}"; do
+  if [ -f "$candidate" ]; then
+    MMUX_BIN="$candidate"
+    break
+  fi
+done
+if [ -z "$MMUX_BIN" ]; then
+  MMUX_BIN="$(find "$TMPDIR" -maxdepth 1 -type f -name 'mmux-*' ! -name "$ARCHIVE" ! -name 'mmux-microsandbox-node*' | head -n 1)"
+fi
+if [ -z "$MMUX_BIN" ]; then
   echo "Archive did not contain an mmux binary" >&2
   exit 1
 fi
-chmod +x "$EXTRACTED"
+chmod +x "$MMUX_BIN"
+
+MICROSANDBOX_BIN=""
+for candidate in "$TMPDIR/mmux-microsandbox-node" "$TMPDIR/mmux-microsandbox-node-${PLATFORM}"; do
+  if [ -f "$candidate" ]; then
+    MICROSANDBOX_BIN="$candidate"
+    chmod +x "$MICROSANDBOX_BIN"
+    break
+  fi
+done
 
 if [ -z "${INSTALL_DIR:-}" ]; then
   if [ "$OS" = "darwin" ] && [ -d "/opt/homebrew/bin" ]; then
@@ -62,9 +80,18 @@ fi
 
 mkdir -p "$INSTALL_DIR" 2>/dev/null || sudo mkdir -p "$INSTALL_DIR"
 if [ -w "$INSTALL_DIR" ]; then
-  mv "$EXTRACTED" "$INSTALL_DIR/mmux"
+  mv "$MMUX_BIN" "$INSTALL_DIR/mmux"
+  if [ -n "$MICROSANDBOX_BIN" ]; then
+    mv "$MICROSANDBOX_BIN" "$INSTALL_DIR/mmux-microsandbox-node"
+  fi
 else
-  sudo mv "$EXTRACTED" "$INSTALL_DIR/mmux"
+  sudo mv "$MMUX_BIN" "$INSTALL_DIR/mmux"
+  if [ -n "$MICROSANDBOX_BIN" ]; then
+    sudo mv "$MICROSANDBOX_BIN" "$INSTALL_DIR/mmux-microsandbox-node"
+  fi
 fi
 
 echo "Installed mmux ${VERSION} to ${INSTALL_DIR}/mmux"
+if [ -n "$MICROSANDBOX_BIN" ]; then
+  echo "Installed mmux-microsandbox-node ${VERSION} to ${INSTALL_DIR}/mmux-microsandbox-node"
+fi

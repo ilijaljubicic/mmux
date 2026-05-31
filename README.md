@@ -1,19 +1,19 @@
 # MCP + tmux = mmux
 
-mmux is a Rust MCP server for controlling tmux-backed local and remote
-execution nodes. It lets agents inspect sessions, drive interactive shells,
-operate coding CLIs, read and write files, and route terminal work to sandboxed
-environments.
+mmux is a Rust MCP server that lets agents operate coding harnesses and other
+tmux-backed terminal workflows across local or remote execution nodes. Agents
+can inspect sessions, drive interactive shells and coding CLIs, read and write
+files, and route terminal work to sandboxed environments.
 
 The core idea is simple:
 
 - `mmux controller` exposes the MCP HTTP endpoint and the controller/node wire
   endpoint.
 - `mmux node` owns tmux and filesystem access in the environment where it runs.
-- Node-aware MCP tools default to `node = "local"`, which uses the built-in
-  local node when the controller is started with `--enable-local-node`. Pass a
-  `node_id` registered by `mmux node` as the tool's `node` argument to target a
-  remote node.
+- Node-aware MCP tools accept a `node` argument. Omitted `node` means the
+  reserved `local` target, which is available only when the controller was
+  started with `--enable-local-node`. To target a remote node, pass the node id
+  registered by `mmux node` as the tool's `node` value.
 - Built-in coder profiles describe how to launch and drive CLIs such as
   `codex`, `opencode`, `kimi`, and `claude`.
 
@@ -49,6 +49,9 @@ Install the latest released `mmux` binary:
 curl -fsSL https://raw.githubusercontent.com/ilijaljubicic/mmux/main/scripts/install.sh | bash
 ```
 
+Linux release archives also include `mmux-microsandbox-node`, which is used by
+the Microsandbox backend example.
+
 Pin a specific release:
 
 ```bash
@@ -63,12 +66,14 @@ mmux controller --enable-local-node
 
 ### Local backend
 
+From a repo checkout, the equivalent development command is:
+
 ```bash
 make run-local
 ```
 
-This starts the controller with the built-in local node enabled and uses the
-built-in coder profiles.
+Both commands start the controller with the built-in local node enabled and use
+the built-in coder profiles.
 
 Warning: the local backend is not sandboxed. Tools run tmux commands and file
 operations on the same host as the controller, with the controller process
@@ -104,7 +109,6 @@ In another shell, prepare the Microsandbox guest once from a stock image:
 
 ```bash
 cd example-backends/microsandbox
-make build
 make prepare NODE_CONFIG=microsandbox-setup.toml
 make bundle-export SANDBOX=mmux-node SNAPSHOT_NAME=mmux-node-seed BUNDLE=.artifacts/mmux-node-seed.tar.zst
 ```

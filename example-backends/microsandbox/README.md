@@ -3,11 +3,10 @@
 This directory contains the example config and Make targets for running an
 `mmux node` inside Microsandbox.
 
-The host builds and runs the `mmux-microsandbox-node` launcher crate. In
-prepare mode, the launcher creates a Microsandbox instance, injects the node
-config and configured assets, runs setup scripts, and finishes without node
-registration. In runtime launch mode, it starts `mmux node` inside an already
-prepared guest.
+The host runs the `mmux-microsandbox-node` launcher. In prepare mode, the
+launcher creates a Microsandbox instance, injects the node config and
+configured assets, runs setup scripts, and finishes without node registration.
+In runtime launch mode, it starts `mmux node` inside an already prepared guest.
 
 For first-time setup from a stock image, the guest installs `mmux` from source
 using the `[microsandbox.assets]` `mmux_source` entry in
@@ -67,7 +66,6 @@ Choose one launch path:
 # egress by default so apt/curl/git/npm/cargo installers can run. It does not
 # start mmux node and does not need the controller token.
 cd /mnt/Radni/aitools/mmux/example-backends/microsandbox
-make build
 make prepare NODE_CONFIG="microsandbox-setup.toml"
 make bundle-export SANDBOX=mmux-node SNAPSHOT_NAME=mmux-node-seed BUNDLE=.artifacts/mmux-node-seed.tar.zst
 ```
@@ -84,7 +82,6 @@ make bundle-launch BUNDLE=.artifacts/mmux-node-seed.tar.zst NODE_CONFIG="mmux.to
 # mmux, and the coder CLIs, so launch does not open installer network access.
 export MMUX_TOKEN="...controller bearer token..."
 cd /mnt/Radni/aitools/mmux/example-backends/microsandbox
-make build
 # Edit [sandbox.runtime].image in mmux.toml.
 make launch NODE_CONFIG="mmux.toml"
 ```
@@ -217,4 +214,12 @@ Before building this backend, install the native package that provides
 ```bash
 sudo apt update
 sudo apt install -y libcap-ng-dev
+```
+
+Normal example targets use the installed `mmux-microsandbox-node` binary from
+`PATH`. For local development, use the dev targets:
+
+```bash
+make build-dev
+make dev-prepare NODE_CONFIG="microsandbox-setup.toml"
 ```
