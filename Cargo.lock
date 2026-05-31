@@ -2966,8 +2966,10 @@ name = "mmux-microsandbox-node"
 version = "0.1.0"
 dependencies = [
  "clap",
+ "http",
  "indoc",
  "microsandbox",
+ "microsandbox-network",
  "mmux-node",
  "mmux-shared",
  "serde",

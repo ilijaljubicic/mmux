@@ -1,7 +1,11 @@
 use clap::{Parser, Subcommand};
+use http::Uri;
 use microsandbox::sandbox::{DiskImageFormat, HostPermissions, MountBuilder, StatVirtualization};
 use microsandbox::snapshot::ExportOpts;
 use microsandbox::{Sandbox, Snapshot, Volume};
+use microsandbox_network::policy::{
+    Action, Destination, DestinationGroup, NetworkPolicyBuilder, PortRange, Protocol, Rule,
+};
 use mmux_shared::CliProfile;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
@@ -33,8 +37,8 @@ pub enum Command {
 pub struct SharedArgs {
     #[arg(long, default_value = "mmux-node")]
     pub name: String,
-    #[arg(long, default_value = DEFAULT_IMAGE)]
-    pub image: String,
+    #[arg(long)]
+    pub image: Option<String>,
 }
 
 #[derive(Debug, Clone, Parser)]
@@ -118,6 +122,11 @@ pub struct SnapshotImportReport {
 
 pub async fn launch(args: LaunchArgs) -> Result<LaunchReport, Box<dyn Error + Send + Sync>> {
     let microsandbox_config = load_microsandbox_config(&args.node_config)?;
+    let image = args
+        .shared
+        .image
+        .clone()
+        .unwrap_or_else(|| microsandbox_config.config.runtime.image.clone());
     let script_assets = if args.snapshot.is_some() {
         Vec::new()
     } else {
@@ -131,8 +140,19 @@ pub async fn launch(args: LaunchArgs) -> Result<LaunchReport, Box<dyn Error + Se
             &microsandbox_config.base_dir,
         )?
     };
+    if args.snapshot.is_none()
+        && image == DEFAULT_IMAGE
+        && microsandbox_config.config.assets.mmux_source.is_none()
+        && script_assets.is_empty()
+        && profile_script_assets.is_empty()
+    {
+        return Err(
+            "runtime config does not prepare a stock image; use bundle-launch with a prepared snapshot, use mmux-setup.toml for preparation, or set a prepared image in the config".into(),
+        );
+    }
     create_sandbox(SandboxLaunchSpec {
         shared: &args.shared,
+        image: &image,
         node_config: &args.node_config,
         controller_url: &args.controller_url,
         node_id: &args.node_id,
@@ -148,7 +168,7 @@ pub async fn launch(args: LaunchArgs) -> Result<LaunchReport, Box<dyn Error + Se
 
     Ok(LaunchReport {
         name: args.shared.name,
-        image: args.shared.image,
+        image,
         node_id: args.node_id,
         controller_url: args.controller_url,
         snapshot: args.snapshot,
@@ -285,6 +305,7 @@ pub async fn logs(args: SharedArgs) -> Result<String, Box<dyn Error + Send + Syn
 
 struct SandboxLaunchSpec<'a> {
     shared: &'a SharedArgs,
+    image: &'a str,
     node_config: &'a Path,
     controller_url: &'a str,
     node_id: &'a str,
@@ -300,6 +321,7 @@ struct SandboxLaunchSpec<'a> {
 async fn create_sandbox(spec: SandboxLaunchSpec<'_>) -> Result<(), Box<dyn Error + Send + Sync>> {
     let SandboxLaunchSpec {
         shared,
+        image,
         node_config,
         controller_url,
         node_id,
@@ -312,17 +334,7 @@ async fn create_sandbox(spec: SandboxLaunchSpec<'_>) -> Result<(), Box<dyn Error
         profile_script_assets,
     } = spec;
     ensure_configured_volumes(&microsandbox_config.volumes).await?;
-    let mut policy: microsandbox::NetworkPolicy = microsandbox_config.network.network_policy.into();
-    for domain in &microsandbox_config.network.deny_domain {
-        policy = policy
-            .deny_domain(domain)
-            .map_err(|error| format!("invalid denied domain '{}': {}", domain, error))?;
-    }
-    for suffix in &microsandbox_config.network.deny_domain_suffix {
-        policy = policy
-            .deny_domain_suffix(suffix)
-            .map_err(|error| format!("invalid denied domain suffix '{}': {}", suffix, error))?;
-    }
+    let policy = build_network_policy(&microsandbox_config.network, controller_url)?;
 
     let mut builder = Sandbox::builder(&shared.name)
         .memory(microsandbox_config.runtime.memory_mib)
@@ -336,15 +348,12 @@ async fn create_sandbox(spec: SandboxLaunchSpec<'_>) -> Result<(), Box<dyn Error
     if let Some(snapshot_ref) = snapshot {
         builder = builder.from_snapshot(snapshot_ref.to_string());
     } else {
-        builder = builder.image(shared.image.clone());
+        builder = builder.image(image.to_owned());
     }
     builder = builder.network(|network| {
-        let mut network = network.policy(policy);
-        if let Some(max_connections) = microsandbox_config.network.max_connections {
-            network = network.max_connections(max_connections);
-        }
-        network = network.trust_host_cas(microsandbox_config.network.trust_host_cas);
         network
+            .policy(policy)
+            .trust_host_cas(microsandbox_config.network.trust_host_cas)
     });
     for profile in coder_profiles {
         if let Some(launch) = profile.launch.as_ref() {
@@ -399,15 +408,6 @@ async fn create_sandbox(spec: SandboxLaunchSpec<'_>) -> Result<(), Box<dyn Error
     let sandbox = if snapshot.is_some() {
         builder.create_detached().await?
     } else {
-        let use_mmux_source = microsandbox_config.assets.mmux_source.is_some();
-        let mmux_binary = if use_mmux_source {
-            None
-        } else {
-            Some(resolve_host_path(
-                config_base_dir,
-                &microsandbox_config.assets.mmux_binary,
-            ))
-        };
         let tmux_conf = resolve_host_path(config_base_dir, &microsandbox_config.assets.tmux_conf);
         let mmux_assets_dir = microsandbox_config
             .assets
@@ -429,11 +429,6 @@ async fn create_sandbox(spec: SandboxLaunchSpec<'_>) -> Result<(), Box<dyn Error
                         Some(0o644),
                         false,
                     );
-                let p = if let Some(mmux_binary) = mmux_binary.as_ref() {
-                    p.copy_file(mmux_binary, "/usr/local/bin/mmux", Some(0o755), true)
-                } else {
-                    p
-                };
                 let p = if let Some(mmux_assets_dir) = mmux_assets_dir.as_ref() {
                     p.copy_dir(mmux_assets_dir, "/mmux/mmux_sources/assets", true)
                 } else {
@@ -468,10 +463,7 @@ nohup /usr/local/bin/mmux node \
   >/tmp/mmux-node.log 2>&1 &
 "#;
 
-    sandbox
-        .shell(command)
-        .await
-        .map_err(|error| format!("failed to launch mmux node: {}", error))?;
+    run_shell_checked(sandbox, "launch mmux node", command).await?;
 
     let ready_check = r#"for _ in 1 2 3 4 5; do
   if ps -ef 2>/dev/null | grep '[m]mux node' >/dev/null 2>&1; then
@@ -481,10 +473,7 @@ nohup /usr/local/bin/mmux node \
 done
 exit 1
 "#;
-    sandbox
-        .shell(ready_check)
-        .await
-        .map_err(|error| format!("mmux node did not stay running: {}", error))?;
+    run_shell_checked(sandbox, "check mmux node readiness", ready_check).await?;
 
     Ok(())
 }
@@ -494,37 +483,39 @@ async fn run_scripts(
     scripts: &[MicrosandboxScriptAsset],
 ) -> Result<(), Box<dyn Error + Send + Sync>> {
     for script in scripts {
-        sandbox
-            .shell(&script.name)
-            .await
-            .map_err(|error| format!("script '{}' failed: {}", script.name, error))?;
+        run_shell_checked(sandbox, &script.name, &script.name).await?;
     }
     Ok(())
 }
 
+async fn run_shell_checked(
+    sandbox: &Sandbox,
+    label: &str,
+    command: &str,
+) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let output = sandbox
+        .shell(command)
+        .await
+        .map_err(|error| format!("{} failed to run: {}", label, error))?;
+    let status = output.status();
+    if status.success {
+        return Ok(());
+    }
+    let stdout = output
+        .stdout()
+        .unwrap_or_else(|_| String::from_utf8_lossy(output.stdout_bytes()).into_owned());
+    let stderr = output
+        .stderr()
+        .unwrap_or_else(|_| String::from_utf8_lossy(output.stderr_bytes()).into_owned());
+    Err(format!(
+        "{} exited with code {}\nstdout:\n{}\nstderr:\n{}",
+        label, status.code, stdout, stderr
+    )
+    .into())
+}
+
 fn default_node_config() -> PathBuf {
     PathBuf::from("mmux-node.toml")
-}
-
-#[derive(Debug, Clone, Copy, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-enum NetworkPolicyKind {
-    #[default]
-    NonLocal,
-    PublicOnly,
-    AllowAll,
-    None,
-}
-
-impl From<NetworkPolicyKind> for microsandbox::NetworkPolicy {
-    fn from(value: NetworkPolicyKind) -> Self {
-        match value {
-            NetworkPolicyKind::NonLocal => microsandbox::NetworkPolicy::non_local(),
-            NetworkPolicyKind::PublicOnly => microsandbox::NetworkPolicy::public_only(),
-            NetworkPolicyKind::AllowAll => microsandbox::NetworkPolicy::allow_all(),
-            NetworkPolicyKind::None => microsandbox::NetworkPolicy::none(),
-        }
-    }
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
@@ -547,6 +538,8 @@ struct MicrosandboxConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 struct MicrosandboxRuntimeConfig {
+    #[serde(default = "default_image")]
+    image: String,
     #[serde(default = "default_memory_mib")]
     memory_mib: u32,
     #[serde(default = "default_cpus")]
@@ -557,8 +550,6 @@ struct MicrosandboxRuntimeConfig {
 struct MicrosandboxAssetsConfig {
     #[serde(default)]
     mmux_source: Option<MicrosandboxSourceConfig>,
-    #[serde(default = "default_mmux_binary")]
-    mmux_binary: PathBuf,
     #[serde(default = "default_tmux_conf")]
     tmux_conf: PathBuf,
     #[serde(default)]
@@ -571,7 +562,6 @@ impl Default for MicrosandboxAssetsConfig {
     fn default() -> Self {
         Self {
             mmux_source: None,
-            mmux_binary: default_mmux_binary(),
             tmux_conf: default_tmux_conf(),
             scripts_dir: None,
             assets_dir: None,
@@ -589,6 +579,7 @@ struct MicrosandboxSourceConfig {
 impl Default for MicrosandboxRuntimeConfig {
     fn default() -> Self {
         Self {
+            image: default_image(),
             memory_mib: default_memory_mib(),
             cpus: default_cpus(),
         }
@@ -596,19 +587,137 @@ impl Default for MicrosandboxRuntimeConfig {
 }
 
 #[derive(Debug, Clone, Deserialize, Default)]
+#[serde(deny_unknown_fields)]
 struct MicrosandboxNetworkConfig {
     #[serde(default)]
-    network_policy: NetworkPolicyKind,
+    default_egress: Option<Action>,
     #[serde(default)]
-    #[serde(alias = "deny_domains")]
-    deny_domain: Vec<String>,
+    default_ingress: Option<Action>,
     #[serde(default)]
-    #[serde(alias = "deny_domain_suffixes")]
-    deny_domain_suffix: Vec<String>,
+    egress: Vec<MicrosandboxNetworkRule>,
     #[serde(default)]
-    max_connections: Option<usize>,
+    ingress: Vec<MicrosandboxNetworkRule>,
     #[serde(default)]
     trust_host_cas: bool,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct MicrosandboxNetworkRule {
+    action: Action,
+    #[serde(default)]
+    destination_group: Option<DestinationGroup>,
+    #[serde(default)]
+    protocol: Option<Protocol>,
+    #[serde(default)]
+    ports: Vec<u16>,
+}
+
+fn build_network_policy(
+    config: &MicrosandboxNetworkConfig,
+    controller_url: &str,
+) -> Result<microsandbox::NetworkPolicy, Box<dyn Error + Send + Sync>> {
+    let mut policy = build_rule_config_policy(config)?;
+    if let Some(port) = controller_host_port(controller_url)? {
+        add_host_tcp_port_allow(&mut policy, port);
+    }
+    Ok(policy)
+}
+
+fn build_rule_config_policy(
+    config: &MicrosandboxNetworkConfig,
+) -> Result<microsandbox::NetworkPolicy, Box<dyn Error + Send + Sync>> {
+    let mut builder = NetworkPolicyBuilder::new();
+    if let Some(action) = config.default_egress {
+        builder = builder.default_egress(action);
+    }
+    if let Some(action) = config.default_ingress {
+        builder = builder.default_ingress(action);
+    }
+    for rule in &config.egress {
+        let rule = rule.clone();
+        builder = builder.egress(move |egress| apply_network_rule(egress, &rule));
+    }
+    for rule in &config.ingress {
+        let rule = rule.clone();
+        builder = builder.ingress(move |ingress| apply_network_rule(ingress, &rule));
+    }
+    builder
+        .build()
+        .map_err(|error| format!("invalid microsandbox network policy: {}", error).into())
+}
+
+fn apply_network_rule<'a>(
+    builder: &'a mut microsandbox_network::policy::RuleBuilder,
+    rule: &MicrosandboxNetworkRule,
+) -> &'a mut microsandbox_network::policy::RuleBuilder {
+    if let Some(protocol) = rule.protocol {
+        match protocol {
+            Protocol::Tcp => {
+                builder.tcp();
+            }
+            Protocol::Udp => {
+                builder.udp();
+            }
+            Protocol::Icmpv4 => {
+                builder.icmpv4();
+            }
+            Protocol::Icmpv6 => {
+                builder.icmpv6();
+            }
+        }
+    }
+    for port in &rule.ports {
+        builder.port(*port);
+    }
+    match rule.action {
+        Action::Allow => {
+            let dest = builder.allow();
+            apply_rule_destination(dest, rule);
+        }
+        Action::Deny => {
+            let dest = builder.deny();
+            apply_rule_destination(dest, rule);
+        }
+    }
+    builder
+}
+
+fn apply_rule_destination(
+    builder: microsandbox_network::policy::RuleDestinationBuilder<'_>,
+    rule: &MicrosandboxNetworkRule,
+) {
+    if let Some(group) = rule.destination_group {
+        builder.group(group);
+    } else {
+        builder.any();
+    }
+}
+
+fn add_host_tcp_port_allow(policy: &mut microsandbox::NetworkPolicy, port: u16) {
+    let mut rule = Rule::allow_egress(Destination::Group(DestinationGroup::Host));
+    rule.protocols.push(Protocol::Tcp);
+    rule.ports.push(PortRange::single(port));
+    policy.rules.push(rule);
+}
+
+fn controller_host_port(controller_url: &str) -> Result<Option<u16>, Box<dyn Error + Send + Sync>> {
+    let uri: Uri = controller_url
+        .parse()
+        .map_err(|error| format!("invalid controller URL '{}': {}", controller_url, error))?;
+    let Some(authority) = uri.authority() else {
+        return Ok(None);
+    };
+    if authority.host() != "host.microsandbox.internal" {
+        return Ok(None);
+    }
+    let port = authority
+        .port_u16()
+        .unwrap_or_else(|| match uri.scheme_str() {
+            Some("https") => 443,
+            _ => 80,
+        });
+    Ok(Some(port))
 }
 
 #[derive(Debug, Clone)]
@@ -1122,8 +1231,8 @@ fn default_cpus() -> u8 {
     2
 }
 
-fn default_mmux_binary() -> PathBuf {
-    PathBuf::from("./.artifacts/mmux")
+fn default_image() -> String {
+    DEFAULT_IMAGE.to_owned()
 }
 
 fn default_tmux_conf() -> PathBuf {
@@ -1133,6 +1242,7 @@ fn default_tmux_conf() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use microsandbox_network::policy::Direction;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1280,11 +1390,11 @@ assets_dir = "./profile_sources/codex/assets"
     }
 
     #[test]
-    fn example_microsandbox_config_parses_kimi_profile() {
+    fn setup_microsandbox_config_parses_kimi_profile() {
         let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
         let config_path = manifest_dir
             .join("../../..")
-            .join("example-backends/microsandbox/mmux.toml");
+            .join("example-backends/microsandbox/mmux-setup.toml");
 
         let loaded = load_microsandbox_config(&config_path).unwrap();
         let kimi = loaded
@@ -1304,6 +1414,15 @@ assets_dir = "./profile_sources/codex/assets"
                 .and_then(|launch| launch.scripts_dir.as_deref()),
             Some("./profile_sources/kimi/scripts")
         );
+        assert_eq!(loaded.config.network.default_egress, Some(Action::Deny));
+        assert_eq!(loaded.config.network.default_ingress, Some(Action::Deny));
+        let policy = build_network_policy(
+            &loaded.config.network,
+            "http://host.microsandbox.internal:3000",
+        )
+        .unwrap();
+        assert_eq!(policy.rules.len(), 4);
+        assert!(policy_has_host_tcp_port_allow(&policy, 3000));
     }
 
     #[test]
@@ -1328,5 +1447,94 @@ assets_dir = "./profile_sources/codex/assets"
                 .and_then(|launch| launch.scripts_dir.as_deref()),
             Some("./profile_sources/codex/scripts")
         );
+        assert_eq!(loaded.config.network.default_egress, Some(Action::Deny));
+        assert_eq!(loaded.config.network.default_ingress, Some(Action::Deny));
+        assert_eq!(
+            loaded
+                .config
+                .secrets
+                .first()
+                .map(|secret| secret.allowed_host.as_str()),
+            Some("host.microsandbox.internal")
+        );
+        let policy = build_network_policy(
+            &loaded.config.network,
+            "http://host.microsandbox.internal:3000",
+        )
+        .unwrap();
+        assert_eq!(policy.rules.len(), 1);
+        assert!(policy_has_host_tcp_port_allow(&policy, 3000));
+    }
+
+    #[test]
+    fn image_runtime_config_has_no_setup_scripts_or_profile_launchers() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let config_path = manifest_dir
+            .join("../../..")
+            .join("example-backends/microsandbox/mmux-image.toml.example");
+
+        let loaded = load_microsandbox_config(&config_path).unwrap();
+
+        assert!(loaded.config.assets.scripts_dir.is_none());
+        assert!(loaded
+            .coder_profiles
+            .iter()
+            .all(|profile| profile.launch.is_none()));
+        let policy = build_network_policy(
+            &loaded.config.network,
+            "http://host.microsandbox.internal:3000",
+        )
+        .unwrap();
+        assert_eq!(policy.rules.len(), 1);
+        assert!(policy_has_host_tcp_port_allow(&policy, 3000));
+    }
+
+    #[test]
+    fn runtime_config_has_controller_only_policy_and_no_setup_scripts() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let config_path = manifest_dir
+            .join("../../..")
+            .join("example-backends/microsandbox/mmux.toml");
+
+        let loaded = load_microsandbox_config(&config_path).unwrap();
+
+        assert!(loaded.config.assets.scripts_dir.is_none());
+        assert!(loaded
+            .coder_profiles
+            .iter()
+            .all(|profile| profile.launch.is_none()));
+        let policy = build_network_policy(
+            &loaded.config.network,
+            "http://host.microsandbox.internal:3000",
+        )
+        .unwrap();
+        assert_eq!(policy.rules.len(), 1);
+        assert!(policy_has_host_tcp_port_allow(&policy, 3000));
+    }
+
+    #[test]
+    fn controller_host_rule_uses_controller_url_port_only_for_microsandbox_host() {
+        let config = MicrosandboxNetworkConfig {
+            default_egress: Some(Action::Deny),
+            default_ingress: Some(Action::Deny),
+            ..Default::default()
+        };
+
+        let policy = build_network_policy(&config, "http://host.microsandbox.internal:3210")
+            .expect("policy");
+        assert!(policy_has_host_tcp_port_allow(&policy, 3210));
+
+        let policy = build_network_policy(&config, "http://example.com:3210").expect("policy");
+        assert!(!policy_has_host_tcp_port_allow(&policy, 3210));
+    }
+
+    fn policy_has_host_tcp_port_allow(policy: &microsandbox::NetworkPolicy, port: u16) -> bool {
+        policy.rules.iter().any(|rule| {
+            rule.direction == Direction::Egress
+                && rule.action == Action::Allow
+                && matches!(rule.destination, Destination::Group(DestinationGroup::Host))
+                && rule.protocols == vec![Protocol::Tcp]
+                && rule.ports == vec![PortRange::single(port)]
+        })
     }
 }

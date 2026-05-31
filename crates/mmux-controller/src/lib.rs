@@ -1,5 +1,5 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use clap::{Parser, ValueEnum};
+use clap::Parser;
 use connectrpc::{
     ConnectError, ConnectRpcService, RequestContext as ConnectRequestContext,
     Response as ConnectResponse, ServiceResult,
@@ -123,11 +123,9 @@ struct Cli {
         help = "Environment variable to read the bearer token from when --token/--token-file are not set."
     )]
     token_env: String,
-    #[arg(long, value_enum, default_value_t = SecurityMode::Local, help = "Security mode: open, local, workspace, attached, or readonly.")]
-    security_mode: SecurityMode,
     #[arg(
         long,
-        help = "Workspace root used to confine path-based APIs in workspace mode."
+        help = "Optional root used to confine local read_file/save_file path APIs."
     )]
     workspace_root: Option<String>,
     #[arg(
@@ -156,23 +154,8 @@ struct Cli {
     enable_local_node: bool,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
-enum SecurityMode {
-    /// Current trust-the-client behavior. Intended only for explicitly trusted deployments.
-    Open,
-    /// Full functionality for loopback use; remote binds require authentication.
-    Local,
-    /// Full terminal control, with path-based APIs confined to --workspace-root.
-    Workspace,
-    /// Drive existing sessions only. No process launch, file APIs, or session killing.
-    Attached,
-    /// Inspection only. No input, writes, process launch, or mutable profile changes.
-    Readonly,
-}
-
 #[derive(Clone, Debug)]
-struct SecurityPolicy {
-    mode: SecurityMode,
+struct ControllerPolicy {
     workspace_root: Option<PathBuf>,
     max_read_bytes: usize,
     max_write_bytes: usize,
@@ -181,28 +164,17 @@ struct SecurityPolicy {
     max_capture_bytes: usize,
 }
 
-impl SecurityPolicy {
+impl ControllerPolicy {
     fn new(cli: &Cli) -> Result<Self, String> {
         let workspace_root =
-            if cli.security_mode == SecurityMode::Workspace {
-                let root = cli
-                    .workspace_root
-                    .as_deref()
-                    .ok_or("--workspace-root is required in workspace mode")?;
-                Some(std::fs::canonicalize(root).map_err(|e| {
+            match cli.workspace_root.as_deref() {
+                Some(root) => Some(std::fs::canonicalize(root).map_err(|e| {
                     format!("failed to canonicalize workspace root '{}': {}", root, e)
-                })?)
-            } else {
-                match cli.workspace_root.as_deref() {
-                    Some(root) => Some(std::fs::canonicalize(root).map_err(|e| {
-                        format!("failed to canonicalize workspace root '{}': {}", root, e)
-                    })?),
-                    None => None,
-                }
+                })?),
+                None => None,
             };
 
         Ok(Self {
-            mode: cli.security_mode,
             workspace_root,
             max_read_bytes: cli.max_read_bytes,
             max_write_bytes: cli.max_write_bytes,
@@ -210,64 +182,6 @@ impl SecurityPolicy {
             max_request_bytes: cli.max_request_bytes,
             max_capture_bytes: cli.max_capture_bytes,
         })
-    }
-
-    fn deny(&self, action: &str) -> String {
-        format!("Denied by {:?} security mode: {}", self.mode, action)
-    }
-
-    fn can_create_session(&self) -> bool {
-        matches!(
-            self.mode,
-            SecurityMode::Open | SecurityMode::Local | SecurityMode::Workspace
-        )
-    }
-
-    fn can_kill_session(&self) -> bool {
-        matches!(
-            self.mode,
-            SecurityMode::Open | SecurityMode::Local | SecurityMode::Workspace
-        )
-    }
-
-    fn can_send_input(&self) -> bool {
-        !matches!(self.mode, SecurityMode::Readonly)
-    }
-
-    fn can_exec(&self) -> bool {
-        matches!(
-            self.mode,
-            SecurityMode::Open | SecurityMode::Local | SecurityMode::Workspace
-        )
-    }
-
-    fn can_read_files(&self) -> bool {
-        matches!(
-            self.mode,
-            SecurityMode::Open | SecurityMode::Local | SecurityMode::Workspace
-        )
-    }
-
-    fn can_write_files(&self) -> bool {
-        matches!(
-            self.mode,
-            SecurityMode::Open | SecurityMode::Local | SecurityMode::Workspace
-        )
-    }
-
-    fn can_mutate_profiles(&self) -> bool {
-        !matches!(self.mode, SecurityMode::Readonly)
-    }
-
-    fn can_load_profile_from_path(&self) -> bool {
-        matches!(
-            self.mode,
-            SecurityMode::Open | SecurityMode::Local | SecurityMode::Workspace
-        )
-    }
-
-    fn can_resize(&self) -> bool {
-        !matches!(self.mode, SecurityMode::Readonly)
     }
 
     fn clamp_timeout(&self, requested: f64) -> Result<f64, String> {
@@ -294,7 +208,7 @@ impl SecurityPolicy {
 
     fn resolve_read_path(&self, user_path: &str) -> Result<PathBuf, String> {
         match self.workspace_root.as_ref() {
-            Some(root) if self.mode == SecurityMode::Workspace => {
+            Some(root) => {
                 let candidate = self.workspace_candidate(root, user_path)?;
                 let real = std::fs::canonicalize(&candidate).map_err(|e| {
                     format!("failed to canonicalize '{}': {}", candidate.display(), e)
@@ -310,7 +224,7 @@ impl SecurityPolicy {
 
     fn resolve_write_path(&self, user_path: &str) -> Result<PathBuf, String> {
         match self.workspace_root.as_ref() {
-            Some(root) if self.mode == SecurityMode::Workspace => {
+            Some(root) => {
                 let candidate = self.workspace_candidate(root, user_path)?;
                 let parent = candidate
                     .parent()
@@ -598,6 +512,21 @@ fn save_file_impl(
 
 fn load_profile_from_toml(text: &str) -> Result<CliProfile, String> {
     mmux_node::load_profile_from_toml(text)
+}
+
+fn profile_launch_command(profile: &CliProfile, bypass_permissions: bool) -> Result<&str, String> {
+    if bypass_permissions {
+        return profile.permission_bypass_cmd.as_deref().ok_or_else(|| {
+            format!(
+                "profile '{}' does not define permission_bypass_cmd; set one in the coder profile before using bypass_permissions=true",
+                profile.name
+            )
+        });
+    }
+    profile
+        .cmd
+        .as_deref()
+        .ok_or_else(|| format!("profile '{}' does not define a launch cmd", profile.name))
 }
 
 async fn session_exec(
@@ -1382,7 +1311,7 @@ impl Actor for LocalNodeActor {
 #[derive(Clone)]
 struct TmuxMcpServer {
     profiles: ProfileRegistry,
-    policy: SecurityPolicy,
+    policy: ControllerPolicy,
     local_node: Option<ActorRef<LocalNodeMessage>>,
     registry: ActorRef<NodeRegistryMessage>,
 }
@@ -1399,7 +1328,7 @@ struct RemoteWaitOptions<'a> {
 impl TmuxMcpServer {
     fn new(
         profiles: ProfileRegistry,
-        policy: SecurityPolicy,
+        policy: ControllerPolicy,
         local_node: Option<ActorRef<LocalNodeMessage>>,
         registry: ActorRef<NodeRegistryMessage>,
     ) -> Self {
@@ -1571,10 +1500,6 @@ impl TmuxMcpServer {
             reply,
         })
         .await
-    }
-
-    fn deny(&self, action: &str) -> CallToolResult {
-        Self::error_result(self.policy.deny(action))
     }
 
     async fn local_node_call<T>(
@@ -1973,6 +1898,7 @@ impl ServerHandler for TmuxMcpServer {
                         "node": { "type": "string", "description": "Execution node id (default: local)" },
                         "cwd": { "type": "string", "description": "Working directory" },
                         "objective": { "type": "string", "description": "Short description of what this coder session is about" },
+                        "bypass_permissions": { "type": "boolean", "description": "Use the profile's explicit permission_bypass_cmd for this session. This may disable the coder CLI's approval prompts or sandboxing. Default: false." },
                         "timeout_seconds": { "type": "integer", "description": "Max seconds to wait for readiness (default: 30)" }
                     }), None)),
                 ),
@@ -2092,9 +2018,6 @@ impl ServerHandler for TmuxMcpServer {
         let result = match request.name.as_ref() {
             // ── Universal session management ──
             "kill_session" => {
-                if !self.policy.can_kill_session() {
-                    return Ok(self.deny("kill_session"));
-                }
                 if node != "local" {
                     if !self.node_session_exists(node, session).await {
                         return Ok(Self::text_result(format!(
@@ -2175,6 +2098,7 @@ impl ServerHandler for TmuxMcpServer {
                             json!({
                                 "name": profile.name,
                                 "cmd": profile.cmd,
+                                "permission_bypass_cmd": profile.permission_bypass_cmd,
                                 "prompt_indicator": profile.prompt_indicator,
                                 "busy_indicators": profile.busy_indicators,
                                 "startup_dismiss": profile.startup_dismiss,
@@ -2200,9 +2124,6 @@ impl ServerHandler for TmuxMcpServer {
             },
             // ── Universal interaction ──
             "send_input" => {
-                if !self.policy.can_send_input() {
-                    return Ok(self.deny("send_input"));
-                }
                 let text = args
                     .get("text")
                     .and_then(|v| v.as_str())
@@ -2263,9 +2184,6 @@ impl ServerHandler for TmuxMcpServer {
                 }
             }
             "send_key" => {
-                if !self.policy.can_send_input() {
-                    return Ok(self.deny("send_key"));
-                }
                 let key = args
                     .get("key")
                     .and_then(|v| v.as_str())
@@ -2404,9 +2322,6 @@ impl ServerHandler for TmuxMcpServer {
                 }
             }
             "interact" => {
-                if !self.policy.can_send_input() {
-                    return Ok(self.deny("interact"));
-                }
                 let text = args
                     .get("text")
                     .and_then(|v| v.as_str())
@@ -2500,9 +2415,6 @@ impl ServerHandler for TmuxMcpServer {
                 }
             }
             "exec" => {
-                if !self.policy.can_exec() {
-                    return Ok(self.deny("exec"));
-                }
                 let command = args
                     .get("command")
                     .and_then(|v| v.as_str())
@@ -2658,9 +2570,6 @@ impl ServerHandler for TmuxMcpServer {
             }
             // ── File operations ──
             "read_file" => {
-                if !self.policy.can_read_files() {
-                    return Ok(self.deny("read_file"));
-                }
                 let path = args
                     .get("path")
                     .and_then(|v| v.as_str())
@@ -2760,9 +2669,6 @@ impl ServerHandler for TmuxMcpServer {
                 }
             }
             "save_file" => {
-                if !self.policy.can_write_files() {
-                    return Ok(self.deny("save_file"));
-                }
                 let path = args
                     .get("path")
                     .and_then(|v| v.as_str())
@@ -2788,7 +2694,7 @@ impl ServerHandler for TmuxMcpServer {
                 } else {
                     path.to_owned()
                 };
-                if node == "local" && self.policy.mode != SecurityMode::Workspace {
+                if node == "local" && self.policy.workspace_root.is_none() {
                     if let Some(parent) = std::path::Path::new(&resolved_text).parent() {
                         let _ = std::fs::create_dir_all(parent);
                     }
@@ -2870,9 +2776,6 @@ impl ServerHandler for TmuxMcpServer {
             }
             // ── Coding CLI adapters ──
             "coding_send" => {
-                if !self.policy.can_send_input() {
-                    return Ok(self.deny("coding_send"));
-                }
                 let prompt = args
                     .get("prompt")
                     .and_then(|v| v.as_str())
@@ -2956,9 +2859,6 @@ impl ServerHandler for TmuxMcpServer {
                 }
             }
             "start_coding_session" => {
-                if !self.policy.can_create_session() {
-                    return Ok(self.deny("start_coding_session"));
-                }
                 let profile = self
                     .resolve_profile(args.get("profile").and_then(|v| v.as_str()))
                     .ok_or_else(|| McpError::invalid_request("unknown profile", None))?;
@@ -2986,6 +2886,10 @@ impl ServerHandler for TmuxMcpServer {
                     .and_then(|value| value.as_str())
                     .map(str::trim)
                     .filter(|value| !value.is_empty());
+                let bypass_permissions = args
+                    .get("bypass_permissions")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 let timeout = self
                     .policy
                     .clamp_timeout(
@@ -2996,12 +2900,8 @@ impl ServerHandler for TmuxMcpServer {
                     )
                     .map_err(|e| McpError::invalid_request(e, None))?
                     as u64;
-                let cmd = profile.cmd.as_deref().ok_or_else(|| {
-                    McpError::invalid_request(
-                        format!("profile '{}' does not define a launch cmd", profile.name),
-                        None,
-                    )
-                })?;
+                let cmd = profile_launch_command(&profile, bypass_permissions)
+                    .map_err(|error| McpError::invalid_request(error, None))?;
                 let launch_envs = Self::profile_launch_envs(&profile)
                     .map_err(|error| McpError::invalid_request(error, None))?;
                 if let Err(error) = self.apply_launch_envs(node, &launch_envs).await {
@@ -3058,9 +2958,6 @@ impl ServerHandler for TmuxMcpServer {
                 }
             }
             "coding_action" => {
-                if !self.policy.can_send_input() {
-                    return Ok(self.deny("coding_action"));
-                }
                 let action = args
                     .get("action")
                     .and_then(|v| v.as_str())
@@ -3165,13 +3062,7 @@ impl ServerHandler for TmuxMcpServer {
                 }
             }
             "load_profile" => {
-                if !self.policy.can_mutate_profiles() {
-                    return Ok(self.deny("load_profile"));
-                }
                 let toml_text = if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
-                    if !self.policy.can_load_profile_from_path() {
-                        return Ok(self.deny("load_profile path"));
-                    }
                     let resolved = self
                         .policy
                         .resolve_read_path(path)
@@ -3305,9 +3196,6 @@ impl ServerHandler for TmuxMcpServer {
                 }
             }
             "resize_pane" => {
-                if !self.policy.can_resize() {
-                    return Ok(self.deny("resize_pane"));
-                }
                 let width = args.get("width").and_then(|v| v.as_u64()).map(|n| n as u32);
                 let height = args
                     .get("height")
@@ -3818,7 +3706,7 @@ impl MmuxNodeRegistryService for NodeRegistryConnectService {
 async fn run_mcp_http_server(
     bind: SocketAddr,
     profiles: ProfileRegistry,
-    policy: SecurityPolicy,
+    policy: ControllerPolicy,
     token: Option<String>,
     enable_local_node: bool,
 ) -> Result<(), String> {
@@ -3896,7 +3784,6 @@ async fn run_mcp_http_server(
     let router = health_router.merge(api_router).merge(wire_router);
 
     println!("mmux MCP HTTP server listening on http://{}/mcp", bind);
-    println!("  Security mode: {:?}", policy.mode);
     if let Some(root) = policy.workspace_root.as_ref() {
         println!("  Workspace root: {}", root.display());
     }
@@ -3950,7 +3837,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-fn resolve_token(cli: &Cli, policy: &SecurityPolicy) -> Result<Option<String>, String> {
+fn resolve_token(cli: &Cli, policy: &ControllerPolicy) -> Result<Option<String>, String> {
     if let Some(token) = cli.token.as_ref() {
         if token.is_empty() {
             return Err("--token must not be empty".into());
@@ -4006,10 +3893,9 @@ fn warn_if_token_file_permissions_are_loose(path: &Path) {
 #[cfg(not(unix))]
 fn warn_if_token_file_permissions_are_loose(_path: &Path) {}
 
-fn validate_startup_security(
+fn validate_remote_bind_auth(
     bind: SocketAddr,
     token: Option<&String>,
-    policy: &SecurityPolicy,
     allow_remote_without_token: bool,
 ) -> Result<(), String> {
     if is_loopback_bind(bind) || token.is_some() {
@@ -4017,14 +3903,14 @@ fn validate_startup_security(
     }
     if allow_remote_without_token {
         eprintln!(
-            "Warning: mmux is bound to {} without authentication in {:?} mode. Only use this behind localhost-only port forwarding or another trusted network boundary.",
-            bind, policy.mode
+            "Warning: mmux is bound to {} without authentication. Only use this behind localhost-only port forwarding or another trusted network boundary.",
+            bind
         );
         return Ok(());
     }
     Err(format!(
-        "refusing to bind unauthenticated mmux to {} in {:?} mode; set --token, --token-file, or MMUX_TOKEN, or deliberately use --allow-remote-without-token behind a trusted network boundary",
-        bind, policy.mode
+        "refusing to bind unauthenticated mmux to {}; set --token, --token-file, or MMUX_TOKEN, or deliberately use --allow-remote-without-token behind a trusted network boundary",
+        bind
     ))
 }
 
@@ -4042,8 +3928,8 @@ where
     T: Into<OsString> + Clone,
 {
     let cli = Cli::parse_from(args);
-    let policy = SecurityPolicy::new(&cli).unwrap_or_else(|e| {
-        eprintln!("Security policy error: {}", e);
+    let policy = ControllerPolicy::new(&cli).unwrap_or_else(|e| {
+        eprintln!("Controller policy error: {}", e);
         std::process::exit(1);
     });
     let token = resolve_token(&cli, &policy).unwrap_or_else(|e| {
@@ -4074,16 +3960,12 @@ where
     let bind: SocketAddr = format!("{}:{}", cli.host, cli.port)
         .parse()
         .unwrap_or_else(|_| "127.0.0.1:3000".parse().unwrap());
-    validate_startup_security(
-        bind,
-        token.as_ref(),
-        &policy,
-        cli.allow_remote_without_token,
-    )
-    .unwrap_or_else(|e| {
-        eprintln!("Security policy error: {}", e);
-        std::process::exit(1);
-    });
+    validate_remote_bind_auth(bind, token.as_ref(), cli.allow_remote_without_token).unwrap_or_else(
+        |e| {
+            eprintln!("Controller policy error: {}", e);
+            std::process::exit(1);
+        },
+    );
 
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     if let Err(e) = rt.block_on(run_mcp_http_server(
@@ -4126,7 +4008,6 @@ mod tests {
             token: None,
             token_file: None,
             token_env: "MMUX_TOKEN".into(),
-            security_mode: SecurityMode::Local,
             workspace_root: None,
             allow_remote_without_token: false,
             max_read_bytes: 4 * 1024 * 1024,
@@ -4179,6 +4060,27 @@ triggers = ["Starting MCP servers"]
     }
 
     #[test]
+    fn test_profile_launch_command_requires_explicit_permission_bypass_cmd() {
+        let mut profile = CliProfile {
+            name: "test".into(),
+            cmd: Some("test-cli".into()),
+            permission_bypass_cmd: None,
+            ..CliProfile::default()
+        };
+
+        assert_eq!(profile_launch_command(&profile, false).unwrap(), "test-cli");
+        assert!(profile_launch_command(&profile, true)
+            .unwrap_err()
+            .contains("does not define permission_bypass_cmd"));
+
+        profile.permission_bypass_cmd = Some("test-cli --dangerously-bypass-permissions".into());
+        assert_eq!(
+            profile_launch_command(&profile, true).unwrap(),
+            "test-cli --dangerously-bypass-permissions"
+        );
+    }
+
+    #[test]
     fn test_load_profile_invalid_toml() {
         let toml = "not valid toml ::";
         let result = load_profile_from_toml(toml);
@@ -4186,10 +4088,10 @@ triggers = ["Starting MCP servers"]
     }
 
     #[test]
-    fn test_security_policy_clamp_timeout_rejects_invalid_and_clamps() {
+    fn test_controller_policy_clamp_timeout_rejects_invalid_and_clamps() {
         let mut cli = test_cli();
         cli.max_timeout_seconds = 12.5;
-        let policy = SecurityPolicy::new(&cli).unwrap();
+        let policy = ControllerPolicy::new(&cli).unwrap();
 
         assert!(policy.clamp_timeout(0.0).is_err());
         assert!(policy.clamp_timeout(f64::NAN).is_err());
@@ -4201,7 +4103,7 @@ triggers = ["Starting MCP servers"]
     fn test_limit_capture_output_truncates_on_utf8_boundary() {
         let mut cli = test_cli();
         cli.max_capture_bytes = 5;
-        let policy = SecurityPolicy::new(&cli).unwrap();
+        let policy = ControllerPolicy::new(&cli).unwrap();
 
         let result = policy.limit_capture_output("prefixétail".into());
 
@@ -4217,9 +4119,8 @@ triggers = ["Starting MCP servers"]
         let file = root.join("inside.txt");
         fs::write(&file, "ok").unwrap();
         let mut cli = test_cli();
-        cli.security_mode = SecurityMode::Workspace;
         cli.workspace_root = Some(root.to_string_lossy().into_owned());
-        let policy = SecurityPolicy::new(&cli).unwrap();
+        let policy = ControllerPolicy::new(&cli).unwrap();
 
         let resolved = policy.resolve_read_path("inside.txt").unwrap();
 
@@ -4232,9 +4133,8 @@ triggers = ["Starting MCP servers"]
         let root = unique_temp_dir("mmux-read-escape");
         fs::create_dir_all(&root).unwrap();
         let mut cli = test_cli();
-        cli.security_mode = SecurityMode::Workspace;
         cli.workspace_root = Some(root.to_string_lossy().into_owned());
-        let policy = SecurityPolicy::new(&cli).unwrap();
+        let policy = ControllerPolicy::new(&cli).unwrap();
 
         let error = policy.resolve_read_path("../outside.txt").unwrap_err();
 
@@ -4247,9 +4147,8 @@ triggers = ["Starting MCP servers"]
         let root = unique_temp_dir("mmux-write-root");
         fs::create_dir_all(&root).unwrap();
         let mut cli = test_cli();
-        cli.security_mode = SecurityMode::Workspace;
         cli.workspace_root = Some(root.to_string_lossy().into_owned());
-        let policy = SecurityPolicy::new(&cli).unwrap();
+        let policy = ControllerPolicy::new(&cli).unwrap();
 
         let resolved = policy.resolve_write_path("nested/output.txt").unwrap();
 
@@ -4264,23 +4163,19 @@ triggers = ["Starting MCP servers"]
     }
 
     #[test]
-    fn test_validate_startup_security_rejects_remote_without_auth_unless_allowed() {
-        let cli = test_cli();
-        let policy = SecurityPolicy::new(&cli).unwrap();
+    fn test_validate_remote_bind_auth_rejects_remote_without_auth_unless_allowed() {
         let bind: SocketAddr = "203.0.113.10:3000".parse().unwrap();
 
-        assert!(validate_startup_security(bind, None, &policy, false).is_err());
-        assert!(validate_startup_security(bind, None, &policy, true).is_ok());
-        assert!(
-            validate_startup_security(bind, Some(&"secret".to_owned()), &policy, false).is_ok()
-        );
+        assert!(validate_remote_bind_auth(bind, None, false).is_err());
+        assert!(validate_remote_bind_auth(bind, None, true).is_ok());
+        assert!(validate_remote_bind_auth(bind, Some(&"secret".to_owned()), false).is_ok());
     }
 
     #[test]
     fn test_resolve_token_reads_configured_env_and_rejects_empty() {
         let mut cli = test_cli();
         cli.token_env = format!("MMUX_TEST_TOKEN_{}", std::process::id());
-        let policy = SecurityPolicy::new(&cli).unwrap();
+        let policy = ControllerPolicy::new(&cli).unwrap();
         std::env::set_var(&cli.token_env, "abc123");
         assert_eq!(resolve_token(&cli, &policy).unwrap(), Some("abc123".into()));
 

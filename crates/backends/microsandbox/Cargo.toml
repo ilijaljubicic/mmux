@@ -6,8 +6,10 @@ license.workspace = true
 
 [dependencies]
 clap = { workspace = true }
+http = { workspace = true }
 indoc = { workspace = true }
 microsandbox = "0.5.3"
+microsandbox-network = "0.5.3"
 mmux-node = { path = "../../mmux-node" }
 mmux-shared = { path = "../../mmux-shared" }
 serde = { workspace = true }

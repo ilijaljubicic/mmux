@@ -1,10 +1,9 @@
 .DEFAULT_GOAL := help
 
-IMAGE ?= debian:bookworm-slim
 SANDBOX ?= mmux-node
 NODE_ID ?= msb-mmux-1
 NODE_NAME ?= Microsandbox mmux node
-CONTROLLER_URL ?= http://controller.mmux.local:3000
+CONTROLLER_URL ?= http://host.microsandbox.internal:3000
 NODE_CONFIG ?= mmux.toml
 SNAPSHOT_NAME ?= $(SANDBOX)-seed
 BUNDLE ?= .artifacts/$(SANDBOX)-seed.tar.zst
@@ -14,7 +13,7 @@ help:
 	@printf 'Microsandbox mmux backend example\n'
 	@printf '\n'
 	@printf '  make build       Build the microsandbox launcher\n'
-	@printf '  make launch      Launch mmux node inside Microsandbox\n'
+	@printf '  make launch      Launch mmux node from NODE_CONFIG\n'
 	@printf '  make bundle-launch  Import a bundle and launch from that snapshot\n'
 	@printf '  make bundle-export  Stop, snapshot, and export a bundle\n'
 	@printf '  make status      Show sandbox status\n'
@@ -27,7 +26,6 @@ build:
 launch: build
 	cargo run -p mmux-microsandbox-node -- launch \
 		--name $(SANDBOX) \
-		--image $(IMAGE) \
 		--node-config $(NODE_CONFIG) \
 		--controller-url $(CONTROLLER_URL) \
 		--node-id $(NODE_ID) \
@@ -42,7 +40,6 @@ bundle-launch: build
 	fi; \
 	cargo run -p mmux-microsandbox-node -- launch \
 		--name $(SANDBOX) \
-		--image $(IMAGE) \
 		--node-config $(NODE_CONFIG) \
 		--snapshot "$$imported" \
 		--controller-url $(CONTROLLER_URL) \
@@ -59,26 +56,21 @@ bundle-export:
 	fi; \
 	cargo run -p mmux-microsandbox-node -- snapshot-export \
 		--name $(SANDBOX) \
-		--image $(IMAGE) \
 		--snapshot-name $(SNAPSHOT_NAME) \
 		--bundle $(BUNDLE)
 
 status:
 	cargo run -p mmux-microsandbox-node -- status \
-		--name $(SANDBOX) \
-		--image $(IMAGE)
+		--name $(SANDBOX)
 
 logs:
 	cargo run -p mmux-microsandbox-node -- logs \
-		--name $(SANDBOX) \
-		--image $(IMAGE)
+		--name $(SANDBOX)
 
 resume:
 	cargo run -p mmux-microsandbox-node -- resume \
-		--name $(SANDBOX) \
-		--image $(IMAGE)
+		--name $(SANDBOX)
 
 stop:
 	cargo run -p mmux-microsandbox-node -- stop \
-		--name $(SANDBOX) \
-		--image $(IMAGE)
+		--name $(SANDBOX)

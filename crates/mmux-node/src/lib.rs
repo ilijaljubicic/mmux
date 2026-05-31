@@ -443,6 +443,7 @@ fn default_profile_map() -> HashMap<String, CliProfile> {
         CliProfile {
             name: "opencode".into(),
             cmd: Some("opencode".into()),
+            permission_bypass_cmd: None,
             prompt_indicator: ">".into(),
             busy_indicators: vec!["Processing".into(), "Generating".into()],
             startup_dismiss: None,
@@ -459,6 +460,7 @@ fn default_profile_map() -> HashMap<String, CliProfile> {
         CliProfile {
             name: "kimi".into(),
             cmd: Some("kimi".into()),
+            permission_bypass_cmd: Some("kimi --yolo".into()),
             prompt_indicator: ">".into(),
             busy_indicators: vec![
                 "Working".into(),
@@ -484,6 +486,7 @@ fn default_profile_map() -> HashMap<String, CliProfile> {
         CliProfile {
             name: "codex".into(),
             cmd: Some("codex".into()),
+            permission_bypass_cmd: Some("codex --dangerously-bypass-approvals-and-sandbox".into()),
             prompt_indicator: "›".into(),
             busy_indicators: vec!["• Working".into(), "Starting MCP servers".into()],
             startup_dismiss: Some(StartupDismiss {
@@ -503,6 +506,7 @@ fn default_profile_map() -> HashMap<String, CliProfile> {
         CliProfile {
             name: "claude".into(),
             cmd: Some("claude".into()),
+            permission_bypass_cmd: Some("claude --dangerously-skip-permissions".into()),
             prompt_indicator: "❯".into(),
             busy_indicators: vec!["Thinking".into(), "Working".into(), "Running".into()],
             startup_dismiss: Some(StartupDismiss {
@@ -817,6 +821,10 @@ prompt_indicator = "codex ready"
 
         let codex = get_profile(&profiles, "codex").expect("codex profile");
         assert_eq!(codex.prompt_indicator, "›");
+        assert_eq!(
+            codex.permission_bypass_cmd.as_deref(),
+            Some("codex --dangerously-bypass-approvals-and-sandbox")
+        );
         let codex_dismiss = codex.startup_dismiss.expect("codex startup dismiss");
         assert_eq!(codex_dismiss.key, "Down Enter");
         assert!(codex_dismiss
@@ -826,6 +834,10 @@ prompt_indicator = "codex ready"
 
         let claude = get_profile(&profiles, "claude").expect("claude profile");
         assert_eq!(claude.cmd.as_deref(), Some("claude"));
+        assert_eq!(
+            claude.permission_bypass_cmd.as_deref(),
+            Some("claude --dangerously-skip-permissions")
+        );
         assert_eq!(claude.prompt_indicator, "❯");
         assert!(claude
             .busy_indicators

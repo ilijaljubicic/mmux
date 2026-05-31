@@ -38,16 +38,36 @@ scripts_dir = "./profile_sources/claude/scripts"
 assets_dir = "./profile_sources/claude/assets"
 
 [microsandbox.network]
-network_policy = "non_local"
-# deny_domain = ["ads.example.com"]
-# deny_domain_suffix = [".tracking.com"]
-# max_connections = 50
+default_egress = "deny"
+default_ingress = "deny"
+# The launcher automatically allows the controller URL when it targets
+# host.microsandbox.internal, including the URL port. Add rules here only for
+# extra access that this sandbox should have.
+#
+# For a separate setup-only config, add resolver and public HTTP/HTTPS egress:
+# [[microsandbox.network.egress]]
+# action = "allow"
+# destination_group = "host"
+# protocol = "udp"
+# ports = [53]
+#
+# [[microsandbox.network.egress]]
+# action = "allow"
+# destination_group = "host"
+# protocol = "tcp"
+# ports = [53]
+#
+# [[microsandbox.network.egress]]
+# action = "allow"
+# destination_group = "public"
+# protocol = "tcp"
+# ports = [80, 443]
 # trust_host_cas = true
 
 [[microsandbox.secrets]]
 env = "MMUX_CONTROLLER_TOKEN"
 value_from = "host.MMUX_TOKEN"
-allowed_host = "controller.mmux.local"
+allowed_host = "host.microsandbox.internal"
 placeholder = "$MSB_MMUX_CONTROLLER_TOKEN"
 inject_headers = false
 inject_basic_auth = false

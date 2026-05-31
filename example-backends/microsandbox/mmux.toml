@@ -1,39 +1,23 @@
 [microsandbox.runtime]
+image = "debian:bookworm-slim"
 # memory_mib = 1024
 # cpus = 2
 
 [microsandbox.assets]
-mmux_source = { repo = "https://github.com/ilijaljubicic/mmux.git", ref = "v0.1.0" }
-scripts_dir = "./mmux_sources/scripts"
-assets_dir = "./mmux_sources/assets"
 tmux_conf = "./mmux_sources/assets/tmux.conf"
 
-# Coder profiles are built into mmux. These sections only extend the built-in
-# profiles with Microsandbox launch assets. Do not repeat backend-agnostic
-# fields like cmd, prompt_indicator, or busy_indicators unless you intentionally
-# want to replace the built-in value.
-
-[coder_profile.codex.launch]
-scripts_dir = "./profile_sources/codex/scripts"
-assets_dir = "./profile_sources/codex/assets"
-
-[coder_profile.opencode.launch]
-scripts_dir = "./profile_sources/opencode/scripts"
-assets_dir = "./profile_sources/opencode/assets"
-
-[coder_profile.kimi.launch]
-scripts_dir = "./profile_sources/kimi/scripts"
-assets_dir = "./profile_sources/kimi/assets"
-
-[coder_profile.claude.launch]
-scripts_dir = "./profile_sources/claude/scripts"
-assets_dir = "./profile_sources/claude/assets"
+# Runtime config for prepared snapshots. Use mmux-setup.toml to build the
+# snapshot from a stock image, then bundle-launch with this config.
 
 [microsandbox.network]
-network_policy = "non_local"
-# deny_domain = ["ads.example.com"]
-# deny_domain_suffix = [".tracking.com"]
-# max_connections = 50
+default_egress = "deny"
+default_ingress = "deny"
+# The launcher automatically allows the controller URL when it targets
+# host.microsandbox.internal, including the URL port. Add rules here only for
+# extra access that this sandbox should have.
+#
+# Do not mutate this runtime config for setup. Use mmux-setup.toml for
+# first-time preparation, or mmux-image.toml.example with a prepared image.
 # trust_host_cas = true
 
 # [[microsandbox.volumes]]
@@ -53,7 +37,7 @@ network_policy = "non_local"
 [[microsandbox.secrets]]
 env = "MMUX_CONTROLLER_TOKEN"
 value_from = "host.MMUX_TOKEN"
-allowed_host = "controller.mmux.local"
+allowed_host = "host.microsandbox.internal"
 placeholder = "$MSB_MMUX_CONTROLLER_TOKEN"
 inject_headers = false
 inject_basic_auth = false

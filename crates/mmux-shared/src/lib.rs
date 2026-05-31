@@ -10,6 +10,8 @@ pub struct StartupDismiss {
 pub struct CliProfile {
     pub name: String,
     pub cmd: Option<String>,
+    #[serde(default)]
+    pub permission_bypass_cmd: Option<String>,
     pub prompt_indicator: String,
     pub busy_indicators: Vec<String>,
     pub startup_dismiss: Option<StartupDismiss>,
@@ -26,6 +28,7 @@ impl Default for CliProfile {
         Self {
             name: "generic".into(),
             cmd: None,
+            permission_bypass_cmd: None,
             prompt_indicator: "$".into(),
             busy_indicators: vec![],
             startup_dismiss: None,

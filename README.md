@@ -98,12 +98,34 @@ In another shell, launch the Microsandbox node:
 cd example-backends/microsandbox
 export MMUX_TOKEN=<same-token>
 make build
-make launch CONTROLLER_URL="http://<controller-host>:3000"
+make launch NODE_CONFIG=mmux-setup.toml
 ```
 
-Use a hostname for `<controller-host>` that resolves from inside the sandbox.
-The `allowed_host` setting in `example-backends/microsandbox/mmux.toml` must
-match that hostname when the token is injected as a Microsandbox secret.
+The Microsandbox example uses `http://host.microsandbox.internal:3000` by
+default. That is the Microsandbox-provided host alias for reaching the laptop
+or host machine from inside the sandbox. When `CONTROLLER_URL` targets that
+alias, the launcher automatically allows exactly that host TCP port for node
+registration and command polling. The controller token secret is scoped to
+`allowed_host = "host.microsandbox.internal"`.
+
+`mmux-setup.toml` is for first-time preparation: it opens DNS plus
+public HTTP/HTTPS egress so apt/curl/git/npm/cargo installers can run. Export a
+snapshot after setup, then relaunch that snapshot with `mmux.toml` for the
+controller-only runtime policy.
+
+If you already have a prepared Docker/OCI image with `tmux`, `mmux`, and the
+coder CLIs installed, create an image config from the template and launch with
+that config:
+
+```bash
+cp mmux-image.toml.example mmux-image.toml
+# Edit [microsandbox.runtime].image in mmux-image.toml.
+make launch NODE_CONFIG=mmux-image.toml
+```
+
+That config has no setup script sections, so launch does not open installer
+network access. It only applies the controller URL allow rule and starts the
+node from the prepared image.
 
 ## CLI Entrypoints
 
@@ -125,8 +147,7 @@ Important controller flags:
 | `--token` | none | Bearer token for MCP and wire requests. |
 | `--token-file` | none | Reads the bearer token from a file. |
 | `--token-env` | `MMUX_TOKEN` | Env var used when token flags are omitted. |
-| `--security-mode` | `local` | One of `open`, `local`, `workspace`, `attached`, or `readonly`. |
-| `--workspace-root` | none | Required in `workspace` mode. |
+| `--workspace-root` | none | Optional root used to confine local `read_file` / `save_file` path APIs. |
 | `--enable-local-node` | false | Starts the built-in local tmux node in-process. |
 
 Important node flags:
@@ -202,7 +223,14 @@ Backend-agnostic override example:
 # unchanged.
 [coder_profile.codex]
 cmd = "codex --model gpt-5"
+permission_bypass_cmd = "codex --model gpt-5 --dangerously-bypass-approvals-and-sandbox"
 ```
+
+`permission_bypass_cmd` is optional and only used when `start_coding_session`
+receives `bypass_permissions = true`. Normal sessions always use `cmd`. This
+keeps approval/sandbox bypass modes an explicit per-session choice. Built-in
+profiles define `permission_bypass_cmd` only for CLIs whose local help exposes a
+clear bypass flag.
 
 Microsandbox extension example:
 
@@ -285,7 +313,7 @@ Profile-aware coding tools:
 | Tool | Purpose |
 | ---- | ------- |
 | `list_coder_profiles` | List loaded coder profiles. |
-| `start_coding_session` | Start a CLI from its profile command. |
+| `start_coding_session` | Start a CLI from its profile command, or from `permission_bypass_cmd` when `bypass_permissions = true`. |
 | `coding_send` | Send a prompt to a coding CLI. |
 | `coding_wait_ready` | Wait until the CLI is at prompt and not busy. |
 | `coding_read` | Read recent CLI output. |
@@ -317,8 +345,9 @@ Prompts:
 ## Security
 
 mmux is a terminal controller. Giving a client access to a writable mmux server
-is equivalent to giving that client shell access as the server user, plus any
-filesystem access allowed by the selected security mode.
+is equivalent to giving that client shell access as the server user. The local
+backend is not sandboxed. Use trusted clients only, or run work through a
+sandboxed backend such as Microsandbox.
 
 The default bind host is loopback-only. A non-loopback unauthenticated bind is
 rejected unless you deliberately pass `--allow-remote-without-token`. For any
@@ -335,15 +364,10 @@ Authenticated requests must include:
 Authorization: Bearer <token>
 ```
 
-Security modes:
-
-| Mode | Intended use | Allows |
-| ---- | ------------ | ------ |
-| `open` | Explicit trusted deployments | Full terminal and file operations. |
-| `local` | Default local development | Full functionality; remote binds require auth. |
-| `workspace` | Shared workspace confinement | Full terminal control with path APIs confined to `--workspace-root`. |
-| `attached` | Drive existing sessions | Input/capture/coding tools without process launch, file APIs, or session killing. |
-| `readonly` | Monitoring and diagnostics | Read-only session/profile inspection. |
+`--workspace-root` is a file API guardrail for the built-in local node: when it
+is set, local `read_file`, `save_file`, and local coding-session `cwd`
+resolution are confined under that root. It is not a sandbox for terminal
+commands.
 
 Request and output limits are configurable with `--max-read-bytes`,
 `--max-write-bytes`, `--max-timeout-seconds`, `--max-request-bytes`, and
@@ -383,19 +407,38 @@ The canonical controller/node wire schema lives in
 - `mmux.toml.example` shows optional local/node profile overlays.
 - `mmux-microsandbox.toml.example` shows Microsandbox config plus profile
   launch extensions.
-- `example-backends/microsandbox/mmux.toml` defines Microsandbox runtime,
-  assets, network policy, secrets, volumes, mounts, patches, and profile launch
-  extensions.
+- `example-backends/microsandbox/mmux.toml` defines controller-only runtime
+  policy for prepared sandboxes.
+- `example-backends/microsandbox/mmux-setup.toml` defines first-time
+  setup policy with explicit installer egress.
+- `example-backends/microsandbox/mmux-image.toml.example` defines runtime from
+  a prepared Docker/OCI image without setup scripts; copy it to a real TOML and
+  set `[microsandbox.runtime].image`.
 
 The Microsandbox backend:
 
-- installs `mmux` from the git ref declared in `mmux.toml`; the ref can be a
-  branch, commit SHA, or release tag such as `v0.1.0`;
-- loads shared scripts from `mmux_sources/scripts`;
-- loads per-profile setup from `profile_sources/<profile>/scripts`;
+- can install `mmux` from the configured git ref during setup, or use a
+  prepared image/snapshot that already contains `/usr/local/bin/mmux`;
+- loads shared scripts from `mmux_sources/scripts` when the selected config
+  declares them;
+- loads per-profile setup from `profile_sources/<profile>/scripts` when the
+  selected config declares them;
 - copies `mmux_sources/assets/tmux.conf` into the guest and sources it from
   `/etc/tmux.conf`;
+- automatically allows the `host.microsandbox.internal:<port>` controller URL
+  as launcher plumbing, without requiring that rule in user TOML;
 - can snapshot/export/import prepared sandboxes for faster relaunch.
+
+The checked-in Microsandbox config uses `default_egress = "deny"` and
+`default_ingress = "deny"`. Use `[[microsandbox.network.egress]]` rules only
+for extra runtime access the sandbox should have beyond controller
+communication. Do not mutate the runtime config back and forth for setup. Use
+`mmux-setup.toml` for one-time preparation, then create a snapshot and
+launch that snapshot with `mmux.toml`.
+
+There are two supported ways to avoid installer egress at runtime:
+use a prepared snapshot with `mmux.toml`, or use a prepared Docker/OCI image
+with `mmux-image.toml.example`.
 
 ## Health Check
 
