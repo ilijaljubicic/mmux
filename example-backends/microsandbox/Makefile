@@ -4,20 +4,16 @@ IMAGE ?= debian:bookworm-slim
 SANDBOX ?= mmux-node
 NODE_ID ?= msb-mmux-1
 NODE_NAME ?= Microsandbox mmux node
-CONTROLLER_URL ?= http://10.0.2.2:3000
+CONTROLLER_URL ?= http://controller.mmux.local:3000
 NODE_CONFIG ?= mmux.toml
 SNAPSHOT_NAME ?= $(SANDBOX)-seed
 BUNDLE ?= .artifacts/$(SANDBOX)-seed.tar.zst
-ARTIFACT_DIR ?= .artifacts
-MMUX_BINARY ?= $(ARTIFACT_DIR)/mmux
-MMUX_TARGET ?= x86_64-unknown-linux-musl
-
 .PHONY: help build launch bundle-launch bundle-export status logs stop resume
 
 help:
 	@printf 'Microsandbox mmux backend example\n'
 	@printf '\n'
-	@printf '  make build       Build and stage the workspace mmux binary\n'
+	@printf '  make build       Build the microsandbox launcher\n'
 	@printf '  make launch      Launch mmux node inside Microsandbox\n'
 	@printf '  make bundle-launch  Import a bundle and launch from that snapshot\n'
 	@printf '  make bundle-export  Stop, snapshot, and export a bundle\n'
@@ -27,9 +23,7 @@ help:
 	@printf '  make stop        Stop the sandbox\n'
 
 build:
-	cd ../.. && cargo build --release --target $(MMUX_TARGET)
-	mkdir -p $(ARTIFACT_DIR)
-	cp ../../target/$(MMUX_TARGET)/release/mmux $(MMUX_BINARY)
+	cd ../.. && cargo build -p mmux-microsandbox-node
 launch: build
 	cargo run -p mmux-microsandbox-node -- launch \
 		--name $(SANDBOX) \

@@ -6,23 +6,20 @@ small example wrapper.
 The backend build expects the host `libcap-ng` development package so Rust can
 link `libcap-ng.so.0`.
 
-The backend crate starts a sandbox from a stock Microsandbox image, copies a
-staged `mmux` binary and `mmux.toml` into the sandbox, then launches
-`mmux node` from Rust inside the guest.
+The backend crate starts a sandbox from a stock Microsandbox image, installs
+`mmux` from the git ref declared in `mmux.toml`, copies `mmux.toml` into the
+sandbox, then launches `mmux node` from Rust inside the guest.
 
 When you want to avoid redoing the guest setup on every launch, create a
 snapshot bundle from the prepared sandbox and launch from that bundle
 instead. Bundle launches skip the setup scripts and rootfs patches, so the
-prepared sandbox must already contain the staged binary, node config, and
-guest toolchain state.
+prepared sandbox must already contain the installed mmux binary, node config,
+and guest toolchain state.
 
-The staged `mmux` binary is built for `x86_64-unknown-linux-musl` so it
-matches the guest libc. If your toolchain does not already have that target,
-add it with:
-
-```bash
-rustup target add x86_64-unknown-linux-musl
-```
+The guest installs `mmux` with `cargo install --git ... --rev ...` during the
+launch scripts, so the chosen ref lives in `mmux.toml`. If you point that ref
+at a private repository, make sure the sandbox has whatever credentials it
+needs to fetch it.
 
 ## Layout
 
@@ -35,6 +32,7 @@ mmux_sources/
     05_tmux_plugins.sh
     10_devtools.sh
     20_toolchains.sh
+    25_install_mmux.sh
 
 profile_sources/
   codex/
@@ -49,13 +47,17 @@ profile_sources/
     assets/
     scripts/
       00_install.sh
+  kimi/
+    assets/
+    scripts/
+      00_install.sh
 ```
 
 `mmux_sources/scripts` contains the shared sandbox setup. The profile-specific
 `profile_sources/<name>/scripts` directories contain the per-coder install
-steps, so `codex`, `opencode`, and `aider` can be prepared independently. The
-backend registers every script and runs them in alphabetical order, first the
-shared scripts and then the profile-specific ones.
+steps, so `codex`, `opencode`, `aider`, and `kimi` can be prepared
+independently. The backend registers every script and runs them in alphabetical
+order, first the shared scripts and then the profile-specific ones.
 
 `mmux_sources/assets/tmux.conf` is copied into `/mmux/tmux.conf` and sourced
 from `/etc/tmux.conf`, so a root SSH shell inside the sandbox picks up the same
@@ -72,8 +74,14 @@ rooted at `/mmux/tmux.conf`.
 export MMUX_TOKEN="...controller bearer token..."
 cd /mnt/Radni/aitools/mmux/example-backends/microsandbox
 make build
-make launch CONTROLLER_URL="http://192.168.12.176:3000" NODE_CONFIG="mmux.toml"
+make launch CONTROLLER_URL="http://<controller-host>:3000" NODE_CONFIG="mmux.toml"
 ```
+
+`<controller-host>` is a placeholder, not a checked-in address. Use a DNS name
+or host alias that resolves from inside the sandbox. The default
+`controller.mmux.local` in the example Makefile and `allowed_host` in
+`mmux.toml` are intentionally neutral and should be changed together for your
+deployment.
 
 To capture and export it as a bundle:
 
@@ -88,7 +96,7 @@ example invocation above.
 To import an exported bundle and launch from that imported snapshot in one go:
 
 ```bash
-make bundle-launch BUNDLE=.artifacts/mmux-node-seed.tar.zst CONTROLLER_URL="http://192.168.12.176:3000" NODE_CONFIG="mmux.toml"
+make bundle-launch BUNDLE=.artifacts/mmux-node-seed.tar.zst CONTROLLER_URL="http://<controller-host>:3000" NODE_CONFIG="mmux.toml"
 ```
 
 ## Node config
@@ -102,7 +110,7 @@ memory_mib = 1024
 cpus = 2
 
 [microsandbox.assets]
-mmux_binary = "./.artifacts/mmux"
+mmux_source = { repo = "https://github.com/ilijaljubicic/mmux.git", ref = "main" }
 scripts_dir = "./mmux_sources/scripts"
 assets_dir = "./mmux_sources/assets"
 tmux_conf = "./mmux_sources/assets/tmux.conf"
@@ -120,6 +128,16 @@ escape_keys = "Escape"
 [coder_profile.codex.launch]
 scripts_dir = "./profile_sources/codex/scripts"
 assets_dir = "./profile_sources/codex/assets"
+
+[coder_profile.claude]
+name = "claude"
+cmd = "claude"
+prompt_indicator = "❯"
+busy_indicators = ["Thinking", "Working", "Running"]
+
+[coder_profile.claude.launch]
+scripts_dir = "./profile_sources/claude/scripts"
+assets_dir = "./profile_sources/claude/assets"
 ```
 
 The backend loads shared scripts from `mmux_sources/scripts`, then loads each
@@ -132,7 +150,8 @@ with a guest env name, a host env reference like `host.MMUX_TOKEN`, and an
 allowed host. The Rust backend resolves the host env var and injects the
 secret through the Microsandbox SDK. The controller token is injected this way
 into `MMUX_CONTROLLER_TOKEN`. For the example launch, export `MMUX_TOKEN` on
-the host before running `make launch`.
+the host before running `make launch`, and set `allowed_host` to the hostname
+used in `CONTROLLER_URL`.
 
 Volumes are declared separately and mounts consume them:
 

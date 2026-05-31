@@ -97,7 +97,9 @@ start_coding_session(profile="codex", session="codex", node="msb-mmux-1", cwd="/
 coding_wait_ready(session="codex", profile="codex", timeout_seconds=30)
 ```
 
-If the CLI shows startup noise (e.g., "Starting MCP servers"), the profile's `startup_dismiss` config will automatically send Escape before proceeding.
+If the CLI shows startup noise or an update prompt, the profile's
+`startup_dismiss` config will automatically send its configured key sequence
+before proceeding.
 
 ### Step 3: Send your prompt
 ```

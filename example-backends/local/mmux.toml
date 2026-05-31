@@ -30,6 +30,46 @@ escape_keys = "Escape"
 scripts_dir = "./profile_sources/aider/scripts"
 assets_dir = "./profile_sources/aider/assets"
 
+[coder_profile.kimi]
+name = "kimi"
+cmd = "kimi"
+prompt_indicator = ">"
+busy_indicators = ["Working", "Running", "ctrl+c: cancel", "ctrl-s to steer", "to edit"]
+approve_keys = "y Enter"
+reject_keys = "n Enter"
+cancel_keys = "C-c"
+escape_keys = "Escape"
+
+[coder_profile.kimi.launch]
+scripts_dir = "./profile_sources/kimi/scripts"
+assets_dir = "./profile_sources/kimi/assets"
+
+[coder_profile.kimi.startup_dismiss]
+key = "Escape"
+triggers = ["Kimi Code Update Available"]
+
+[coder_profile.claude]
+name = "claude"
+cmd = "claude"
+prompt_indicator = "❯"
+busy_indicators = ["Thinking", "Working", "Running"]
+approve_keys = "y Enter"
+reject_keys = "n Enter"
+cancel_keys = "C-c"
+escape_keys = "Escape"
+
+[coder_profile.claude.launch]
+scripts_dir = "./profile_sources/claude/scripts"
+assets_dir = "./profile_sources/claude/assets"
+
+[coder_profile.claude.startup_dismiss]
+key = "Escape"
+triggers = [
+    "Update available",
+    "Claude Code Update Available",
+    "A new version of Claude Code is available",
+]
+
 [coder_profile.generic]
 name = "generic"
 prompt_indicator = "$"
@@ -54,5 +94,5 @@ scripts_dir = "./profile_sources/codex/scripts"
 assets_dir = "./profile_sources/codex/assets"
 
 [coder_profile.codex.startup_dismiss]
-key = "Escape"
-triggers = ["Starting MCP servers"]
+key = "Down Enter"
+triggers = ["Update available!", "Press enter to continue"]

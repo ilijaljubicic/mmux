@@ -480,8 +480,31 @@ pub fn default_profiles() -> ProfileRegistry {
             prompt_indicator: "›".into(),
             busy_indicators: vec!["• Working".into(), "Starting MCP servers".into()],
             startup_dismiss: Some(StartupDismiss {
+                key: "Down Enter".into(),
+                triggers: vec!["Update available!".into(), "Press enter to continue".into()],
+            }),
+            launch: None,
+            approve_keys: "y Enter".into(),
+            reject_keys: "n Enter".into(),
+            cancel_keys: "C-c".into(),
+            escape_keys: "Escape".into(),
+        },
+    );
+
+    registry.insert(
+        "claude".into(),
+        CliProfile {
+            name: "claude".into(),
+            cmd: Some("claude".into()),
+            prompt_indicator: "❯".into(),
+            busy_indicators: vec!["Thinking".into(), "Working".into(), "Running".into()],
+            startup_dismiss: Some(StartupDismiss {
                 key: "Escape".into(),
-                triggers: vec!["Starting MCP servers".into()],
+                triggers: vec![
+                    "Update available".into(),
+                    "Claude Code Update Available".into(),
+                    "A new version of Claude Code is available".into(),
+                ],
             }),
             launch: None,
             approve_keys: "y Enter".into(),
@@ -680,6 +703,19 @@ pub fn save_file_impl(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+
+    fn unique_temp_file(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "{}-{}-{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("time")
+                .as_nanos()
+        ))
+    }
 
     #[test]
     fn load_profiles_from_config_uses_coder_profile_only() {
@@ -711,5 +747,61 @@ escape_keys = "Escape"
         assert_eq!(profile.prompt_indicator, "›");
 
         let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn default_profiles_include_tuned_codex_and_claude() {
+        let profiles = default_profiles();
+
+        let codex = get_profile(&profiles, "codex").expect("codex profile");
+        assert_eq!(codex.prompt_indicator, "›");
+        let codex_dismiss = codex.startup_dismiss.expect("codex startup dismiss");
+        assert_eq!(codex_dismiss.key, "Down Enter");
+        assert!(codex_dismiss
+            .triggers
+            .iter()
+            .any(|trigger| trigger == "Update available!"));
+
+        let claude = get_profile(&profiles, "claude").expect("claude profile");
+        assert_eq!(claude.cmd.as_deref(), Some("claude"));
+        assert_eq!(claude.prompt_indicator, "❯");
+        assert!(claude
+            .busy_indicators
+            .iter()
+            .any(|marker| marker == "Thinking"));
+    }
+
+    #[test]
+    fn save_file_impl_rejects_writes_over_max_bytes() {
+        let path = unique_temp_file("mmux-node-max-write.txt");
+
+        let error = save_file_impl(path.to_str().unwrap(), "too large", "utf-8", false, Some(3))
+            .unwrap_err();
+
+        assert!(error.contains("write too large"));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn save_file_impl_appends_when_requested() {
+        let path = unique_temp_file("mmux-node-append.txt");
+
+        save_file_impl(path.to_str().unwrap(), "first", "utf-8", false, None).unwrap();
+        save_file_impl(path.to_str().unwrap(), "second", "utf-8", true, None).unwrap();
+
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "firstsecond");
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn save_file_impl_enforces_max_bytes_after_base64_decode() {
+        let path = unique_temp_file("mmux-node-base64-max.bin");
+        let content = BASE64.encode([0, 1, 2, 3]);
+
+        let error =
+            save_file_impl(path.to_str().unwrap(), &content, "base64", false, Some(3)).unwrap_err();
+
+        assert!(error.contains("write too large"));
+        assert!(!path.exists());
     }
 }

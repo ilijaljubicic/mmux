@@ -656,7 +656,7 @@ async fn coding_send_with_profile(
     if let Some(ref dismiss) = profile.startup_dismiss {
         let buf = tmux(&["capture-pane", "-t", &pane, "-p"]).unwrap_or_default();
         if dismiss.triggers.iter().any(|t| buf.contains(t)) {
-            tmux(&["send-keys", "-t", &pane, &dismiss.key]).map_err(|e| e.to_string())?;
+            tmux_send_key_sequence(&pane, &dismiss.key).map_err(|e| e.to_string())?;
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
     }
@@ -682,11 +682,13 @@ async fn coding_wait_ready_with_profile(
     let deadline = Instant::now() + Duration::from_secs(timeout);
     loop {
         let buf = tmux(&["capture-pane", "-t", &pane, "-p"]).unwrap_or_default();
+        if let Some(key) = startup_dismiss_key(&buf, profile) {
+            tmux_send_key_sequence(&pane, key)?;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            continue;
+        }
         let has_prompt = buf.contains(&profile.prompt_indicator);
-        let busy = profile
-            .busy_indicators
-            .iter()
-            .any(|marker| buf.contains(marker));
+        let busy = profile_is_busy(&buf, profile);
         if has_prompt && !busy {
             return Ok(format!("{} is ready (profile: {})", session, profile.name));
         }
@@ -716,11 +718,72 @@ fn coding_action_with_profile(
         "escape" | "dismiss" => &profile.escape_keys,
         other => return Err(format!("Unknown action: {}", other)),
     };
-    tmux(&["send-keys", "-t", &pane, keys])?;
+    tmux_send_key_sequence(&pane, keys)?;
     Ok(format!(
         "Sent action '{}' to {} (profile: {})",
         action, session, profile.name
     ))
+}
+
+const BUSY_SCAN_TRAILING_LINES: usize = 30;
+
+fn profile_is_busy(output: &str, profile: &CliProfile) -> bool {
+    let active_region = output
+        .lines()
+        .rev()
+        .take(BUSY_SCAN_TRAILING_LINES)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<Vec<_>>()
+        .join("\n");
+    if profile
+        .startup_dismiss
+        .as_ref()
+        .map(|dismiss| {
+            dismiss
+                .triggers
+                .iter()
+                .any(|trigger| !trigger.is_empty() && active_region.contains(trigger))
+        })
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    profile
+        .busy_indicators
+        .iter()
+        .any(|marker| !marker.is_empty() && active_region.contains(marker))
+}
+
+fn startup_dismiss_key<'a>(output: &str, profile: &'a CliProfile) -> Option<&'a str> {
+    let dismiss = profile.startup_dismiss.as_ref()?;
+    dismiss
+        .triggers
+        .iter()
+        .any(|trigger| !trigger.is_empty() && output.contains(trigger))
+        .then_some(dismiss.key.as_str())
+}
+
+fn key_sequence_parts(keys: &str) -> Vec<&str> {
+    let parts = keys.split_whitespace().collect::<Vec<_>>();
+    if parts.is_empty() {
+        vec![keys]
+    } else {
+        parts
+    }
+}
+
+fn tmux_send_key_sequence(target: &str, keys: &str) -> Result<String, String> {
+    let mut args = vec!["send-keys", "-t", target];
+    args.extend(key_sequence_parts(keys));
+    tmux(&args)
+}
+
+fn remote_send_key_args(target: &str, keys: &str) -> Vec<String> {
+    let mut args = vec!["send-keys".into(), "-t".into(), target.into()];
+    args.extend(key_sequence_parts(keys).into_iter().map(ToOwned::to_owned));
+    args
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -769,7 +832,7 @@ fn check_state(session: &str, profile: &CliProfile) -> Result<String, String> {
     let pane = session_first_pane(session)?;
     let buf = tmux(&["capture-pane", "-t", &pane, "-p"]).unwrap_or_default();
     let has_prompt = buf.contains(&profile.prompt_indicator);
-    let busy = profile.busy_indicators.iter().any(|m| buf.contains(m));
+    let busy = profile_is_busy(&buf, profile);
     Ok(format!(
         "{{\"session\":\"{}\",\"has_prompt\":{},\"busy\":{},\"profile\":\"{}\"}}",
         session, has_prompt, busy, profile.name
@@ -1297,6 +1360,15 @@ struct TmuxMcpServer {
     registry: ActorRef<NodeRegistryMessage>,
 }
 
+struct RemoteWaitOptions<'a> {
+    mode: &'a str,
+    sentinel: Option<&'a str>,
+    prompt: Option<&'a str>,
+    timeout: f64,
+    poll: f64,
+    stability: f64,
+}
+
 impl TmuxMcpServer {
     fn new(
         profiles: ProfileRegistry,
@@ -1326,16 +1398,18 @@ impl TmuxMcpServer {
     }
 
     fn resolve_launch_secret_value(value_from: &str) -> Result<String, String> {
-        let env_name = value_from
-            .strip_prefix("host.")
-            .ok_or_else(|| {
-                format!(
-                    "unsupported launch secret source '{}': expected host.ENV_VAR",
-                    value_from
-                )
-            })?;
-        std::env::var(env_name)
-            .map_err(|error| format!("missing host env var {} for launch secret: {}", env_name, error))
+        let env_name = value_from.strip_prefix("host.").ok_or_else(|| {
+            format!(
+                "unsupported launch secret source '{}': expected host.ENV_VAR",
+                value_from
+            )
+        })?;
+        std::env::var(env_name).map_err(|error| {
+            format!(
+                "missing host env var {} for launch secret: {}",
+                env_name, error
+            )
+        })
     }
 
     fn profile_launch_envs(profile: &CliProfile) -> Result<Vec<(String, String)>, String> {
@@ -1352,11 +1426,7 @@ impl TmuxMcpServer {
         Ok(envs)
     }
 
-    async fn apply_launch_envs(
-        &self,
-        node: &str,
-        envs: &[(String, String)],
-    ) -> Result<(), String> {
+    async fn apply_launch_envs(&self, node: &str, envs: &[(String, String)]) -> Result<(), String> {
         for (key, value) in envs {
             if node != "local" {
                 self.remote_tmux(
@@ -1440,11 +1510,19 @@ impl TmuxMcpServer {
                     .remote_session_capture(node, session, None, false)
                     .await
                     .unwrap_or_default();
+                if let Some(key) = startup_dismiss_key(&buf, profile) {
+                    let _ = self
+                        .remote_tmux(
+                            node,
+                            remote_send_key_args(session, key),
+                            Duration::from_secs(20),
+                        )
+                        .await;
+                    tokio::time::sleep(Duration::from_millis(300)).await;
+                    continue;
+                }
                 let has_prompt = buf.contains(&profile.prompt_indicator);
-                let busy = profile
-                    .busy_indicators
-                    .iter()
-                    .any(|marker| buf.contains(marker));
+                let busy = profile_is_busy(&buf, profile);
                 if has_prompt && !busy {
                     return Ok(format!(
                         "{} is ready on node {} (profile: {})",
@@ -1616,13 +1694,16 @@ impl TmuxMcpServer {
         &self,
         node_id: &str,
         session: &str,
-        mode: &str,
-        sentinel: Option<&str>,
-        prompt: Option<&str>,
-        timeout: f64,
-        poll: f64,
-        stability: f64,
+        options: RemoteWaitOptions<'_>,
     ) -> Result<String, String> {
+        let RemoteWaitOptions {
+            mode,
+            sentinel,
+            prompt,
+            timeout,
+            poll,
+            stability,
+        } = options;
         let deadline = Instant::now() + Duration::from_secs_f64(timeout);
         let poll_dur = Duration::from_secs_f64(poll);
         match mode {
@@ -2013,13 +2094,8 @@ impl ServerHandler for TmuxMcpServer {
                 Err(e) => Ok(Self::error_result(e)),
             },
             "list_coder_profiles" => {
-                let mut profiles: Vec<_> = self
-                    .profiles
-                    .read()
-                    .unwrap()
-                    .values()
-                    .cloned()
-                    .collect();
+                let mut profiles: Vec<_> =
+                    self.profiles.read().unwrap().values().cloned().collect();
                 profiles.sort_by(|a, b| a.name.cmp(&b.name));
                 let json = serde_json::to_string_pretty(
                     &profiles
@@ -2222,7 +2298,16 @@ impl ServerHandler for TmuxMcpServer {
                 if node != "local" {
                     return match self
                         .remote_wait_for(
-                            node, session, mode, sentinel, prompt, timeout, poll, stability,
+                            node,
+                            session,
+                            RemoteWaitOptions {
+                                mode,
+                                sentinel,
+                                prompt,
+                                timeout,
+                                poll,
+                                stability,
+                            },
                         )
                         .await
                     {
@@ -2297,7 +2382,18 @@ impl ServerHandler for TmuxMcpServer {
                         return Ok(Self::error_result(error));
                     }
                     return match self
-                        .remote_wait_for(node, session, "stable", None, None, timeout, 0.5, 1.0)
+                        .remote_wait_for(
+                            node,
+                            session,
+                            RemoteWaitOptions {
+                                mode: "stable",
+                                sentinel: None,
+                                prompt: None,
+                                timeout,
+                                poll: 0.5,
+                                stability: 1.0,
+                            },
+                        )
                         .await
                     {
                         Ok(msg) => Ok(Self::text_result(msg)),
@@ -2430,7 +2526,18 @@ impl ServerHandler for TmuxMcpServer {
                         }
                     }
                     if let Err(error) = self
-                        .remote_wait_for(node, session, "stable", None, None, timeout, 0.5, 1.0)
+                        .remote_wait_for(
+                            node,
+                            session,
+                            RemoteWaitOptions {
+                                mode: "stable",
+                                sentinel: None,
+                                prompt: None,
+                                timeout,
+                                poll: 0.5,
+                                stability: 1.0,
+                            },
+                        )
                         .await
                     {
                         return Ok(Self::error_result(error));
@@ -2448,7 +2555,7 @@ impl ServerHandler for TmuxMcpServer {
                                         None
                                     }
                                 })
-                                .last();
+                                .next_back();
                             let result_lines: Vec<&str> = if let Some(idx) = sentinel_idx {
                                 all_lines.iter().skip(idx + 1).copied().collect()
                             } else {
@@ -2725,12 +2832,7 @@ impl ServerHandler for TmuxMcpServer {
                             let _ = self
                                 .remote_tmux(
                                     node,
-                                    vec![
-                                        "send-keys".into(),
-                                        "-t".into(),
-                                        pane.clone(),
-                                        dismiss.key.clone(),
-                                    ],
+                                    remote_send_key_args(&pane, &dismiss.key),
                                     Duration::from_secs(20),
                                 )
                                 .await;
@@ -2816,7 +2918,8 @@ impl ServerHandler for TmuxMcpServer {
                             .map(|v| v as f64)
                             .unwrap_or(30.0),
                     )
-                    .map_err(|e| McpError::invalid_request(e, None))? as u64;
+                    .map_err(|e| McpError::invalid_request(e, None))?
+                    as u64;
                 let cmd = profile.cmd.as_deref().ok_or_else(|| {
                     McpError::invalid_request(
                         format!("profile '{}' does not define a launch cmd", profile.name),
@@ -2896,12 +2999,7 @@ impl ServerHandler for TmuxMcpServer {
                     return match self
                         .remote_tmux(
                             node,
-                            vec![
-                                "send-keys".into(),
-                                "-t".into(),
-                                pane,
-                                keys,
-                            ],
+                            remote_send_key_args(&pane, &keys),
                             Duration::from_secs(20),
                         )
                         .await
@@ -2941,11 +3039,19 @@ impl ServerHandler for TmuxMcpServer {
                             .remote_session_capture(node, session, None, false)
                             .await
                             .unwrap_or_default();
+                        if let Some(key) = startup_dismiss_key(&buf, &profile) {
+                            let _ = self
+                                .remote_tmux(
+                                    node,
+                                    remote_send_key_args(session, key),
+                                    Duration::from_secs(20),
+                                )
+                                .await;
+                            tokio::time::sleep(Duration::from_millis(300)).await;
+                            continue;
+                        }
                         let has_prompt = buf.contains(&profile.prompt_indicator);
-                        let busy = profile
-                            .busy_indicators
-                            .iter()
-                            .any(|marker| buf.contains(marker));
+                        let busy = profile_is_busy(&buf, &profile);
                         if has_prompt && !busy {
                             return Ok(Self::text_result(format!(
                                 "{} is ready on node {} (profile: {})",
@@ -3089,10 +3195,7 @@ impl ServerHandler for TmuxMcpServer {
                         .await
                         .unwrap_or_default();
                     let has_prompt = buf.contains(&profile.prompt_indicator);
-                    let busy = profile
-                        .busy_indicators
-                        .iter()
-                        .any(|marker| buf.contains(marker));
+                    let busy = profile_is_busy(&buf, &profile);
                     return Ok(Self::text_result(format!(
                         "{{\"node\":\"{}\",\"session\":\"{}\",\"has_prompt\":{},\"busy\":{},\"profile\":\"{}\"}}",
                         node, session, has_prompt, busy, profile.name
@@ -3912,6 +4015,36 @@ mod tests {
     use super::*;
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
     use std::fs;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    fn unique_temp_dir(prefix: &str) -> PathBuf {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        std::env::temp_dir().join(format!("{prefix}-{}-{unique}", std::process::id()))
+    }
+
+    fn test_cli() -> Cli {
+        Cli {
+            node_config: None,
+            config: None,
+            host: "127.0.0.1".into(),
+            port: 3000,
+            token: None,
+            token_file: None,
+            token_env: "MMUX_TOKEN".into(),
+            security_mode: SecurityMode::Local,
+            workspace_root: None,
+            allow_remote_without_token: false,
+            max_read_bytes: 4 * 1024 * 1024,
+            max_write_bytes: 4 * 1024 * 1024,
+            max_timeout_seconds: 60.0,
+            max_request_bytes: 2 * 1024 * 1024,
+            max_capture_bytes: 2 * 1024 * 1024,
+            enable_local_node: false,
+        }
+    }
 
     #[test]
     fn test_load_profile_from_toml() {
@@ -3958,6 +4091,111 @@ triggers = ["Starting MCP servers"]
         let toml = "not valid toml ::";
         let result = load_profile_from_toml(toml);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_security_policy_clamp_timeout_rejects_invalid_and_clamps() {
+        let mut cli = test_cli();
+        cli.max_timeout_seconds = 12.5;
+        let policy = SecurityPolicy::new(&cli).unwrap();
+
+        assert!(policy.clamp_timeout(0.0).is_err());
+        assert!(policy.clamp_timeout(f64::NAN).is_err());
+        assert_eq!(policy.clamp_timeout(5.0).unwrap(), 5.0);
+        assert_eq!(policy.clamp_timeout(99.0).unwrap(), 12.5);
+    }
+
+    #[test]
+    fn test_limit_capture_output_truncates_on_utf8_boundary() {
+        let mut cli = test_cli();
+        cli.max_capture_bytes = 5;
+        let policy = SecurityPolicy::new(&cli).unwrap();
+
+        let result = policy.limit_capture_output("prefixétail".into());
+
+        assert!(result.starts_with("[mmux truncated capture to last 5 bytes]\n"));
+        assert!(result.ends_with("tail"));
+        assert!(std::str::from_utf8(result.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn test_workspace_resolve_read_path_allows_existing_file_inside_root() {
+        let root = unique_temp_dir("mmux-read-root");
+        fs::create_dir_all(&root).unwrap();
+        let file = root.join("inside.txt");
+        fs::write(&file, "ok").unwrap();
+        let mut cli = test_cli();
+        cli.security_mode = SecurityMode::Workspace;
+        cli.workspace_root = Some(root.to_string_lossy().into_owned());
+        let policy = SecurityPolicy::new(&cli).unwrap();
+
+        let resolved = policy.resolve_read_path("inside.txt").unwrap();
+
+        assert_eq!(resolved, fs::canonicalize(&file).unwrap());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_workspace_resolve_read_path_rejects_parent_escape() {
+        let root = unique_temp_dir("mmux-read-escape");
+        fs::create_dir_all(&root).unwrap();
+        let mut cli = test_cli();
+        cli.security_mode = SecurityMode::Workspace;
+        cli.workspace_root = Some(root.to_string_lossy().into_owned());
+        let policy = SecurityPolicy::new(&cli).unwrap();
+
+        let error = policy.resolve_read_path("../outside.txt").unwrap_err();
+
+        assert!(error.contains("parent directory components are not allowed"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_workspace_resolve_write_path_creates_nested_parent_inside_root() {
+        let root = unique_temp_dir("mmux-write-root");
+        fs::create_dir_all(&root).unwrap();
+        let mut cli = test_cli();
+        cli.security_mode = SecurityMode::Workspace;
+        cli.workspace_root = Some(root.to_string_lossy().into_owned());
+        let policy = SecurityPolicy::new(&cli).unwrap();
+
+        let resolved = policy.resolve_write_path("nested/output.txt").unwrap();
+
+        assert!(root.join("nested").is_dir());
+        assert_eq!(
+            resolved,
+            fs::canonicalize(root.join("nested"))
+                .unwrap()
+                .join("output.txt")
+        );
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn test_validate_startup_security_rejects_remote_without_auth_unless_allowed() {
+        let cli = test_cli();
+        let policy = SecurityPolicy::new(&cli).unwrap();
+        let bind: SocketAddr = "203.0.113.10:3000".parse().unwrap();
+
+        assert!(validate_startup_security(bind, None, &policy, false).is_err());
+        assert!(validate_startup_security(bind, None, &policy, true).is_ok());
+        assert!(
+            validate_startup_security(bind, Some(&"secret".to_owned()), &policy, false).is_ok()
+        );
+    }
+
+    #[test]
+    fn test_resolve_token_reads_configured_env_and_rejects_empty() {
+        let mut cli = test_cli();
+        cli.token_env = format!("MMUX_TEST_TOKEN_{}", std::process::id());
+        let policy = SecurityPolicy::new(&cli).unwrap();
+        std::env::set_var(&cli.token_env, "abc123");
+        assert_eq!(resolve_token(&cli, &policy).unwrap(), Some("abc123".into()));
+
+        std::env::set_var(&cli.token_env, "");
+        let error = resolve_token(&cli, &policy).unwrap_err();
+        assert!(error.contains("is set but empty"));
+        std::env::remove_var(&cli.token_env);
     }
 
     #[test]
@@ -4083,5 +4321,85 @@ triggers = ["Starting MCP servers"]
         // No command line (edge case) — first non-empty line is still treated as command
         let lines = vec!["just output", "user@host:~$ "];
         assert_eq!(clean_exec_output(lines), "");
+    }
+
+    #[test]
+    fn test_profile_is_busy_scans_active_trailing_region_only() {
+        let profile = CliProfile {
+            name: "kimi".into(),
+            prompt_indicator: ">".into(),
+            busy_indicators: vec!["thinking".into()],
+            ..CliProfile::default()
+        };
+        let stale_history = (0..40)
+            .map(|i| {
+                if i == 0 {
+                    "old thinking text".to_owned()
+                } else {
+                    format!("old line {i}")
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let idle_output = format!("{stale_history}\n╭────╮\n│ >  │\n╰────╯");
+
+        assert!(!profile_is_busy(&idle_output, &profile));
+    }
+
+    #[test]
+    fn test_profile_is_busy_detects_live_trailing_status() {
+        let profile = CliProfile {
+            name: "kimi".into(),
+            prompt_indicator: ">".into(),
+            busy_indicators: vec!["ctrl+c: cancel".into(), "ctrl-s to steer".into()],
+            ..CliProfile::default()
+        };
+        let output = "old transcript\n╭────╮\n│ >  │\n╰────╯\nKimi-k2.6 thinking  ctrl+c: cancel";
+
+        assert!(profile_is_busy(output, &profile));
+    }
+
+    #[test]
+    fn test_profile_is_busy_uses_profile_specific_markers_for_common_clis() {
+        for (name, marker) in [
+            ("codex", "• Working"),
+            ("aider", "Generating"),
+            ("opencode", "Processing"),
+            ("claude", "Thinking"),
+        ] {
+            let profile = CliProfile {
+                name: name.into(),
+                prompt_indicator: ">".into(),
+                busy_indicators: vec![marker.into()],
+                ..CliProfile::default()
+            };
+            let output = format!("old output\n╭────╮\n│ >  │\n╰────╯\nstatus: {marker}");
+
+            assert!(
+                profile_is_busy(&output, &profile),
+                "{name} marker not detected"
+            );
+        }
+    }
+
+    #[test]
+    fn test_startup_dismiss_triggers_count_as_busy_and_return_key() {
+        let profile = CliProfile {
+            name: "codex".into(),
+            prompt_indicator: "›".into(),
+            startup_dismiss: Some(mmux_shared::StartupDismiss {
+                key: "Down Enter".into(),
+                triggers: vec!["Update available!".into()],
+            }),
+            ..CliProfile::default()
+        };
+        let output = "✨ Update available!\n› 1. Update now\n  2. Skip\nPress enter to continue";
+
+        assert!(profile_is_busy(output, &profile));
+        assert_eq!(startup_dismiss_key(output, &profile), Some("Down Enter"));
+        assert_eq!(
+            remote_send_key_args("%1", "Down Enter"),
+            vec!["send-keys", "-t", "%1", "Down", "Enter"]
+        );
     }
 }

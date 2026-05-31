@@ -1,7 +1,7 @@
 use clap::{Parser, Subcommand};
 use microsandbox::sandbox::{DiskImageFormat, HostPermissions, MountBuilder, StatVirtualization};
-use microsandbox::{Sandbox, Snapshot, Volume};
 use microsandbox::snapshot::ExportOpts;
+use microsandbox::{Sandbox, Snapshot, Volume};
 use mmux_shared::CliProfile;
 use serde::{Deserialize, Serialize};
 use std::error::Error;
@@ -126,21 +126,24 @@ pub async fn launch(args: LaunchArgs) -> Result<LaunchReport, Box<dyn Error + Se
     let profile_script_assets = if args.snapshot.is_some() {
         Vec::new()
     } else {
-        load_profile_scripts(&microsandbox_config.coder_profiles, &microsandbox_config.base_dir)?
+        load_profile_scripts(
+            &microsandbox_config.coder_profiles,
+            &microsandbox_config.base_dir,
+        )?
     };
-    create_sandbox(
-        &args.shared,
-        &args.node_config,
-        &args.controller_url,
-        &args.node_id,
-        &args.node_name,
-        args.snapshot.as_deref(),
-        &microsandbox_config.config,
-        &microsandbox_config.coder_profiles,
-        &microsandbox_config.base_dir,
-        &script_assets,
-        &profile_script_assets,
-    )
+    create_sandbox(SandboxLaunchSpec {
+        shared: &args.shared,
+        node_config: &args.node_config,
+        controller_url: &args.controller_url,
+        node_id: &args.node_id,
+        node_name: &args.node_name,
+        snapshot: args.snapshot.as_deref(),
+        microsandbox_config: &microsandbox_config.config,
+        coder_profiles: &microsandbox_config.coder_profiles,
+        config_base_dir: &microsandbox_config.base_dir,
+        script_assets: &script_assets,
+        profile_script_assets: &profile_script_assets,
+    })
     .await?;
 
     Ok(LaunchReport {
@@ -176,8 +179,12 @@ pub async fn snapshot_export(
     if let Some(parent) = bundle.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    Snapshot::export(snapshot_path.to_string_lossy().as_ref(), &bundle, ExportOpts::default())
-        .await?;
+    Snapshot::export(
+        snapshot_path.to_string_lossy().as_ref(),
+        &bundle,
+        ExportOpts::default(),
+    )
+    .await?;
     Ok(SnapshotExportReport {
         name: args.snapshot_name,
         source_sandbox: args.shared.name,
@@ -252,7 +259,10 @@ pub async fn logs(args: SharedArgs) -> Result<String, Box<dyn Error + Send + Syn
         out.push_str(&format!("[{source}] {}\n", data.trim_end()));
     }
     if let Ok(sandbox) = handle.connect().await {
-        if let Ok(output) = sandbox.shell("cat /tmp/mmux-node.log 2>/dev/null || true").await {
+        if let Ok(output) = sandbox
+            .shell("cat /tmp/mmux-node.log 2>/dev/null || true")
+            .await
+        {
             out.push_str("== guest log ==\n");
             out.push_str(&output.stdout().unwrap_or_default());
             if !out.ends_with('\n') {
@@ -273,22 +283,36 @@ pub async fn logs(args: SharedArgs) -> Result<String, Box<dyn Error + Send + Syn
     Ok(out)
 }
 
-async fn create_sandbox(
-    shared: &SharedArgs,
-    node_config: &Path,
-    controller_url: &str,
-    node_id: &str,
-    node_name: &str,
-    snapshot: Option<&str>,
-    microsandbox_config: &MicrosandboxConfig,
-    coder_profiles: &[CliProfile],
-    config_base_dir: &Path,
-    script_assets: &[MicrosandboxScriptAsset],
-    profile_script_assets: &[MicrosandboxScriptAsset],
-) -> Result<(), Box<dyn Error + Send + Sync>> {
+struct SandboxLaunchSpec<'a> {
+    shared: &'a SharedArgs,
+    node_config: &'a Path,
+    controller_url: &'a str,
+    node_id: &'a str,
+    node_name: &'a str,
+    snapshot: Option<&'a str>,
+    microsandbox_config: &'a MicrosandboxConfig,
+    coder_profiles: &'a [CliProfile],
+    config_base_dir: &'a Path,
+    script_assets: &'a [MicrosandboxScriptAsset],
+    profile_script_assets: &'a [MicrosandboxScriptAsset],
+}
+
+async fn create_sandbox(spec: SandboxLaunchSpec<'_>) -> Result<(), Box<dyn Error + Send + Sync>> {
+    let SandboxLaunchSpec {
+        shared,
+        node_config,
+        controller_url,
+        node_id,
+        node_name,
+        snapshot,
+        microsandbox_config,
+        coder_profiles,
+        config_base_dir,
+        script_assets,
+        profile_script_assets,
+    } = spec;
     ensure_configured_volumes(&microsandbox_config.volumes).await?;
-    let mut policy: microsandbox::NetworkPolicy =
-        microsandbox_config.network.network_policy.into();
+    let mut policy: microsandbox::NetworkPolicy = microsandbox_config.network.network_policy.into();
     for domain in &microsandbox_config.network.deny_domain {
         policy = policy
             .deny_domain(domain)
@@ -337,7 +361,10 @@ async fn create_sandbox(
         let value = resolve_host_secret_value(&secret.value_from)?;
         builder = builder.env(&secret.env, value.clone());
         builder = builder.secret(|s| {
-            let mut s = s.env(&secret.env).value(value).allow_host(&secret.allowed_host);
+            let mut s = s
+                .env(&secret.env)
+                .value(value)
+                .allow_host(&secret.allowed_host);
             if let Some(placeholder) = secret.placeholder.as_deref() {
                 s = s.placeholder(placeholder);
             }
@@ -349,7 +376,15 @@ async fn create_sandbox(
         });
     }
     for mount in &microsandbox_config.mounts {
-        builder = builder.volume(mount_guest(mount), |v| apply_mount(v, mount, config_base_dir));
+        builder = builder.volume(mount_guest(mount), |v| {
+            apply_mount(v, mount, config_base_dir)
+        });
+    }
+
+    if let Some(mmux_source) = microsandbox_config.assets.mmux_source.as_ref() {
+        builder = builder
+            .env("MMUX_SOURCE_REPO", &mmux_source.repo)
+            .env("MMUX_SOURCE_REF", &mmux_source.revision);
     }
 
     if snapshot.is_none() {
@@ -364,7 +399,15 @@ async fn create_sandbox(
     let sandbox = if snapshot.is_some() {
         builder.create_detached().await?
     } else {
-        let mmux_binary = resolve_host_path(config_base_dir, &microsandbox_config.assets.mmux_binary);
+        let use_mmux_source = microsandbox_config.assets.mmux_source.is_some();
+        let mmux_binary = if use_mmux_source {
+            None
+        } else {
+            Some(resolve_host_path(
+                config_base_dir,
+                &microsandbox_config.assets.mmux_binary,
+            ))
+        };
         let tmux_conf = resolve_host_path(config_base_dir, &microsandbox_config.assets.tmux_conf);
         let mmux_assets_dir = microsandbox_config
             .assets
@@ -377,10 +420,20 @@ async fn create_sandbox(
                     .mkdir("/mmux", Some(0o755))
                     .mkdir("/etc/mmux", Some(0o755))
                     .mkdir("/workspace", Some(0o755))
-                    .copy_file(mmux_binary, "/usr/local/bin/mmux", Some(0o755), true)
                     .copy_file(node_config, "/etc/mmux/mmux-node.toml", None, true)
                     .copy_file(tmux_conf, "/mmux/tmux.conf", None, true)
-                    .text("/etc/tmux.conf", "source-file /mmux/tmux.conf\n", Some(0o644), false);
+                    .text(
+                        "/etc/tmux.conf",
+                        "source-file /mmux/tmux.conf
+",
+                        Some(0o644),
+                        false,
+                    );
+                let p = if let Some(mmux_binary) = mmux_binary.as_ref() {
+                    p.copy_file(mmux_binary, "/usr/local/bin/mmux", Some(0o755), true)
+                } else {
+                    p
+                };
                 let p = if let Some(mmux_assets_dir) = mmux_assets_dir.as_ref() {
                     p.copy_dir(mmux_assets_dir, "/mmux/mmux_sources/assets", true)
                 } else {
@@ -404,8 +457,7 @@ async fn create_sandbox(
 }
 
 async fn launch_mmux_node(sandbox: &Sandbox) -> Result<(), Box<dyn Error + Send + Sync>> {
-    let command = format!(
-        r#"set -eu
+    let command = r#"set -eu
 mkdir -p /tmp
 nohup /usr/local/bin/mmux node \
   --controller-url "$MMUX_CONTROLLER_URL" \
@@ -414,8 +466,7 @@ nohup /usr/local/bin/mmux node \
   --node-config "$MMUX_NODE_CONFIG" \
   --poll-interval-ms "$MMUX_POLL_INTERVAL_MS" \
   >/tmp/mmux-node.log 2>&1 &
-"#
-    );
+"#;
 
     sandbox
         .shell(command)
@@ -455,19 +506,14 @@ fn default_node_config() -> PathBuf {
     PathBuf::from("mmux-node.toml")
 }
 
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Copy, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 enum NetworkPolicyKind {
+    #[default]
     NonLocal,
     PublicOnly,
     AllowAll,
     None,
-}
-
-impl Default for NetworkPolicyKind {
-    fn default() -> Self {
-        Self::NonLocal
-    }
 }
 
 impl From<NetworkPolicyKind> for microsandbox::NetworkPolicy {
@@ -509,6 +555,8 @@ struct MicrosandboxRuntimeConfig {
 
 #[derive(Debug, Clone, Deserialize)]
 struct MicrosandboxAssetsConfig {
+    #[serde(default)]
+    mmux_source: Option<MicrosandboxSourceConfig>,
     #[serde(default = "default_mmux_binary")]
     mmux_binary: PathBuf,
     #[serde(default = "default_tmux_conf")]
@@ -522,12 +570,20 @@ struct MicrosandboxAssetsConfig {
 impl Default for MicrosandboxAssetsConfig {
     fn default() -> Self {
         Self {
+            mmux_source: None,
             mmux_binary: default_mmux_binary(),
             tmux_conf: default_tmux_conf(),
             scripts_dir: None,
             assets_dir: None,
         }
     }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct MicrosandboxSourceConfig {
+    repo: String,
+    #[serde(rename = "ref", alias = "branch")]
+    revision: String,
 }
 
 impl Default for MicrosandboxRuntimeConfig {
@@ -728,7 +784,10 @@ fn load_microsandbox_config(
 ) -> Result<LoadedMicrosandboxConfig, Box<dyn Error + Send + Sync>> {
     let text = std::fs::read_to_string(path)?;
     let raw: toml::Table = toml::from_str(&text)?;
-    let base_dir = path.parent().unwrap_or_else(|| Path::new(".")).to_path_buf();
+    let base_dir = path
+        .parent()
+        .unwrap_or_else(|| Path::new("."))
+        .to_path_buf();
     let config = match raw.get("microsandbox") {
         Some(value) => value.clone().try_into()?,
         None => MicrosandboxConfig::default(),
@@ -745,7 +804,10 @@ fn load_coder_profiles(
     table: &toml::Table,
 ) -> Result<Vec<CliProfile>, Box<dyn Error + Send + Sync>> {
     let mut profiles = Vec::new();
-    let Some(coder_profiles) = table.get("coder_profile").and_then(|value| value.as_table()) else {
+    let Some(coder_profiles) = table
+        .get("coder_profile")
+        .and_then(|value| value.as_table())
+    else {
         return Ok(profiles);
     };
 
@@ -786,7 +848,10 @@ fn load_profile_scripts(
             continue;
         };
         let scripts_dir = resolve_host_path(base_dir, Path::new(scripts_dir));
-        scripts.extend(load_script_dir(&scripts_dir, &format!("profile_{}", profile.name))?);
+        scripts.extend(load_script_dir(
+            &scripts_dir,
+            &format!("profile_{}", profile.name),
+        )?);
     }
     Ok(scripts)
 }
@@ -839,9 +904,12 @@ fn apply_profile_assets(
 }
 
 fn resolve_host_secret_value(value_from: &str) -> Result<String, Box<dyn Error + Send + Sync>> {
-    let env_name = value_from
-        .strip_prefix("host.")
-        .ok_or_else(|| format!("unsupported secret source '{}': expected host.ENV_VAR", value_from))?;
+    let env_name = value_from.strip_prefix("host.").ok_or_else(|| {
+        format!(
+            "unsupported secret source '{}': expected host.ENV_VAR",
+            value_from
+        )
+    })?;
     let value = std::env::var(env_name)
         .map_err(|error| format!("missing host env var {} for secret: {}", env_name, error))?;
     Ok(value)
@@ -1052,8 +1120,11 @@ mod tests {
         fs::write(
             &config_path,
             r#"
+[microsandbox.assets.mmux_source]
+repo = "https://github.com/ilijaljubicic/mmux.git"
+ref = "main"
+
 [microsandbox.assets]
-mmux_binary = "./.artifacts/mmux"
 scripts_dir = "./mmux_sources/scripts"
 assets_dir = "./mmux_sources/assets"
 tmux_conf = "./mmux_sources/assets/tmux.conf"
@@ -1084,6 +1155,24 @@ assets_dir = "./profile_sources/codex/assets"
             loaded.config.assets.assets_dir.as_deref(),
             Some(Path::new("./mmux_sources/assets"))
         );
+        assert_eq!(
+            loaded
+                .config
+                .assets
+                .mmux_source
+                .as_ref()
+                .map(|source| source.repo.as_str()),
+            Some("https://github.com/ilijaljubicic/mmux.git")
+        );
+        assert_eq!(
+            loaded
+                .config
+                .assets
+                .mmux_source
+                .as_ref()
+                .map(|source| source.revision.as_str()),
+            Some("main")
+        );
         assert_eq!(loaded.coder_profiles.len(), 1);
         let profile = &loaded.coder_profiles[0];
         assert_eq!(profile.name, "codex");
@@ -1100,6 +1189,94 @@ assets_dir = "./profile_sources/codex/assets"
                 .as_ref()
                 .and_then(|launch| launch.assets_dir.as_deref()),
             Some("./profile_sources/codex/assets")
+        );
+    }
+
+    #[test]
+    fn load_profile_scripts_sorts_profiles_and_script_names() {
+        let unique = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time")
+            .as_nanos();
+        let base_dir = std::env::temp_dir().join(format!("mmux-msb-scripts-{}", unique));
+        fs::create_dir_all(base_dir.join("profile_sources/zeta/scripts")).unwrap();
+        fs::create_dir_all(base_dir.join("profile_sources/alpha/scripts")).unwrap();
+        fs::write(
+            base_dir.join("profile_sources/zeta/scripts/20_second.sh"),
+            "echo zeta second",
+        )
+        .unwrap();
+        fs::write(
+            base_dir.join("profile_sources/zeta/scripts/10_first.sh"),
+            "echo zeta first",
+        )
+        .unwrap();
+        fs::write(
+            base_dir.join("profile_sources/alpha/scripts/00_first.sh"),
+            "echo alpha",
+        )
+        .unwrap();
+
+        let profiles = vec![
+            CliProfile {
+                name: "zeta".into(),
+                launch: Some(mmux_shared::CoderProfileLaunch {
+                    scripts_dir: Some("./profile_sources/zeta/scripts".into()),
+                    ..Default::default()
+                }),
+                ..CliProfile::default()
+            },
+            CliProfile {
+                name: "alpha".into(),
+                launch: Some(mmux_shared::CoderProfileLaunch {
+                    scripts_dir: Some("./profile_sources/alpha/scripts".into()),
+                    ..Default::default()
+                }),
+                ..CliProfile::default()
+            },
+        ];
+
+        let scripts = load_profile_scripts(&profiles, &base_dir).unwrap();
+        let names = scripts
+            .iter()
+            .map(|script| script.name.as_str())
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            names,
+            vec![
+                "profile_alpha__00_first.sh",
+                "profile_zeta__10_first.sh",
+                "profile_zeta__20_second.sh"
+            ]
+        );
+        let _ = fs::remove_dir_all(base_dir);
+    }
+
+    #[test]
+    fn example_microsandbox_config_parses_kimi_profile() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let config_path = manifest_dir
+            .join("../../..")
+            .join("example-backends/microsandbox/mmux.toml");
+
+        let loaded = load_microsandbox_config(&config_path).unwrap();
+        let kimi = loaded
+            .coder_profiles
+            .iter()
+            .find(|profile| profile.name == "kimi")
+            .expect("kimi profile loaded");
+
+        assert_eq!(kimi.cmd.as_deref(), Some("kimi"));
+        assert!(kimi
+            .busy_indicators
+            .iter()
+            .any(|marker| marker == "ctrl-s to steer"));
+        assert_eq!(
+            kimi.launch
+                .as_ref()
+                .and_then(|launch| launch.scripts_dir.as_deref()),
+            Some("./profile_sources/kimi/scripts")
         );
     }
 }
