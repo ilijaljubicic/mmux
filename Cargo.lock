@@ -2968,6 +2968,7 @@ dependencies = [
  "clap",
  "indoc",
  "microsandbox",
+ "mmux-node",
  "mmux-shared",
  "serde",
  "serde_json",

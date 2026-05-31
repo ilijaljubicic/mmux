@@ -423,13 +423,11 @@ pub fn load_profiles_from_config(path: &str) -> Result<ProfileRegistry, String> 
     let config: toml::Table = toml::from_str(&text)
         .map_err(|e| format!("failed to parse node profile config '{}': {}", path, e))?;
 
-    let mut registry = HashMap::new();
+    let mut registry = default_profile_map();
 
     if let Some(profiles) = config.get("coder_profile").and_then(|v| v.as_table()) {
         for (name, value) in profiles {
-            let toml_str = toml::to_string(value)
-                .map_err(|e| format!("serialize profile '{}': {}", name, e))?;
-            let profile = load_profile_from_toml(&toml_str)?;
+            let profile = load_profile_overlay(name, value, registry.get(name).cloned())?;
             registry.insert(name.clone(), profile);
         }
     }
@@ -437,7 +435,7 @@ pub fn load_profiles_from_config(path: &str) -> Result<ProfileRegistry, String> 
     Ok(Arc::new(RwLock::new(registry)))
 }
 
-pub fn default_profiles() -> ProfileRegistry {
+fn default_profile_map() -> HashMap<String, CliProfile> {
     let mut registry = HashMap::new();
 
     registry.insert(
@@ -457,13 +455,22 @@ pub fn default_profiles() -> ProfileRegistry {
     );
 
     registry.insert(
-        "aider".into(),
+        "kimi".into(),
         CliProfile {
-            name: "aider".into(),
-            cmd: Some("aider".into()),
-            prompt_indicator: "aider >".into(),
-            busy_indicators: vec!["Generating".into()],
-            startup_dismiss: None,
+            name: "kimi".into(),
+            cmd: Some("kimi".into()),
+            prompt_indicator: ">".into(),
+            busy_indicators: vec![
+                "Working".into(),
+                "Running".into(),
+                "ctrl+c: cancel".into(),
+                "ctrl-s to steer".into(),
+                "to edit".into(),
+            ],
+            startup_dismiss: Some(StartupDismiss {
+                key: "Escape".into(),
+                triggers: vec!["Kimi Code Update Available".into()],
+            }),
             launch: None,
             approve_keys: "y Enter".into(),
             reject_keys: "n Enter".into(),
@@ -516,7 +523,47 @@ pub fn default_profiles() -> ProfileRegistry {
 
     registry.insert("generic".into(), CliProfile::default());
 
-    Arc::new(RwLock::new(registry))
+    registry
+}
+
+pub fn default_profiles() -> ProfileRegistry {
+    Arc::new(RwLock::new(default_profile_map()))
+}
+
+fn load_profile_overlay(
+    name: &str,
+    value: &toml::Value,
+    base: Option<CliProfile>,
+) -> Result<CliProfile, String> {
+    let mut merged = match base {
+        Some(profile) => toml::Value::try_from(profile)
+            .map_err(|error| format!("serialize built-in profile '{}': {}", name, error))?,
+        None => toml::Value::Table(toml::Table::new()),
+    };
+    merge_toml_value(&mut merged, value.clone());
+    let mut profile: CliProfile = merged
+        .try_into()
+        .map_err(|error| format!("profile '{}': {}", name, error))?;
+    if profile.name.is_empty() {
+        profile.name = name.to_owned();
+    }
+    Ok(profile)
+}
+
+fn merge_toml_value(base: &mut toml::Value, overlay: toml::Value) {
+    match (base, overlay) {
+        (toml::Value::Table(base), toml::Value::Table(overlay)) => {
+            for (key, value) in overlay {
+                match base.get_mut(&key) {
+                    Some(existing) => merge_toml_value(existing, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, overlay) => *base = overlay,
+    }
 }
 
 pub fn detect_compression(bytes: &[u8]) -> Option<String> {
@@ -718,7 +765,7 @@ mod tests {
     }
 
     #[test]
-    fn load_profiles_from_config_uses_coder_profile_only() {
+    fn load_profiles_from_config_overlays_built_in_profiles() {
         let dir = std::env::temp_dir();
         let path = dir.join(format!(
             "mmux-coder-profile-test-{}.toml",
@@ -728,14 +775,7 @@ mod tests {
             &path,
             r#"
 [coder_profile.codex]
-name = "codex"
-cmd = "codex"
-prompt_indicator = "›"
-busy_indicators = ["• Working"]
-approve_keys = "y Enter"
-reject_keys = "n Enter"
-cancel_keys = "C-c"
-escape_keys = "Escape"
+prompt_indicator = "codex ready"
 "#,
         )
         .unwrap();
@@ -744,14 +784,36 @@ escape_keys = "Escape"
         let profile = get_profile(&profiles, "codex").expect("profile loaded");
         assert_eq!(profile.name, "codex");
         assert_eq!(profile.cmd.as_deref(), Some("codex"));
-        assert_eq!(profile.prompt_indicator, "›");
+        assert_eq!(profile.prompt_indicator, "codex ready");
+        assert!(profile
+            .busy_indicators
+            .iter()
+            .any(|marker| marker == "• Working"));
 
         let _ = std::fs::remove_file(path);
     }
 
     #[test]
+    fn root_mmux_example_config_parses() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let config_path = manifest_dir.join("../..").join("mmux.toml.example");
+
+        let profiles = load_profiles_from_config(config_path.to_str().unwrap()).unwrap();
+
+        assert!(get_profile(&profiles, "codex").is_some());
+        assert!(get_profile(&profiles, "kimi").is_some());
+    }
+
+    #[test]
     fn default_profiles_include_tuned_codex_and_claude() {
         let profiles = default_profiles();
+
+        let kimi = get_profile(&profiles, "kimi").expect("kimi profile");
+        assert_eq!(kimi.cmd.as_deref(), Some("kimi"));
+        assert!(kimi
+            .busy_indicators
+            .iter()
+            .any(|marker| marker == "ctrl-s to steer"));
 
         let codex = get_profile(&profiles, "codex").expect("codex profile");
         assert_eq!(codex.prompt_indicator, "›");

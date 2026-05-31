@@ -803,22 +803,54 @@ fn load_microsandbox_config(
 fn load_coder_profiles(
     table: &toml::Table,
 ) -> Result<Vec<CliProfile>, Box<dyn Error + Send + Sync>> {
-    let mut profiles = Vec::new();
-    let Some(coder_profiles) = table
+    let mut profiles = mmux_node::default_profiles().read().unwrap().clone();
+
+    if let Some(coder_profiles) = table
         .get("coder_profile")
         .and_then(|value| value.as_table())
-    else {
-        return Ok(profiles);
-    };
-
-    for (name, value) in coder_profiles {
-        let mut profile: CliProfile = value.clone().try_into()?;
-        if profile.name.is_empty() {
-            profile.name = name.clone();
+    {
+        for (name, value) in coder_profiles {
+            let profile = load_profile_overlay(name, value, profiles.get(name).cloned())?;
+            profiles.insert(name.clone(), profile);
         }
-        profiles.push(profile);
     }
+
+    let mut profiles = profiles.into_values().collect::<Vec<_>>();
+    profiles.sort_by(|left, right| left.name.cmp(&right.name));
     Ok(profiles)
+}
+
+fn load_profile_overlay(
+    name: &str,
+    value: &toml::Value,
+    base: Option<CliProfile>,
+) -> Result<CliProfile, Box<dyn Error + Send + Sync>> {
+    let mut merged = match base {
+        Some(profile) => toml::Value::try_from(profile)?,
+        None => toml::Value::Table(toml::Table::new()),
+    };
+    merge_toml_value(&mut merged, value.clone());
+    let mut profile: CliProfile = merged.try_into()?;
+    if profile.name.is_empty() {
+        profile.name = name.to_owned();
+    }
+    Ok(profile)
+}
+
+fn merge_toml_value(base: &mut toml::Value, overlay: toml::Value) {
+    match (base, overlay) {
+        (toml::Value::Table(base), toml::Value::Table(overlay)) => {
+            for (key, value) in overlay {
+                match base.get_mut(&key) {
+                    Some(existing) => merge_toml_value(existing, value),
+                    None => {
+                        base.insert(key, value);
+                    }
+                }
+            }
+        }
+        (base, overlay) => *base = overlay,
+    }
 }
 
 fn load_host_scripts(
@@ -1129,16 +1161,6 @@ scripts_dir = "./mmux_sources/scripts"
 assets_dir = "./mmux_sources/assets"
 tmux_conf = "./mmux_sources/assets/tmux.conf"
 
-[coder_profile.codex]
-name = "codex"
-cmd = "codex"
-prompt_indicator = "›"
-busy_indicators = ["• Working"]
-approve_keys = "y Enter"
-reject_keys = "n Enter"
-cancel_keys = "C-c"
-escape_keys = "Escape"
-
 [coder_profile.codex.launch]
 scripts_dir = "./profile_sources/codex/scripts"
 assets_dir = "./profile_sources/codex/assets"
@@ -1173,9 +1195,13 @@ assets_dir = "./profile_sources/codex/assets"
                 .map(|source| source.revision.as_str()),
             Some("v0.1.0")
         );
-        assert_eq!(loaded.coder_profiles.len(), 1);
-        let profile = &loaded.coder_profiles[0];
+        let profile = loaded
+            .coder_profiles
+            .iter()
+            .find(|profile| profile.name == "codex")
+            .expect("codex profile loaded");
         assert_eq!(profile.name, "codex");
+        assert_eq!(profile.cmd.as_deref(), Some("codex"));
         assert_eq!(
             profile
                 .launch
@@ -1277,6 +1303,30 @@ assets_dir = "./profile_sources/codex/assets"
                 .as_ref()
                 .and_then(|launch| launch.scripts_dir.as_deref()),
             Some("./profile_sources/kimi/scripts")
+        );
+    }
+
+    #[test]
+    fn root_microsandbox_example_config_parses_launch_extensions() {
+        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let config_path = manifest_dir
+            .join("../../..")
+            .join("mmux-microsandbox.toml.example");
+
+        let loaded = load_microsandbox_config(&config_path).unwrap();
+        let codex = loaded
+            .coder_profiles
+            .iter()
+            .find(|profile| profile.name == "codex")
+            .expect("codex profile loaded");
+
+        assert_eq!(codex.cmd.as_deref(), Some("codex"));
+        assert_eq!(
+            codex
+                .launch
+                .as_ref()
+                .and_then(|launch| launch.scripts_dir.as_deref()),
+            Some("./profile_sources/codex/scripts")
         );
     }
 }

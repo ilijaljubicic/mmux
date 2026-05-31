@@ -1,3 +1,13 @@
+# Microsandbox node config example.
+#
+# This file shows backend config plus profile launch extensions. Coder
+# interaction profiles are built into mmux; do not repeat cmd, prompt markers,
+# busy markers, or action keys here unless you intentionally want to change the
+# built-in profile.
+#
+# Copy this file to the config path you pass as --node-config, or use it as a
+# reference for example-backends/microsandbox/mmux.toml.
+
 [microsandbox.runtime]
 # memory_mib = 1024
 # cpus = 2
@@ -8,10 +18,8 @@ scripts_dir = "./mmux_sources/scripts"
 assets_dir = "./mmux_sources/assets"
 tmux_conf = "./mmux_sources/assets/tmux.conf"
 
-# Coder profiles are built into mmux. These sections only extend the built-in
-# profiles with Microsandbox launch assets. Do not repeat backend-agnostic
-# fields like cmd, prompt_indicator, or busy_indicators unless you intentionally
-# want to replace the built-in value.
+# These launch sections extend the built-in coder profiles with sandbox setup
+# assets. Omitted backend-agnostic fields continue to come from code defaults.
 
 [coder_profile.codex.launch]
 scripts_dir = "./profile_sources/codex/scripts"
@@ -35,20 +43,6 @@ network_policy = "non_local"
 # deny_domain_suffix = [".tracking.com"]
 # max_connections = 50
 # trust_host_cas = true
-
-# [[microsandbox.volumes]]
-# name = "my-data"
-# quota_mib = 5120
-# [[microsandbox.volumes.labels]]
-# key = "env"
-# value = "dev"
-
-# [[microsandbox.mounts]]
-# kind = "named"
-# guest = "/data"
-# name = "my-data"
-# readonly = false
-# noexec = false
 
 [[microsandbox.secrets]]
 env = "MMUX_CONTROLLER_TOKEN"

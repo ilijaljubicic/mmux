@@ -1,0 +1,43 @@
+# Optional local/node config overlay.
+#
+# mmux has built-in coder profiles for codex, opencode, kimi, claude, and
+# generic. You do not need a TOML file for local mode.
+#
+# Copy this file to mmux.toml only when you need to change a built-in profile
+# or add a new one. For built-in profiles, set only the fields you intentionally
+# want to change. Omitted fields keep their built-in values.
+#
+# Nested tables merge with built-ins. Scalar and list fields replace the
+# built-in value, so do not copy a full profile unless you mean to own every
+# copied field.
+
+# Example: add one extra busy marker to an existing built-in profile.
+# Because lists replace, include the built-in markers you still want to keep.
+#
+# [coder_profile.kimi]
+# busy_indicators = [
+#     "Working",
+#     "Running",
+#     "ctrl+c: cancel",
+#     "ctrl-s to steer",
+#     "to edit",
+#     "Indexing workspace",
+# ]
+
+# Example: override only the command used for a built-in profile.
+#
+# [coder_profile.codex]
+# cmd = "codex --model gpt-5"
+
+# Example: define a new custom profile. New profiles do not have built-in
+# defaults, so provide the complete backend-agnostic profile shape.
+#
+# [coder_profile.custom]
+# name = "custom"
+# cmd = "custom-code"
+# prompt_indicator = ">"
+# busy_indicators = ["Working"]
+# approve_keys = "y Enter"
+# reject_keys = "n Enter"
+# cancel_keys = "C-c"
+# escape_keys = "Escape"

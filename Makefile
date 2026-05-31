@@ -12,7 +12,7 @@ endef
 
 .PHONY: help build check test clean lint release release-build prepare-release release-tag update-patch update-minor update-major generate-build run-local run-controller run-node wire-check-tools wire-generate
 
-LOCAL_ARGS ?= --node-config example-backends/local/mmux.toml
+LOCAL_ARGS ?=
 CONTROLLER_ARGS ?=
 NODE_ARGS ?=
 

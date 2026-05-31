@@ -1,26 +1,28 @@
 # Microsandbox mmux Backend Example
 
-This directory shows the Microsandbox backend as a real Rust crate plus a
-small example wrapper.
+This directory contains the example config and Make targets for running an
+`mmux node` inside Microsandbox.
 
-The backend build expects the host `libcap-ng` development package so Rust can
-link `libcap-ng.so.0`.
+The host builds and runs the `mmux-microsandbox-node` launcher crate. That
+launcher creates or resumes a Microsandbox instance, injects the node config
+and setup assets, then starts `mmux node` inside the guest.
 
-The backend crate starts a sandbox from a stock Microsandbox image, installs
-`mmux` from the git ref declared in `mmux.toml`, copies `mmux.toml` into the
-sandbox, then launches `mmux node` from Rust inside the guest.
+The guest installs `mmux` from source using the `[microsandbox.assets]`
+`mmux_source` entry in `mmux.toml`:
+
+```toml
+mmux_source = { repo = "https://github.com/ilijaljubicic/mmux.git", ref = "v0.1.0" }
+```
+
+Use a branch or commit for development, or a release tag such as `v0.1.0` for
+reproducible sandbox launches. If you point the ref at a private repository,
+the sandbox needs credentials that can fetch it.
 
 When you want to avoid redoing the guest setup on every launch, create a
 snapshot bundle from the prepared sandbox and launch from that bundle
 instead. Bundle launches skip the setup scripts and rootfs patches, so the
 prepared sandbox must already contain the installed mmux binary, node config,
 and guest toolchain state.
-
-The guest installs `mmux` with `cargo install --git ... --rev ...` during the
-launch scripts, so the chosen ref lives in `mmux.toml`. Use a branch or commit
-for development, or a release tag such as `v0.1.0` for reproducible sandbox
-launches. If you point that ref at a private repository, make sure the sandbox
-has whatever credentials it needs to fetch it.
 
 ## Layout
 
@@ -44,10 +46,6 @@ profile_sources/
     assets/
     scripts/
       00_install.sh
-  aider/
-    assets/
-    scripts/
-      00_install.sh
   kimi/
     assets/
     scripts/
@@ -60,7 +58,7 @@ profile_sources/
 
 `mmux_sources/scripts` contains the shared sandbox setup. The profile-specific
 `profile_sources/<name>/scripts` directories contain the per-coder install
-steps, so `codex`, `opencode`, `aider`, `kimi`, and `claude` can be prepared
+steps, so `codex`, `opencode`, `kimi`, and `claude` can be prepared
 independently. The backend registers every script and runs them in alphabetical
 order, first the shared scripts and then the profile-specific ones.
 
@@ -106,8 +104,9 @@ make bundle-launch BUNDLE=.artifacts/mmux-node-seed.tar.zst CONTROLLER_URL="http
 
 ## Node config
 
-`mmux.toml` owns the node config plus the shared and per-profile launch
-prep:
+`mmux.toml` owns the Microsandbox node config plus shared setup and per-profile
+launch extensions. It should not restate built-in coder profile fields unless
+you intentionally want to replace them:
 
 ```toml
 [microsandbox.runtime]
@@ -120,33 +119,21 @@ scripts_dir = "./mmux_sources/scripts"
 assets_dir = "./mmux_sources/assets"
 tmux_conf = "./mmux_sources/assets/tmux.conf"
 
-[coder_profile.codex]
-name = "codex"
-cmd = "codex"
-prompt_indicator = "›"
-busy_indicators = ["• Working", "Starting MCP servers"]
-approve_keys = "y Enter"
-reject_keys = "n Enter"
-cancel_keys = "C-c"
-escape_keys = "Escape"
-
 [coder_profile.codex.launch]
 scripts_dir = "./profile_sources/codex/scripts"
 assets_dir = "./profile_sources/codex/assets"
-
-[coder_profile.claude]
-name = "claude"
-cmd = "claude"
-prompt_indicator = "❯"
-busy_indicators = ["Thinking", "Working", "Running"]
 
 [coder_profile.claude.launch]
 scripts_dir = "./profile_sources/claude/scripts"
 assets_dir = "./profile_sources/claude/assets"
 ```
 
-The backend loads shared scripts from `mmux_sources/scripts`, then loads each
-profile launch directory in profile-name order. Host-side paths for
+Coder interaction profiles are built into mmux. The Microsandbox TOML only
+needs backend-specific launch sections for the profiles that require sandbox
+setup. Omitted fields keep their built-in values; scalar and list fields that
+you set replace the built-in value. The backend loads shared scripts from
+`mmux_sources/scripts`, then loads each profile launch directory in
+profile-name order. Host-side paths for
 `copy_file`, `copy_dir`, and launch directories are resolved relative to the
 directory that contains `mmux.toml`.
 

@@ -390,6 +390,10 @@ fn tmux(args: &[&str]) -> Result<String, String> {
     mmux_node::tmux(args)
 }
 
+const SESSION_OBJECTIVE_OPTION: &str = "@mmux_objective";
+const SESSION_LIST_FORMAT: &str =
+    "#{session_name}: #{session_windows} windows (#{session_attached} attached) objective=#{@mmux_objective}";
+
 fn session_exists(session: &str) -> bool {
     mmux_node::session_exists(session)
 }
@@ -421,14 +425,34 @@ fn session_kill(session: &str) -> Result<String, String> {
 }
 
 fn session_list() -> Result<String, String> {
-    match tmux(&[
-        "list-sessions",
-        "-F",
-        "#{session_name}: #{session_windows} windows (#{session_attached} attached)",
-    ]) {
+    match tmux(&["list-sessions", "-F", SESSION_LIST_FORMAT]) {
         Ok(output) => Ok(output),
         Err(_) => Ok("No tmux sessions running".into()),
     }
+}
+
+fn set_session_objective(session: &str, objective: &str) -> Result<(), String> {
+    tmux(&[
+        "set-option",
+        "-t",
+        session,
+        SESSION_OBJECTIVE_OPTION,
+        objective,
+    ])?;
+    Ok(())
+}
+
+fn session_objective(session: &str) -> Option<String> {
+    tmux(&[
+        "show-options",
+        "-v",
+        "-t",
+        session,
+        SESSION_OBJECTIVE_OPTION,
+    ])
+    .ok()
+    .map(|value| value.trim().to_owned())
+    .filter(|value| !value.is_empty())
 }
 
 async fn session_send(session: &str, text: &str, enter: bool) -> Result<String, String> {
@@ -806,9 +830,12 @@ fn session_info(session: &str) -> Result<String, String> {
         "-F",
         "window_id=#{window_id} index=#{window_index} name=#{window_name} active=#{window_active}",
     ])?;
+    let objective = session_objective(session)
+        .map(|value| format!("\nObjective: {}", value))
+        .unwrap_or_default();
     Ok(format!(
-        "Session: {}\nPanes:\n{}\nWindows:\n{}",
-        session, info, windows
+        "Session: {}{}\nPanes:\n{}\nWindows:\n{}",
+        session, objective, info, windows
     ))
 }
 
@@ -1690,6 +1717,49 @@ impl TmuxMcpServer {
             .ok_or_else(|| format!("Session '{}' has no panes on node '{}'", session, node_id))
     }
 
+    async fn set_node_session_objective(
+        &self,
+        node: &str,
+        session: &str,
+        objective: &str,
+    ) -> Result<(), String> {
+        if node != "local" {
+            self.remote_tmux(
+                node,
+                vec![
+                    "set-option".into(),
+                    "-t".into(),
+                    session.into(),
+                    SESSION_OBJECTIVE_OPTION.into(),
+                    objective.into(),
+                ],
+                Duration::from_secs(20),
+            )
+            .await?;
+        } else {
+            set_session_objective(session, objective)?;
+        }
+        Ok(())
+    }
+
+    async fn remote_session_objective(&self, node: &str, session: &str) -> Option<String> {
+        self.remote_tmux(
+            node,
+            vec![
+                "show-options".into(),
+                "-v".into(),
+                "-t".into(),
+                session.into(),
+                SESSION_OBJECTIVE_OPTION.into(),
+            ],
+            Duration::from_secs(20),
+        )
+        .await
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+    }
+
     async fn remote_wait_for(
         &self,
         node_id: &str,
@@ -1902,6 +1972,7 @@ impl ServerHandler for TmuxMcpServer {
                         "session": { "type": "string", "description": "Session name (default: profile name)" },
                         "node": { "type": "string", "description": "Execution node id (default: local)" },
                         "cwd": { "type": "string", "description": "Working directory" },
+                        "objective": { "type": "string", "description": "Short description of what this coder session is about" },
                         "timeout_seconds": { "type": "integer", "description": "Max seconds to wait for readiness (default: 30)" }
                     }), None)),
                 ),
@@ -2065,7 +2136,7 @@ impl ServerHandler for TmuxMcpServer {
                             vec![
                                 "list-sessions".into(),
                                 "-F".into(),
-                                "#{session_name}: #{session_windows} windows (#{session_attached} attached)".into(),
+                                SESSION_LIST_FORMAT.into(),
                             ],
                             Duration::from_secs(20),
                         )
@@ -2910,6 +2981,11 @@ impl ServerHandler for TmuxMcpServer {
                     args.get("cwd").and_then(|v| v.as_str()).map(PathBuf::from)
                 };
                 let cwd_text = cwd.as_ref().map(|p| p.to_string_lossy().into_owned());
+                let objective = args
+                    .get("objective")
+                    .and_then(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty());
                 let timeout = self
                     .policy
                     .clamp_timeout(
@@ -2935,13 +3011,23 @@ impl ServerHandler for TmuxMcpServer {
                     .create_session_with_command(node, session_name, cmd, cwd_text.as_deref())
                     .await
                 {
-                    Ok(_) => match self
-                        .wait_coding_session_ready(node, session_name, &profile, timeout)
-                        .await
-                    {
-                        Ok(msg) => Ok(Self::text_result(msg)),
-                        Err(e) => Ok(Self::error_result(e)),
-                    },
+                    Ok(_) => {
+                        if let Some(objective) = objective {
+                            if let Err(error) = self
+                                .set_node_session_objective(node, session_name, objective)
+                                .await
+                            {
+                                return Ok(Self::error_result(error));
+                            }
+                        }
+                        match self
+                            .wait_coding_session_ready(node, session_name, &profile, timeout)
+                            .await
+                        {
+                            Ok(msg) => Ok(Self::text_result(msg)),
+                            Err(e) => Ok(Self::error_result(e)),
+                        }
+                    }
                     Err(e) => Ok(Self::error_result(e)),
                 }
             }
@@ -3135,10 +3221,15 @@ impl ServerHandler for TmuxMcpServer {
                             Duration::from_secs(20),
                         )
                         .await;
+                    let objective = self.remote_session_objective(node, session).await;
+                    let objective = objective
+                        .as_deref()
+                        .map(|value| format!("\nObjective: {}", value))
+                        .unwrap_or_default();
                     return match (panes, windows) {
                         (Ok(panes), Ok(windows)) => Ok(Self::text_result(format!(
-                            "Node: {}\nSession: {}\nPanes:\n{}\nWindows:\n{}",
-                            node, session, panes, windows
+                            "Node: {}\nSession: {}{}\nPanes:\n{}\nWindows:\n{}",
+                            node, session, objective, panes, windows
                         ))),
                         (Err(e), _) | (_, Err(e)) => Ok(Self::error_result(e)),
                     };
@@ -3462,8 +3553,9 @@ impl ServerHandler for TmuxMcpServer {
                 "drive-coding-cli",
                 Some("Best practices for driving a coding CLI through mmux"),
                 Some(vec![
-                    PromptArgument::new("profile")
-                        .with_description("CLI profile to use (e.g. opencode, aider, codex)"),
+                    PromptArgument::new("profile").with_description(
+                        "CLI profile to use (e.g. codex, opencode, kimi, claude)",
+                    ),
                     PromptArgument::new("session").with_description("Tmux session name"),
                 ]),
             ),
@@ -3973,7 +4065,7 @@ where
         })
     } else {
         println!(
-            "No node profile config found. Using built-in profiles (opencode, aider, codex, generic)."
+            "No node profile config found. Using built-in profiles (codex, opencode, kimi, claude, generic)."
         );
         mmux_node::default_profiles()
     };
@@ -4297,6 +4389,11 @@ triggers = ["Starting MCP servers"]
     }
 
     #[test]
+    fn test_session_list_format_exposes_objective() {
+        assert!(SESSION_LIST_FORMAT.contains("objective=#{@mmux_objective}"));
+    }
+
+    #[test]
     fn test_clean_exec_output() {
         // Typical shell output: command line, output, empty lines, prompt
         let lines = vec!["user@host:~$ echo hello", "hello", "", "user@host:~$ "];
@@ -4363,8 +4460,8 @@ triggers = ["Starting MCP servers"]
     fn test_profile_is_busy_uses_profile_specific_markers_for_common_clis() {
         for (name, marker) in [
             ("codex", "• Working"),
-            ("aider", "Generating"),
             ("opencode", "Processing"),
+            ("kimi", "ctrl-s to steer"),
             ("claude", "Thinking"),
         ] {
             let profile = CliProfile {

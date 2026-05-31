@@ -10,7 +10,7 @@ mmux is an MCP server that controls tmux sessions. It lets you:
 - Capture output (visible lines or full scrollback)
 - Wait for conditions (stable output, sentinel strings, prompt markers)
 - Read and save files on the host filesystem
-- Drive coding CLIs (opencode, aider, codex, etc.) with profile-aware actions
+- Drive coding CLIs (codex, opencode, kimi, claude, etc.) with profile-aware actions
 
 ## How to Connect
 
@@ -34,7 +34,7 @@ Do you need to run a single shell command and get its output?
 Do you need to run a command in a terminal?
   └─ Use exec for one-shot commands, or start_coding_session / send_input / send_key → capture_output for interactive work
 
-Do you need to drive a coding CLI (opencode, aider, codex)?
+Do you need to drive a coding CLI (codex, opencode, kimi, claude)?
   └─ Use list_coder_profiles → start_coding_session → coding_send → coding_wait_ready → coding_read → coding_action
 
 Do you need to check what's happening without waiting?
@@ -46,6 +46,11 @@ Do you need to read or write a file?
 
 ## Session Lifecycle Best Practices
 
+mmux has generic tmux sessions and profile-driven coder sessions. A coder
+session is still a tmux session; it is identified by `node`, `session`, the
+`profile` used by coding tools, and an optional `objective` describing what the
+session is about.
+
 ### 1. Always check what is already running
 ```
 list_sessions  → see what's running
@@ -55,10 +60,12 @@ check_state    → quick JSON check (has_prompt, busy)
 
 ### 2. Start profile-driven sessions explicitly
 ```
-start_coding_session(profile="codex", session="codex", node="msb-mmux-1")
+start_coding_session(profile="codex", session="codex", node="msb-mmux-1", objective="work on release docs")
 ```
 
-The public MCP surface no longer exposes raw generic session creation. Use `start_coding_session` for coding CLIs and the debug/read tools for inspection.
+The public MCP surface does not expose raw generic session creation. Use
+`start_coding_session` for coding CLIs. Use `exec` for one-shot shell work; it
+creates its shell session if needed.
 
 ### 3. Capture output after every significant action
 ```
@@ -77,7 +84,7 @@ Or run from inside the session:
 tmux detach
 ```
 
-This is useful when you want to leave a coding CLI (codex, aider, etc.) running and come back to it later.
+This is useful when you want to leave a coding CLI running and come back to it later.
 
 ### 5. Clean up when done
 ```
@@ -89,7 +96,7 @@ kill_session(session="myapp")
 ### Step 1: Ensure the session exists
 ```
 list_coder_profiles
-start_coding_session(profile="codex", session="codex", node="msb-mmux-1", cwd="/path/to/project")
+start_coding_session(profile="codex", session="codex", node="msb-mmux-1", cwd="/path/to/project", objective="fix tests for project X")
 ```
 
 ### Step 2: Wait for the CLI to be ready
@@ -139,10 +146,16 @@ coding_action(session="codex", profile="codex", action="cancel")
 
 ## Profile System
 
-Profiles define how to interact with a specific CLI. They are loaded from the active config file at startup. For this repo, the canonical backend configs live under `example-backends/`:
+Profiles define how to interact with a specific CLI. Common coder profiles are
+built into mmux so local mode works without a profile TOML file. Optional
+`[coder_profile.<name>]` sections in the active config overlay those built-ins:
+omitted fields keep their built-in values, nested tables merge, and scalar/list
+fields replace the built-in value. For this repo, backend examples live under
+`example-backends/`:
 
-- `example-backends/local/mmux.toml`
-- `example-backends/microsandbox/mmux.toml`
+- `example-backends/local/mmux.toml` for local overrides
+- `example-backends/microsandbox/mmux.toml` for Microsandbox launch config
+- `mmux.toml.example` and `mmux-microsandbox.toml.example` for root examples
 
 The canonical profile section name is `coder_profile`.
 
@@ -216,7 +229,9 @@ Creates parent directories automatically.
 ## Common Gotchas
 
 ### 1. Session does not exist
-If you get `"Session 'X' does not exist"`, call `create_session` first.
+If you get `"Session 'X' does not exist"` for a coding CLI, call
+`start_coding_session` first. For shell work, use `exec`; it creates its shell
+session if needed.
 
 ### 2. Output is truncated
 - `capture_output` defaults to visible pane only. Use `scrollback: true` for full history.
@@ -264,6 +279,6 @@ Both accept optional `profile` and `session` arguments.
 - The server is single-process but async-concurrent. Multiple agents can call tools simultaneously.
 - `thread::sleep` has been replaced with `tokio::time::sleep`. Long waits (e.g., `wait_for` with 60s timeout) do not block other requests.
 - The controller does not start the local backend by default. Use `--enable-local-node` for the built-in local tmux backend.
-- The local backend config lives at `example-backends/local/mmux.toml`.
-- The Microsandbox backend config lives at `example-backends/microsandbox/mmux.toml`.
+- The local backend does not need a TOML file unless you want profile overlays.
+- The Microsandbox backend config lives at `example-backends/microsandbox/mmux.toml`; its coder profile sections should normally only add backend launch extensions.
 - Pass `--config` to override the default config file if needed.

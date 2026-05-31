@@ -1,9 +1,9 @@
 # Local Backend Example
 
-This directory holds the coder-profile config for the built-in local backend.
-The local backend runs tmux on the same host as the controller, so it is the
-fastest path for development and for agents that should operate your current
-machine directly.
+This directory holds optional overrides for the built-in local backend. The
+local backend runs tmux on the same host as the controller, so it is the fastest
+path for development and for agents that should operate your current machine
+directly.
 
 ## Run
 
@@ -14,7 +14,7 @@ make run-local
 Equivalent direct command from the repository root:
 
 ```bash
-cargo run -- controller --enable-local-node --node-config example-backends/local/mmux.toml
+cargo run -- controller --enable-local-node
 ```
 
 The controller exposes MCP at:
@@ -29,20 +29,18 @@ bearer-token authentication.
 
 ## Profiles
 
-`mmux.toml` defines the checked-in local profiles:
+Local mode uses built-in profiles by default:
 
 - `codex`
 - `opencode`
-- `aider`
 - `kimi`
 - `claude`
 - `generic`
 
 Each profile declares a command, prompt marker, busy markers, and the keys used
-for approve/reject/cancel/escape actions. The local config also includes launch
-metadata for profile-specific scripts/assets, but this directory intentionally
-does not ship those setup directories. The launch metadata is useful when the
-same profile shape is consumed by a backend that prepares CLI environments.
+for approve/reject/cancel/escape actions. `mmux.toml` is optional and should be
+used only for local overlays. When overriding a built-in profile, set only the
+fields you intentionally want to change. See `../../mmux.toml.example`.
 
 ## Typical MCP Workflow
 

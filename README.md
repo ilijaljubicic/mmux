@@ -10,10 +10,12 @@ The core idea is simple:
 - `mmux controller` exposes the MCP HTTP endpoint and the controller/node wire
   endpoint.
 - `mmux node` owns tmux and filesystem access in the environment where it runs.
-- MCP tools target the built-in local node by default, or a registered remote
-  node when the tool accepts a `node` argument.
-- Coder profiles describe how to launch and drive CLIs such as `codex`,
-  `opencode`, `aider`, and `kimi`.
+- Node-aware MCP tools default to `node = "local"`, which uses the built-in
+  local node when the controller is started with `--enable-local-node`. Pass a
+  `node_id` registered by `mmux node` as the tool's `node` argument to target a
+  remote node.
+- Built-in coder profiles describe how to launch and drive CLIs such as
+  `codex`, `opencode`, `kimi`, and `claude`.
 
 ## Prerequisites
 
@@ -48,7 +50,7 @@ VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/ilijaljubicic/mmux/m
 Then run a local controller:
 
 ```bash
-mmux controller --enable-local-node --node-config example-backends/local/mmux.toml
+mmux controller --enable-local-node
 ```
 
 ### Local backend
@@ -57,8 +59,12 @@ mmux controller --enable-local-node --node-config example-backends/local/mmux.to
 make run-local
 ```
 
-This starts the controller with the built-in local node enabled and loads
-`example-backends/local/mmux.toml`.
+This starts the controller with the built-in local node enabled and uses the
+built-in coder profiles.
+
+Warning: the local backend is not sandboxed. Tools run tmux commands and file
+operations on the same host as the controller, with the controller process
+user's permissions. Use it only for trusted clients and trusted workspaces.
 
 The MCP endpoint is:
 
@@ -113,7 +119,7 @@ Important controller flags:
 
 | Flag | Default | Purpose |
 | ---- | ------- | ------- |
-| `--node-config` | `mmux.toml` in the current directory, then built-ins | Loads coder profiles. |
+| `--node-config` | `mmux.toml` in the current directory, then built-ins | Loads coder profile overlays. |
 | `--host` | loopback interface | Bind host for the HTTP server. |
 | `--port` | `3000` | Bind port. |
 | `--token` | none | Bearer token for MCP and wire requests. |
@@ -153,7 +159,7 @@ make wire-generate
 Pass entrypoint flags through the target variables:
 
 ```bash
-make run-local LOCAL_ARGS="--node-config example-backends/local/mmux.toml"
+make run-local LOCAL_ARGS="--port 3001"
 make run-controller CONTROLLER_ARGS="--token $MMUX_TOKEN"
 make run-node NODE_ARGS="--controller-url http://<controller-host>:3000"
 ```
@@ -168,51 +174,86 @@ used by `scripts/install.sh`.
 
 ## Coder Profiles
 
-Coder profiles live under `[coder_profile.<name>]` in TOML. The controller
-loads profiles from `--node-config`, then from `mmux.toml` in the current
-directory, then falls back to built-in profiles.
+Coder profiles are built into mmux for common coding CLIs, so local mode works
+without a profile TOML file. If you provide `[coder_profile.<name>]` sections
+through `--node-config` or `mmux.toml` in the current directory, those sections
+overlay the built-ins. Omitted fields keep their built-in values.
 
-Example:
+Use TOML only for intentional changes:
+
+- backend-agnostic profile tweaks, such as changing a command or prompt marker;
+- backend-specific extensions, such as Microsandbox launch scripts/assets;
+- new custom profiles.
+
+Nested tables merge with the built-in profile. Scalar and list fields replace
+the built-in value, so do not copy full profile definitions unless you want to
+own every copied field. See `mmux.toml.example` and
+`mmux-microsandbox.toml.example` for copyable examples.
+
+The fields shown here are the backend-agnostic profile shape: they describe how
+mmux launches and drives a CLI once a node has the CLI available. Individual
+backends may add extra nested sections for environment preparation, assets, or
+secrets.
+
+Backend-agnostic override example:
 
 ```toml
+# Only this field changes. The rest of the built-in codex profile remains
+# unchanged.
 [coder_profile.codex]
-name = "codex"
-cmd = "codex"
-prompt_indicator = "›"
-busy_indicators = ["• Working", "Starting MCP servers"]
-approve_keys = "y Enter"
-reject_keys = "n Enter"
-cancel_keys = "C-c"
-escape_keys = "Escape"
+cmd = "codex --model gpt-5"
+```
 
+Microsandbox extension example:
+
+```toml
+# This extends the built-in codex profile with backend launch assets. It does
+# not override cmd, prompt_indicator, busy_indicators, or action keys.
 [coder_profile.codex.launch]
 scripts_dir = "./profile_sources/codex/scripts"
 assets_dir = "./profile_sources/codex/assets"
-
-[coder_profile.codex.startup_dismiss]
-key = "Down Enter"
-triggers = ["Update available!", "Press enter to continue"]
-
-[coder_profile.claude]
-name = "claude"
-cmd = "claude"
-prompt_indicator = "❯"
-busy_indicators = ["Thinking", "Working", "Running"]
-approve_keys = "y Enter"
-reject_keys = "n Enter"
-cancel_keys = "C-c"
-escape_keys = "Escape"
-
-[coder_profile.claude.startup_dismiss]
-key = "Escape"
-triggers = [
-    "Update available",
-    "Claude Code Update Available",
-    "A new version of Claude Code is available",
-]
 ```
 
 Profiles can also be loaded at runtime with the `load_profile` MCP tool.
+
+## Sessions
+
+mmux works with tmux sessions. A session name identifies a running terminal on
+one node. Node-aware tools accept `node`; if omitted, they target `local`.
+
+There are two common session patterns:
+
+| Session type | Created by | Used with | Meaning |
+| ------------ | ---------- | --------- | ------- |
+| Shell session | `exec` when needed, or an existing tmux session | `send_input`, `send_key`, `capture_output`, `wait_for`, `session_info`, `list_panes`, `resize_pane` | Generic terminal session with no profile-specific readiness rules. |
+| Coder session | `start_coding_session` | `coding_send`, `coding_wait_ready`, `coding_read`, `coding_action`, `check_state` | A tmux session running a coding CLI and interpreted through a coder profile. |
+
+A coder session can also carry one human-readable `objective`, stored as a
+tmux session option. Use it to tell agents what that long-lived coding session
+is about when several sessions exist.
+
+A coder session is not a separate storage object. It is identified by:
+
+- `node`: where the tmux session lives;
+- `session`: the tmux session name;
+- `profile`: the CLI interaction rules used to launch/read/drive it.
+- `objective`: optional short description of the session's task or intent.
+
+Example:
+
+```json
+{
+  "node": "msb-mmux-1",
+  "session": "codex-main",
+  "profile": "codex",
+  "objective": "work on mmux release docs"
+}
+```
+
+`list_sessions` and `session_info` show the objective when it is set. The same
+tmux session can be inspected with generic session tools, but coding tools need
+the profile so mmux can detect prompts, busy states, startup/update prompts,
+and approval actions correctly.
 
 ## MCP Surface
 
@@ -338,9 +379,13 @@ The canonical controller/node wire schema lives in
 
 ## Backend Layout
 
-- `example-backends/local/mmux.toml` defines local coder profiles.
+- Local mode uses built-in coder profiles by default.
+- `mmux.toml.example` shows optional local/node profile overlays.
+- `mmux-microsandbox.toml.example` shows Microsandbox config plus profile
+  launch extensions.
 - `example-backends/microsandbox/mmux.toml` defines Microsandbox runtime,
-  assets, network policy, secrets, volumes, mounts, patches, and coder profiles.
+  assets, network policy, secrets, volumes, mounts, patches, and profile launch
+  extensions.
 
 The Microsandbox backend:
 
