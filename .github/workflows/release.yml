@@ -1,0 +1,113 @@
+name: mmux Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build & Package on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest, macos-15-intel]
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcap-ng-dev musl-tools pkg-config
+
+      - name: Test
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            cargo test --workspace --locked
+          else
+            cargo test --workspace --exclude mmux-microsandbox-node --locked
+          fi
+
+      - name: Build mmux binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            rustup target add x86_64-unknown-linux-musl
+            cargo build --release --locked --target x86_64-unknown-linux-musl --bin mmux
+          elif [[ "$RUNNER_OS" == "macOS" ]]; then
+            if [[ "$(uname -m)" == "arm64" ]]; then
+              rustup target add aarch64-apple-darwin
+              cargo build --release --locked --target aarch64-apple-darwin --bin mmux
+            else
+              rustup target add x86_64-apple-darwin
+              cargo build --release --locked --target x86_64-apple-darwin --bin mmux
+            fi
+          else
+            echo "Unsupported platform: $RUNNER_OS"
+            exit 1
+          fi
+
+      - name: Package archive
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p artifacts
+          if [[ "$RUNNER_OS" == "Linux" ]]; then
+            cp target/x86_64-unknown-linux-musl/release/mmux artifacts/mmux-linux-x86_64
+          elif [[ "$RUNNER_OS" == "macOS" ]]; then
+            if [[ "$(uname -m)" == "arm64" ]]; then
+              cp target/aarch64-apple-darwin/release/mmux artifacts/mmux-darwin-arm64
+            else
+              cp target/x86_64-apple-darwin/release/mmux artifacts/mmux-darwin-x86_64
+            fi
+          fi
+          cd artifacts
+          for file in mmux-*; do
+            tar -czf "${file}.tar.gz" "$file"
+          done
+
+      - name: Upload archive
+        uses: actions/upload-artifact@v6
+        with:
+          name: binaries-${{ matrix.os }}
+          path: artifacts/*.tar.gz
+
+  release:
+    name: Create GitHub Release
+    needs: build
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download archives
+        uses: actions/download-artifact@v6
+        with:
+          pattern: binaries-*
+          merge-multiple: true
+          path: artifacts
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: "Release ${{ github.ref_name }}"
+          body: "Automated mmux release for ${{ github.ref_name }}."
+          draft: false
+          prerelease: false
+          files: artifacts/*.tar.gz
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

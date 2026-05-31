@@ -17,9 +17,10 @@ prepared sandbox must already contain the installed mmux binary, node config,
 and guest toolchain state.
 
 The guest installs `mmux` with `cargo install --git ... --rev ...` during the
-launch scripts, so the chosen ref lives in `mmux.toml`. If you point that ref
-at a private repository, make sure the sandbox has whatever credentials it
-needs to fetch it.
+launch scripts, so the chosen ref lives in `mmux.toml`. Use a branch or commit
+for development, or a release tag such as `v0.1.0` for reproducible sandbox
+launches. If you point that ref at a private repository, make sure the sandbox
+has whatever credentials it needs to fetch it.
 
 ## Layout
 
@@ -51,11 +52,15 @@ profile_sources/
     assets/
     scripts/
       00_install.sh
+  claude/
+    assets/
+    scripts/
+      00_install.sh
 ```
 
 `mmux_sources/scripts` contains the shared sandbox setup. The profile-specific
 `profile_sources/<name>/scripts` directories contain the per-coder install
-steps, so `codex`, `opencode`, `aider`, and `kimi` can be prepared
+steps, so `codex`, `opencode`, `aider`, `kimi`, and `claude` can be prepared
 independently. The backend registers every script and runs them in alphabetical
 order, first the shared scripts and then the profile-specific ones.
 
@@ -110,7 +115,7 @@ memory_mib = 1024
 cpus = 2
 
 [microsandbox.assets]
-mmux_source = { repo = "https://github.com/ilijaljubicic/mmux.git", ref = "main" }
+mmux_source = { repo = "https://github.com/ilijaljubicic/mmux.git", ref = "v0.1.0" }
 scripts_dir = "./mmux_sources/scripts"
 assets_dir = "./mmux_sources/assets"
 tmux_conf = "./mmux_sources/assets/tmux.conf"

@@ -1,6 +1,16 @@
 .DEFAULT_GOAL := help
 
-.PHONY: help build check test clean lint release generate-build run-local run-controller run-node wire-check-tools wire-generate
+CARGO_TOML := Cargo.toml
+
+define get_version
+$(shell awk '/^\[workspace.package\]/{in_workspace_package=1; next} /^\[/{in_workspace_package=0} in_workspace_package && /^version = /{gsub(/"/, "", $$3); print $$3; exit}' $(CARGO_TOML))
+endef
+
+define update_version
+	perl -0pi -e 's/(\[workspace\.package\]\nversion = ")[^"]+(")/$${1}$(1)$${2}/' $(CARGO_TOML)
+endef
+
+.PHONY: help build check test clean lint release release-build prepare-release release-tag update-patch update-minor update-major generate-build run-local run-controller run-node wire-check-tools wire-generate
 
 LOCAL_ARGS ?= --node-config example-backends/local/mmux.toml
 CONTROLLER_ARGS ?=
@@ -14,7 +24,14 @@ help:
 	@printf '  make test              Run workspace tests\n'
 	@printf '  make lint              Run clippy across workspace targets\n'
 	@printf '  make release           Release-build the full Cargo workspace\n'
+	@printf '  make release-build     Alias for make release\n'
 	@printf '  make generate-build    Generate wire sources, then debug-build\n'
+	@printf '\nRelease publishing:\n'
+	@printf '  make update-patch      Bump workspace patch version\n'
+	@printf '  make update-minor      Bump workspace minor version\n'
+	@printf '  make update-major      Bump workspace major version\n'
+	@printf '  make prepare-release   Refresh lockfile and run release checks\n'
+	@printf '  make release-tag       Tag v$$(workspace.package.version) and push it to trigger GitHub release\n'
 	@printf '\nRun locally:\n'
 	@printf '  make run-local         Run mmux controller with the built-in local node enabled\n'
 	@printf '  make run-controller    Run mmux controller\n'
@@ -33,8 +50,58 @@ check:
 	cargo check --workspace
 
 # Release build
-release:
+release: release-build
+
+release-build:
 	cargo build --workspace --release
+
+update-patch:
+	@echo "Updating patch version..."
+	$(eval CURRENT_VERSION := $(call get_version))
+	$(eval NEW_VERSION := $(shell echo $(CURRENT_VERSION) | awk -F. '{$$3=$$3+1} 1' OFS=.))
+	$(call update_version,$(NEW_VERSION))
+	@echo "Version updated from $(CURRENT_VERSION) to $(NEW_VERSION)"
+
+update-minor:
+	@echo "Updating minor version..."
+	$(eval CURRENT_VERSION := $(call get_version))
+	$(eval NEW_VERSION := $(shell echo $(CURRENT_VERSION) | awk -F. '{$$2=$$2+1; $$3=0} 1' OFS=.))
+	$(call update_version,$(NEW_VERSION))
+	@echo "Version updated from $(CURRENT_VERSION) to $(NEW_VERSION)"
+
+update-major:
+	@echo "Updating major version..."
+	$(eval CURRENT_VERSION := $(call get_version))
+	$(eval NEW_VERSION := $(shell echo $(CURRENT_VERSION) | awk -F. '{$$1=$$1+1; $$2=0; $$3=0} 1' OFS=.))
+	$(call update_version,$(NEW_VERSION))
+	@echo "Version updated from $(CURRENT_VERSION) to $(NEW_VERSION)"
+
+prepare-release:
+	@echo "Preparing release..."
+	$(eval VERSION := $(call get_version))
+	@echo "Current version: $(VERSION)"
+	cargo update
+	cargo test --workspace
+	cargo build --workspace --release
+	@echo "Release preparation complete for version $(VERSION)"
+
+release-tag:
+	@echo "Creating release tag from current branch..."
+	$(eval VERSION := $(call get_version))
+	$(eval CURRENT_BRANCH := $(shell git branch --show-current))
+	@if [ "$(CURRENT_BRANCH)" != "main" ]; then \
+		echo "ERROR: release-tag must be run from main. Current branch: $(CURRENT_BRANCH)"; \
+		exit 1; \
+	fi
+	@if ! git diff-index --quiet HEAD --; then \
+		echo "ERROR: working directory has uncommitted changes."; \
+		exit 1; \
+	fi
+	cargo test --workspace
+	cargo build --release --bin mmux
+	git tag -a v$(VERSION) -m "Release version v$(VERSION)"
+	git push origin v$(VERSION)
+	@echo "Release v$(VERSION) tagged. GitHub Actions will build and publish artifacts."
 
 # Generate wire sources, then build the full workspace
 generate-build: wire-generate build

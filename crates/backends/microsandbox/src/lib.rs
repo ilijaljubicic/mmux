@@ -1122,7 +1122,7 @@ mod tests {
             r#"
 [microsandbox.assets.mmux_source]
 repo = "https://github.com/ilijaljubicic/mmux.git"
-ref = "main"
+ref = "v0.1.0"
 
 [microsandbox.assets]
 scripts_dir = "./mmux_sources/scripts"
@@ -1171,7 +1171,7 @@ assets_dir = "./profile_sources/codex/assets"
                 .mmux_source
                 .as_ref()
                 .map(|source| source.revision.as_str()),
-            Some("main")
+            Some("v0.1.0")
         );
         assert_eq!(loaded.coder_profiles.len(), 1);
         let profile = &loaded.coder_profiles[0];

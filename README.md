@@ -31,6 +31,26 @@ revision in `Cargo.toml`.
 
 ## Quick Start
 
+### Install Controller
+
+Install the latest released `mmux` binary:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/ilijaljubicic/mmux/main/scripts/install.sh | bash
+```
+
+Pin a specific release:
+
+```bash
+VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/ilijaljubicic/mmux/main/scripts/install.sh | bash
+```
+
+Then run a local controller:
+
+```bash
+mmux controller --enable-local-node --node-config example-backends/local/mmux.toml
+```
+
 ### Local backend
 
 ```bash
@@ -137,6 +157,14 @@ make run-local LOCAL_ARGS="--node-config example-backends/local/mmux.toml"
 make run-controller CONTROLLER_ARGS="--token $MMUX_TOKEN"
 make run-node NODE_ARGS="--controller-url http://<controller-host>:3000"
 ```
+
+Release publishing uses git tags. The release version comes from
+`[workspace.package].version` in top-level `Cargo.toml`; all crates inherit it
+with `version.workspace = true`. Bump that version with `make update-patch`,
+`make update-minor`, or `make update-major`, merge the version change to
+`main`, then run `make release-tag` from a clean `main` checkout. The
+`v<version>` tag triggers GitHub Actions to build and attach platform archives
+used by `scripts/install.sh`.
 
 ## Coder Profiles
 
@@ -316,7 +344,8 @@ The canonical controller/node wire schema lives in
 
 The Microsandbox backend:
 
-- installs `mmux` from the git ref declared in `mmux.toml`;
+- installs `mmux` from the git ref declared in `mmux.toml`; the ref can be a
+  branch, commit SHA, or release tag such as `v0.1.0`;
 - loads shared scripts from `mmux_sources/scripts`;
 - loads per-profile setup from `profile_sources/<profile>/scripts`;
 - copies `mmux_sources/assets/tmux.conf` into the guest and sources it from

@@ -3,7 +3,7 @@
 # cpus = 2
 
 [microsandbox.assets]
-mmux_source = { repo = "https://github.com/ilijaljubicic/mmux.git", ref = "main" }
+mmux_source = { repo = "https://github.com/ilijaljubicic/mmux.git", ref = "v0.1.0" }
 scripts_dir = "./mmux_sources/scripts"
 assets_dir = "./mmux_sources/assets"
 tmux_conf = "./mmux_sources/assets/tmux.conf"
