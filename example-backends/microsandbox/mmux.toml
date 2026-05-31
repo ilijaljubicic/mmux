@@ -1,0 +1,107 @@
+[microsandbox.runtime]
+# memory_mib = 1024
+# cpus = 2
+
+[microsandbox.assets]
+mmux_binary = "./.artifacts/mmux"
+scripts_dir = "./mmux_sources/scripts"
+assets_dir = "./mmux_sources/assets"
+tmux_conf = "./mmux_sources/assets/tmux.conf"
+
+[coder_profile.codex]
+name = "codex"
+cmd = "codex"
+prompt_indicator = "›"
+busy_indicators = ["• Working", "Starting MCP servers"]
+approve_keys = "y Enter"
+reject_keys = "n Enter"
+cancel_keys = "C-c"
+escape_keys = "Escape"
+
+[coder_profile.codex.launch]
+scripts_dir = "./profile_sources/codex/scripts"
+assets_dir = "./profile_sources/codex/assets"
+
+[coder_profile.codex.startup_dismiss]
+key = "Escape"
+triggers = ["Starting MCP servers"]
+
+[coder_profile.opencode]
+name = "opencode"
+cmd = "opencode"
+prompt_indicator = ">"
+busy_indicators = ["Processing", "Generating"]
+approve_keys = "y Enter"
+reject_keys = "n Enter"
+cancel_keys = "C-c"
+escape_keys = "Escape"
+
+[coder_profile.opencode.launch]
+scripts_dir = "./profile_sources/opencode/scripts"
+assets_dir = "./profile_sources/opencode/assets"
+
+[coder_profile.aider]
+name = "aider"
+cmd = "aider"
+prompt_indicator = "aider >"
+busy_indicators = ["Generating"]
+approve_keys = "y Enter"
+reject_keys = "n Enter"
+cancel_keys = "C-c"
+escape_keys = "Escape"
+
+[coder_profile.aider.launch]
+scripts_dir = "./profile_sources/aider/scripts"
+assets_dir = "./profile_sources/aider/assets"
+
+[coder_profile.generic]
+name = "generic"
+prompt_indicator = "$"
+busy_indicators = []
+approve_keys = "y Enter"
+reject_keys = "n Enter"
+cancel_keys = "C-c"
+escape_keys = "Escape"
+
+[microsandbox.network]
+network_policy = "non_local"
+# deny_domain = ["ads.example.com"]
+# deny_domain_suffix = [".tracking.com"]
+# max_connections = 50
+# trust_host_cas = true
+
+# [[microsandbox.volumes]]
+# name = "my-data"
+# quota_mib = 5120
+# [[microsandbox.volumes.labels]]
+# key = "env"
+# value = "dev"
+
+# [[microsandbox.mounts]]
+# kind = "named"
+# guest = "/data"
+# name = "my-data"
+# readonly = false
+# noexec = false
+
+[[microsandbox.secrets]]
+env = "MMUX_CONTROLLER_TOKEN"
+value_from = "host.MMUX_TOKEN"
+allowed_host = "192.168.12.176"
+placeholder = "$MSB_MMUX_CONTROLLER_TOKEN"
+inject_headers = false
+inject_basic_auth = false
+inject_query = false
+inject_body = false
+require_tls_identity = false
+
+# [[microsandbox.secrets]]
+# env = "OPENAI_API_KEY"
+# value_from = "host.OPENAI_API_KEY"
+# allowed_host = "api.openai.com"
+# placeholder = "$MSB_OPENAI_API_KEY"
+# inject_headers = true
+# inject_basic_auth = false
+# inject_query = false
+# inject_body = false
+# require_tls_identity = true

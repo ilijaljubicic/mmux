@@ -1,0 +1,58 @@
+[coder_profile.opencode]
+name = "opencode"
+cmd = "opencode"
+prompt_indicator = ">"
+busy_indicators = ["Processing", "Generating"]
+approve_keys = "y Enter"
+reject_keys = "n Enter"
+cancel_keys = "C-c"
+escape_keys = "Escape"
+
+[coder_profile.opencode.launch]
+scripts_dir = "./profile_sources/opencode/scripts"
+assets_dir = "./profile_sources/opencode/assets"
+
+[coder_profile.opencode.startup_dismiss]
+key = "Escape"
+triggers = ["Starting MCP servers"]
+
+[coder_profile.aider]
+name = "aider"
+cmd = "aider"
+prompt_indicator = "aider >"
+busy_indicators = ["Generating"]
+approve_keys = "y Enter"
+reject_keys = "n Enter"
+cancel_keys = "C-c"
+escape_keys = "Escape"
+
+[coder_profile.aider.launch]
+scripts_dir = "./profile_sources/aider/scripts"
+assets_dir = "./profile_sources/aider/assets"
+
+[coder_profile.generic]
+name = "generic"
+prompt_indicator = "$"
+busy_indicators = []
+approve_keys = "y Enter"
+reject_keys = "n Enter"
+cancel_keys = "C-c"
+escape_keys = "Escape"
+
+[coder_profile.codex]
+name = "codex"
+cmd = "codex"
+prompt_indicator = "›"
+busy_indicators = ["• Working", "Starting MCP servers"]
+approve_keys = "y Enter"
+reject_keys = "n Enter"
+cancel_keys = "C-c"
+escape_keys = "Escape"
+
+[coder_profile.codex.launch]
+scripts_dir = "./profile_sources/codex/scripts"
+assets_dir = "./profile_sources/codex/assets"
+
+[coder_profile.codex.startup_dismiss]
+key = "Escape"
+triggers = ["Starting MCP servers"]

@@ -1,0 +1,9 @@
+*
+!target/
+!target/release/
+!target/release/mmux
+!mmux.toml
+!example-sandboxes/
+!example-sandboxes/microsandbox-mmux-node/
+!example-sandboxes/microsandbox-mmux-node/entrypoint.sh
+!example-sandboxes/microsandbox-mmux-node/mmux-node.toml
