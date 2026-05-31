@@ -105,15 +105,17 @@ scripts, so launch only applies runtime policy, writes the selected node config
 into the guest, auto-allows the controller URL, and starts `mmux node`.
 Installer network access is not opened at launch time.
 
-To capture and export it as a bundle:
+To capture and export a prepared sandbox as a bundle:
 
 ```bash
 make bundle-export SANDBOX=mmux-node SNAPSHOT_NAME=mmux-node-seed BUNDLE=.artifacts/mmux-node-seed.tar.zst
 ```
 
-`SANDBOX` is required for `bundle-export` because the snapshot is tied to a
-specific sandbox instance. If you omit it, the Makefile prints the exact
-example invocation above.
+`bundle-export` expects `SANDBOX` to name an existing sandbox that was already
+prepared with `make prepare`. It does not run setup itself; it stops that
+sandbox, snapshots it, and writes the bundle. `SANDBOX` is required because the
+snapshot is tied to a specific sandbox instance. If you omit it, the Makefile
+prints the exact example invocation above.
 
 To import an exported bundle and launch from that imported snapshot in one go:
 

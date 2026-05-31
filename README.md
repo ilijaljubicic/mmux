@@ -31,7 +31,7 @@ configuration for your environment and use mmux at your own risk.
 | ---------- | ------------ | ----- |
 | Rust and Cargo | Build, test, run | Install with rustup or your system package manager. |
 | tmux | Local and node runtime | `mmux-node` shells out to the system `tmux` binary. |
-| OpenSSL CLI | Token examples | Any secure token generator is fine. |
+| Microsandbox | Microsandbox backend | Required only when running the Microsandbox backend. |
 | `libcap-ng` development package | Microsandbox backend | Needed so the Microsandbox backend can link `libcap-ng.so.0`. |
 
 Wire source generation is optional. `make wire-generate` additionally needs
