@@ -15,5 +15,5 @@ fi
 export DEBIAN_FRONTEND=noninteractive
 export PATH="/root/.cargo/bin:/root/.local/bin:/usr/local/bin:$PATH"
 
-cargo install --locked --force --git "$MMUX_SOURCE_REPO" --rev "$MMUX_SOURCE_REF" --package mmux --bin mmux --root /usr/local
+cargo install --locked --force --git "$MMUX_SOURCE_REPO" --rev "$MMUX_SOURCE_REF" --bin mmux --root /usr/local mmux
 printf '%s\n' "$desired_stamp" >"$stamp_file"

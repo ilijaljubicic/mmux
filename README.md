@@ -34,10 +34,12 @@ configuration for your environment and use mmux at your own risk.
 | Microsandbox | Microsandbox backend | Required only when running the Microsandbox backend. |
 | `libcap-ng` development package | Microsandbox backend | Needed so the Microsandbox backend can link `libcap-ng.so.0`. |
 
-Wire source generation is optional. `make wire-generate` additionally needs
-`buf`, `protoc-gen-buffa`, `protoc-gen-buffa-packaging`, and the
-`protoc-gen-connect-rust` generator that matches the pinned connect-rust
-revision in `Cargo.toml`.
+Wire source generation is only needed when editing the protobuf schema. The
+generated Rust sources are checked in, so normal builds do not require `buf` or
+the protobuf generators. If you change files under `crates/mmux-wire/proto`,
+run `make wire-generate`, which additionally needs `buf`, `protoc-gen-buffa`,
+`protoc-gen-buffa-packaging`, and the `protoc-gen-connect-rust` generator that
+matches the pinned connect-rust revision in `Cargo.toml`.
 
 ## Quick Start
 
@@ -49,8 +51,8 @@ Install the latest released `mmux` binary:
 curl -fsSL https://raw.githubusercontent.com/ilijaljubicic/mmux/main/scripts/install.sh | bash
 ```
 
-Linux release archives also include `mmux-microsandbox-node`, which is used by
-the Microsandbox backend example.
+Linux release archives also include `mmux-microsandbox-node`, the
+Microsandbox backend launcher.
 
 Pin a specific release:
 
