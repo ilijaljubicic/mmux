@@ -395,6 +395,42 @@ impl NodeExecutionBackend {
     }
 }
 
+pub struct EmbeddedNodeBackend {
+    backend: NodeExecutionBackend,
+}
+
+impl EmbeddedNodeBackend {
+    pub async fn local() -> Result<Self, String> {
+        Ok(Self {
+            backend: NodeExecutionBackend::Local,
+        })
+    }
+
+    pub async fn microsandbox(sandbox_name: &str) -> Result<Self, String> {
+        #[cfg(feature = "microsandbox")]
+        {
+            let sandbox = connect_existing_microsandbox(sandbox_name).await?;
+            Ok(Self {
+                backend: NodeExecutionBackend::Microsandbox(MicrosandboxNodeBackend { sandbox }),
+            })
+        }
+        #[cfg(not(feature = "microsandbox"))]
+        {
+            let _ = sandbox_name;
+            Err("mmux was not built with Microsandbox backend support".into())
+        }
+    }
+
+    pub async fn execute(&mut self, kind: NodeCommandKind) -> NodeCommandResult {
+        self.backend
+            .execute(NodeCommand {
+                command_id: "embedded".into(),
+                kind,
+            })
+            .await
+    }
+}
+
 #[cfg(feature = "microsandbox")]
 struct MicrosandboxNodeBackend {
     sandbox: microsandbox::Sandbox,
