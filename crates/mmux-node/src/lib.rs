@@ -1,5 +1,5 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use connectrpc::{
     client::{ClientConfig, HttpClient},
     rustls,
@@ -16,8 +16,8 @@ use mmux_wire::{
 use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::OpenOptions;
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
+use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, RwLock};
 use std::time::Duration;
@@ -26,10 +26,66 @@ pub const DEFAULT_NODE_PROFILE_CONFIG_NAME: &str = "mmux.toml";
 
 pub type ProfileRegistry = Arc<RwLock<HashMap<String, CliProfile>>>;
 
+#[derive(Clone, Debug)]
+struct NodeClientIdentity {
+    cert_pem: Arc<Vec<u8>>,
+    key_pem: Arc<Vec<u8>>,
+}
+
+impl NodeClientIdentity {
+    fn from_cli(cli: &NodeCli) -> Result<Option<Self>, String> {
+        match (&cli.client_cert, &cli.client_key) {
+            (Some(cert_path), Some(key_path)) => {
+                let cert_path = canonicalize_required_path("--client-cert", cert_path)?;
+                let key_path = canonicalize_required_path("--client-key", key_path)?;
+                Ok(Some(Self {
+                    cert_pem: Arc::new(read_pem_file("--client-cert", &cert_path)?),
+                    key_pem: Arc::new(read_pem_file("--client-key", &key_path)?),
+                }))
+            }
+            (None, None) => Ok(None),
+            (Some(_), None) => Err("--client-cert requires --client-key".into()),
+            (None, Some(_)) => Err("--client-key requires --client-cert".into()),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct ResolvedNodeWirePolicy {
+    token: Option<String>,
+    client_identity: Option<NodeClientIdentity>,
+    controller_ca: Option<PathBuf>,
+}
+
+impl ResolvedNodeWirePolicy {
+    fn from_cli(cli: &NodeCli) -> Result<Self, String> {
+        let token = cli
+            .wire_token
+            .clone()
+            .or_else(|| std::env::var("MMUX_WIRE_TOKEN").ok());
+        let client_identity = NodeClientIdentity::from_cli(cli)?;
+        let controller_ca = cli
+            .controller_ca
+            .as_deref()
+            .map(|path| canonicalize_required_path("--controller-ca", path))
+            .transpose()?;
+        if token.is_some() && client_identity.is_some() {
+            return Err("--wire-token/MMUX_WIRE_TOKEN is mutually exclusive with --client-cert/--client-key".into());
+        }
+        Ok(Self {
+            token,
+            client_identity,
+            controller_ca,
+        })
+    }
+}
+
 #[derive(Parser, Debug)]
 #[command(name = "mmux node")]
 #[command(about = "Run an mmux execution node that owns local tmux/filesystem access")]
 pub struct NodeCli {
+    #[arg(long, value_enum, default_value_t = NodeBackendKind::Local)]
+    pub backend: NodeBackendKind,
     #[arg(
         long,
         default_value = "local",
@@ -41,7 +97,16 @@ pub struct NodeCli {
     #[arg(long, help = "Human-readable node name advertised to the controller")]
     pub node_name: Option<String>,
     #[arg(long, help = "Bearer token for controller wire endpoints")]
-    pub controller_token: Option<String>,
+    pub wire_token: Option<String>,
+    #[arg(
+        long,
+        help = "PEM CA certificate(s) used to verify the HTTPS controller."
+    )]
+    pub controller_ca: Option<PathBuf>,
+    #[arg(long, help = "PEM certificate chain to present for node wire mTLS.")]
+    pub client_cert: Option<PathBuf>,
+    #[arg(long, help = "PEM private key to present for node wire mTLS.")]
+    pub client_key: Option<PathBuf>,
     #[arg(
         long,
         default_value_t = 500,
@@ -50,6 +115,17 @@ pub struct NodeCli {
     pub poll_interval_ms: u64,
     #[arg(long, help = "Path to node profile TOML file")]
     pub node_config: Option<String>,
+    #[arg(
+        long,
+        help = "Microsandbox sandbox name used with --backend microsandbox"
+    )]
+    pub sandbox_name: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+pub enum NodeBackendKind {
+    Local,
+    Microsandbox,
 }
 
 pub fn main_entry() {
@@ -72,12 +148,26 @@ where
     println!("mmux node '{}'", cli.node_id);
     if let Some(url) = cli.controller_url.as_deref() {
         println!("  Controller URL: {}", url);
-        let token = cli
-            .controller_token
-            .clone()
-            .or_else(|| std::env::var("MMUX_CONTROLLER_TOKEN").ok());
+        let wire_auth = match ResolvedNodeWirePolicy::from_cli(&cli) {
+            Ok(auth) => auth,
+            Err(error) => {
+                eprintln!("Node wire auth error: {}", error);
+                std::process::exit(1);
+            }
+        };
         let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-        if let Err(error) = runtime.block_on(run_registered_node(&cli, url, token.as_deref())) {
+        if let Err(error) = runtime.block_on(async {
+            let backend = NodeExecutionBackend::from_cli(&cli).await?;
+            run_registered_node(
+                &cli,
+                url,
+                wire_auth.token.as_deref(),
+                wire_auth.client_identity,
+                wire_auth.controller_ca,
+                backend,
+            )
+            .await
+        }) {
             eprintln!("Node error: {}", error);
             std::process::exit(1);
         }
@@ -90,6 +180,9 @@ async fn run_registered_node(
     cli: &NodeCli,
     controller_url: &str,
     token: Option<&str>,
+    client_identity: Option<NodeClientIdentity>,
+    controller_ca: Option<PathBuf>,
+    mut backend: NodeExecutionBackend,
 ) -> Result<(), String> {
     let descriptor = NodeDescriptor {
         node_id: cli.node_id.clone(),
@@ -102,7 +195,12 @@ async fn run_registered_node(
     let rpc_timeout = Duration::from_secs(5);
     let mut reconnect_delay = Duration::from_secs(1);
     loop {
-        let client = match connect_client(controller_url, token) {
+        let client = match connect_client(
+            controller_url,
+            token,
+            client_identity.as_ref(),
+            controller_ca.as_deref(),
+        ) {
             Ok(client) => client,
             Err(error) => {
                 eprintln!("controller connect failed: {error}");
@@ -148,7 +246,6 @@ async fn run_registered_node(
         reconnect_delay = Duration::from_secs(1);
 
         loop {
-            log_node(&format!("mmux node: heartbeat {}", cli.node_id));
             match tokio::time::timeout(
                 rpc_timeout,
                 client.heartbeat(heartbeat_request_to_proto(HeartbeatRequest {
@@ -172,7 +269,6 @@ async fn run_registered_node(
                 }
             }
 
-            log_node(&format!("mmux node: pull commands {}", cli.node_id));
             let response = match tokio::time::timeout(
                 rpc_timeout,
                 client.pull_commands(pull_commands_request_to_proto(PullCommandsRequest {
@@ -201,17 +297,19 @@ async fn run_registered_node(
                     break;
                 }
             };
-            log_node(&format!(
-                "mmux node: received {} command(s)",
-                response.commands.len()
-            ));
+            if !response.commands.is_empty() {
+                log_node(&format!(
+                    "mmux node: received {} command(s)",
+                    response.commands.len()
+                ));
+            }
             for command in response.commands {
                 let command_id = command.command_id.clone();
                 log_node(&format!(
                     "mmux node: executing command {} {:?}",
                     command_id, command.kind
                 ));
-                let result = execute_node_command(command);
+                let result = backend.execute(command).await;
                 log_node(&format!("mmux node: finished command {}", command_id));
                 match tokio::time::timeout(
                     rpc_timeout,
@@ -261,7 +359,164 @@ fn next_reconnect_delay(current: Duration) -> Duration {
     next.min(Duration::from_secs(30))
 }
 
-fn execute_node_command(command: NodeCommand) -> NodeCommandResult {
+enum NodeExecutionBackend {
+    Local,
+    #[cfg(feature = "microsandbox")]
+    Microsandbox(MicrosandboxNodeBackend),
+}
+
+impl NodeExecutionBackend {
+    async fn from_cli(cli: &NodeCli) -> Result<Self, String> {
+        match cli.backend {
+            NodeBackendKind::Local => Ok(Self::Local),
+            NodeBackendKind::Microsandbox => {
+                #[cfg(feature = "microsandbox")]
+                {
+                    let sandbox_name = cli.sandbox_name.as_deref().ok_or_else(|| {
+                        "--sandbox-name is required with --backend microsandbox".to_owned()
+                    })?;
+                    let sandbox = connect_existing_microsandbox(sandbox_name).await?;
+                    Ok(Self::Microsandbox(MicrosandboxNodeBackend { sandbox }))
+                }
+                #[cfg(not(feature = "microsandbox"))]
+                {
+                    Err("mmux node was not built with Microsandbox backend support".into())
+                }
+            }
+        }
+    }
+
+    async fn execute(&mut self, command: NodeCommand) -> NodeCommandResult {
+        match self {
+            Self::Local => execute_local_node_command(command),
+            #[cfg(feature = "microsandbox")]
+            Self::Microsandbox(backend) => backend.execute(command).await,
+        }
+    }
+}
+
+#[cfg(feature = "microsandbox")]
+struct MicrosandboxNodeBackend {
+    sandbox: microsandbox::Sandbox,
+}
+
+#[cfg(feature = "microsandbox")]
+async fn connect_existing_microsandbox(
+    sandbox_name: &str,
+) -> Result<microsandbox::Sandbox, String> {
+    let handle = microsandbox::Sandbox::get(sandbox_name)
+        .await
+        .map_err(|error| format!("Microsandbox '{}' does not exist: {}", sandbox_name, error))?;
+    match handle.connect().await {
+        Ok(sandbox) => Ok(sandbox),
+        Err(connect_error) => microsandbox::Sandbox::start_detached(sandbox_name)
+            .await
+            .map_err(|start_error| {
+                format!(
+                    "failed to attach to existing Microsandbox '{}': {}; resume failed: {}",
+                    sandbox_name, connect_error, start_error
+                )
+            }),
+    }
+}
+
+#[cfg(feature = "microsandbox")]
+impl MicrosandboxNodeBackend {
+    async fn execute(&self, command: NodeCommand) -> NodeCommandResult {
+        match command.kind {
+            NodeCommandKind::Tmux { args } => {
+                let command = shell_command("tmux", &args);
+                match self.run_shell(&command).await {
+                    Ok(output) => NodeCommandResult::TmuxOutput(output),
+                    Err(message) => NodeCommandResult::Error { message },
+                }
+            }
+            NodeCommandKind::ReadFile {
+                path,
+                offset,
+                limit,
+            } => match self.read_file(&path, offset, limit).await {
+                Ok(content_base64) => NodeCommandResult::FileContent { content_base64 },
+                Err(message) => NodeCommandResult::Error { message },
+            },
+            NodeCommandKind::WriteFile {
+                path,
+                content_base64,
+                append,
+            } => match self.write_file(&path, &content_base64, append).await {
+                Ok(bytes_written) => NodeCommandResult::WriteComplete { bytes_written },
+                Err(message) => NodeCommandResult::Error { message },
+            },
+            NodeCommandKind::Shutdown => std::process::exit(0),
+        }
+    }
+
+    async fn read_file(
+        &self,
+        path: &str,
+        offset: Option<u64>,
+        limit: usize,
+    ) -> Result<String, String> {
+        let skip = offset.unwrap_or(0);
+        let command = format!(
+            "dd if={} bs=1 skip={} count={} status=none | base64 -w0",
+            shell_quote(path),
+            skip,
+            limit
+        );
+        self.run_shell(&command).await
+    }
+
+    async fn write_file(
+        &self,
+        path: &str,
+        content_base64: &str,
+        append: bool,
+    ) -> Result<usize, String> {
+        let parent = Path::new(path)
+            .parent()
+            .and_then(Path::to_str)
+            .filter(|parent| !parent.is_empty())
+            .unwrap_or(".");
+        let operator = if append { ">>" } else { ">" };
+        let command = format!(
+            "mkdir -p {} && printf %s {} | base64 -d {} {}",
+            shell_quote(parent),
+            shell_quote(content_base64),
+            operator,
+            shell_quote(path)
+        );
+        self.run_shell(&command).await?;
+        BASE64
+            .decode(content_base64.as_bytes())
+            .map(|bytes| bytes.len())
+            .map_err(|error| format!("base64 decode error: {}", error))
+    }
+
+    async fn run_shell(&self, command: &str) -> Result<String, String> {
+        let output = self
+            .sandbox
+            .shell(command)
+            .await
+            .map_err(|error| format!("microsandbox shell failed to run: {}", error))?;
+        let status = output.status();
+        let stdout = output
+            .stdout()
+            .unwrap_or_else(|_| String::from_utf8_lossy(output.stdout_bytes()).into_owned());
+        if status.success {
+            return Ok(stdout);
+        }
+        let stderr = output
+            .stderr()
+            .unwrap_or_else(|_| String::from_utf8_lossy(output.stderr_bytes()).into_owned());
+        Err(format!(
+            "microsandbox shell exited with code {}\nstdout:\n{}\nstderr:\n{}",
+            status.code, stdout, stderr
+        ))
+    }
+}
+
+fn execute_local_node_command(command: NodeCommand) -> NodeCommandResult {
     match command.kind {
         NodeCommandKind::Tmux { args } => {
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();
@@ -295,6 +550,19 @@ fn execute_node_command(command: NodeCommand) -> NodeCommandResult {
         },
         NodeCommandKind::Shutdown => std::process::exit(0),
     }
+}
+
+#[cfg(feature = "microsandbox")]
+fn shell_command(program: &str, args: &[String]) -> String {
+    std::iter::once(shell_quote(program))
+        .chain(args.iter().map(|arg| shell_quote(arg)))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+#[cfg(feature = "microsandbox")]
+fn shell_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
 fn read_file_bytes(path: &str, offset: Option<u64>, limit: usize) -> Result<Vec<u8>, String> {
@@ -331,11 +599,13 @@ fn write_file_bytes(path: &str, bytes: &[u8], append: bool) -> Result<usize, Str
 fn connect_client(
     controller_url: &str,
     token: Option<&str>,
+    client_identity: Option<&NodeClientIdentity>,
+    controller_ca: Option<&Path>,
 ) -> Result<MmuxNodeRegistryServiceClient<HttpClient>, String> {
     let uri: http::Uri = controller_url
         .parse()
         .map_err(|error| format!("invalid controller URL '{}': {}", controller_url, error))?;
-    let transport = controller_transport(&uri)?;
+    let transport = controller_transport(&uri, client_identity, controller_ca)?;
     let mut config = ClientConfig::new(uri);
     if let Some(token) = token {
         let value = HeaderValue::from_str(&format!("Bearer {}", token))
@@ -345,24 +615,131 @@ fn connect_client(
     Ok(MmuxNodeRegistryServiceClient::new(transport, config))
 }
 
-fn controller_transport(uri: &http::Uri) -> Result<HttpClient, String> {
+fn controller_transport(
+    uri: &http::Uri,
+    client_identity: Option<&NodeClientIdentity>,
+    controller_ca: Option<&Path>,
+) -> Result<HttpClient, String> {
     match uri.scheme_str() {
-        Some("http") => Ok(HttpClient::plaintext()),
-        Some("https") => Ok(HttpClient::with_tls(default_tls_config())),
+        Some("http") => {
+            if client_identity.is_some() {
+                return Err("--client-cert/--client-key require an https:// controller URL".into());
+            }
+            if controller_ca.is_some() {
+                return Err("--controller-ca requires an https:// controller URL".into());
+            }
+            Ok(HttpClient::plaintext())
+        }
+        Some("https") => Ok(HttpClient::with_tls(default_tls_config(
+            client_identity,
+            controller_ca,
+        )?)),
         Some(other) => Err(format!("unsupported controller URL scheme '{}'", other)),
         None => Err("controller URL must include http:// or https:// scheme".into()),
     }
 }
 
-fn default_tls_config() -> Arc<rustls::ClientConfig> {
+fn canonicalize_required_path(flag: &str, path: &Path) -> Result<PathBuf, String> {
+    std::fs::canonicalize(path).map_err(|error| {
+        format!(
+            "failed to canonicalize {} '{}': {}",
+            flag,
+            path.display(),
+            error
+        )
+    })
+}
+
+fn read_pem_file(flag: &str, path: &Path) -> Result<Vec<u8>, String> {
+    std::fs::read(path)
+        .map_err(|error| format!("failed to read {} '{}': {}", flag, path.display(), error))
+}
+
+fn default_tls_config(
+    client_identity: Option<&NodeClientIdentity>,
+    controller_ca: Option<&Path>,
+) -> Result<Arc<rustls::ClientConfig>, String> {
     let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-    Arc::new(
-        rustls::ClientConfig::builder()
-            .with_root_certificates(roots)
-            .with_no_client_auth(),
-    )
+    if let Some(controller_ca) = controller_ca {
+        for cert in load_cert_chain(controller_ca, "controller CA certificate")? {
+            roots.add(cert).map_err(|error| {
+                format!(
+                    "failed to add controller CA '{}': {}",
+                    controller_ca.display(),
+                    error
+                )
+            })?;
+        }
+    }
+    let builder = rustls::ClientConfig::builder().with_root_certificates(roots);
+    let config = if let Some(identity) = client_identity {
+        let cert_chain =
+            load_cert_chain_from_bytes(identity.cert_pem.as_slice(), "client certificate")?;
+        let private_key =
+            load_private_key_from_bytes(identity.key_pem.as_slice(), "client private key")?;
+        builder
+            .with_client_auth_cert(cert_chain, private_key)
+            .map_err(|error| format!("invalid client TLS identity: {}", error))?
+    } else {
+        builder.with_no_client_auth()
+    };
+    Ok(Arc::new(config))
+}
+
+fn load_cert_chain_from_bytes(
+    bytes: &[u8],
+    description: &str,
+) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, String> {
+    let certs = rustls_pemfile::certs(&mut Cursor::new(bytes))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| format!("failed to parse {}: {}", description, error))?;
+    if certs.is_empty() {
+        return Err(format!("{} contains no certificates", description));
+    }
+    Ok(certs)
+}
+
+fn load_cert_chain(
+    path: &Path,
+    description: &str,
+) -> Result<Vec<rustls::pki_types::CertificateDer<'static>>, String> {
+    let file = std::fs::File::open(path).map_err(|error| {
+        format!(
+            "failed to open {} '{}': {}",
+            description,
+            path.display(),
+            error
+        )
+    })?;
+    let certs = rustls_pemfile::certs(&mut BufReader::new(file))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            format!(
+                "failed to parse {} '{}': {}",
+                description,
+                path.display(),
+                error
+            )
+        })?;
+    if certs.is_empty() {
+        return Err(format!(
+            "{} '{}' contains no certificates",
+            description,
+            path.display()
+        ));
+    }
+    Ok(certs)
+}
+
+fn load_private_key_from_bytes(
+    bytes: &[u8],
+    description: &str,
+) -> Result<rustls::pki_types::PrivateKeyDer<'static>, String> {
+    rustls_pemfile::private_key(&mut Cursor::new(bytes))
+        .map_err(|error| format!("failed to parse {}: {}", description, error))?
+        .ok_or_else(|| format!("{} contains no private key", description))
 }
 
 #[derive(Clone, Debug, Default)]
@@ -887,20 +1264,50 @@ prompt_indicator = "codex ready"
 
     #[test]
     fn controller_transport_supports_http_and_https() {
-        let http_transport = controller_transport(&"http://localhost:3000".parse().unwrap())
-            .expect("http transport");
+        let http_transport =
+            controller_transport(&"http://localhost:3000".parse().unwrap(), None, None)
+                .expect("http transport");
         assert!(format!("{http_transport:?}").contains("plaintext"));
 
-        let https_transport = controller_transport(&"https://mmux.example.com".parse().unwrap())
-            .expect("https transport");
+        let https_transport =
+            controller_transport(&"https://mmux.example.com".parse().unwrap(), None, None)
+                .expect("https transport");
         assert!(format!("{https_transport:?}").contains("tls"));
     }
 
     #[test]
     fn controller_transport_rejects_unsupported_schemes() {
-        let error = controller_transport(&"ftp://mmux.example.com".parse().unwrap()).unwrap_err();
+        let error = controller_transport(&"ftp://mmux.example.com".parse().unwrap(), None, None)
+            .unwrap_err();
 
         assert!(error.contains("unsupported controller URL scheme"));
+    }
+
+    #[test]
+    fn controller_transport_rejects_client_identity_without_https() {
+        let identity = NodeClientIdentity {
+            cert_pem: Arc::new(Vec::new()),
+            key_pem: Arc::new(Vec::new()),
+        };
+
+        let error = controller_transport(
+            &"http://localhost:3000".parse().unwrap(),
+            Some(&identity),
+            None,
+        )
+        .unwrap_err();
+
+        assert!(error.contains("require an https:// controller URL"));
+    }
+
+    #[test]
+    fn controller_transport_rejects_controller_ca_without_https() {
+        let ca = Path::new("controller-ca.pem");
+
+        let error = controller_transport(&"http://localhost:3000".parse().unwrap(), None, Some(ca))
+            .unwrap_err();
+
+        assert!(error.contains("--controller-ca requires an https:// controller URL"));
     }
 
     #[test]

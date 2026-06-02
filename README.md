@@ -51,8 +51,8 @@ Install the latest released `mmux` binary:
 curl -fsSL https://raw.githubusercontent.com/ilijaljubicic/mmux/main/scripts/install.sh | bash
 ```
 
-Linux release archives also include `mmux-microsandbox-node`, the
-Microsandbox backend launcher.
+Linux release archives include one `mmux` binary. On Linux, that binary
+includes the `mmux node --backend microsandbox` connector.
 
 Pin a specific release:
 
@@ -108,46 +108,20 @@ export MMUX_WIRE_TOKEN=<wire-token>
 make run-controller CONTROLLER_ARGS="--host <bind-host> --port 3000 --mcp-token $MMUX_MCP_TOKEN --wire-token $MMUX_WIRE_TOKEN"
 ```
 
-In another shell, prepare the Microsandbox guest once from a stock image:
+In another shell, use `msb` to create or start the sandbox, then run the
+host-side node connector:
 
 ```bash
 cd example-backends/microsandbox
-make prepare NODE_CONFIG=microsandbox-setup.toml
-make bundle-export SANDBOX=mmux-node SNAPSHOT_NAME=mmux-node-seed BUNDLE=.artifacts/mmux-node-seed.tar.zst
-```
-
-Then launch the prepared bundle as a runtime node:
-
-```bash
 export MMUX_WIRE_TOKEN=<same-wire-token>
-make bundle-launch BUNDLE=.artifacts/mmux-node-seed.tar.zst NODE_CONFIG=mmux.toml
+make launch
 ```
 
-The Microsandbox example uses `http://host.microsandbox.internal:3000` by
-default. That is the Microsandbox-provided host alias for reaching the laptop
-or host machine from inside the sandbox. When `CONTROLLER_URL` targets that
-alias, the launcher automatically allows exactly that host TCP port for node
-registration and command polling. The wire token secret is scoped to
-`allowed_host = "host.microsandbox.internal"`.
-
-`microsandbox-setup.toml` is for first-time preparation only. `make prepare`
-uses an open setup egress policy by default so apt/curl/npm and tool installers
-can run, but it does not inject the wire token and does not start
-`mmux node`. Export a snapshot after setup, then relaunch that snapshot with
-`mmux.toml` for the controller-only runtime policy.
-
-If you already have a prepared Docker/OCI image with `tmux`, `mmux`, and the
-coder CLIs installed, set `[sandbox.runtime].image` in `mmux.toml` to that
-image and launch it directly:
-
-```bash
-# Edit [sandbox.runtime].image in mmux.toml.
-make launch NODE_CONFIG=mmux.toml
-```
-
-The runtime config has no setup script sections, so launch does not open
-installer network access. It only applies runtime policy, writes the selected
-node config into the guest, and starts `mmux node`.
+The Microsandbox example uses `http://127.0.0.1:3000` by default because the
+node connector runs on the host and attaches to an existing sandbox by name.
+Override `CONTROLLER_URL` only when the controller runs elsewhere. mmux does not
+provide a Microsandbox lifecycle command; use `msb` directly for create, start,
+stop, snapshot, import, and export.
 
 ## CLI Entrypoints
 
@@ -170,6 +144,10 @@ Important controller flags:
 | `--mcp-token-file` | none | Reads the MCP bearer token from a file. |
 | `--mcp-token-env` | `MMUX_MCP_TOKEN` | Env var used when MCP token flags are omitted. |
 | `--wire-token` | `MMUX_WIRE_TOKEN` | Bearer token for node wire RPC requests. |
+| `--wire-mtls` | false | Enables native TLS termination and requires mTLS node identity for wire RPC; mutually exclusive with wire token flags/env. |
+| `--tls-cert` | none | PEM server certificate chain used when `--wire-mtls` is set. |
+| `--tls-key` | none | PEM server private key used when `--wire-mtls` is set. |
+| `--wire-client-ca` | none | PEM CA certificate(s) used to verify node client certificates. |
 | `--wire-token-file` | none | Reads the node wire bearer token from a file. |
 | `--wire-token-env` | `MMUX_WIRE_TOKEN` | Env var used when wire token flags are omitted. |
 | `--allow-unauthenticated-node-wire` | false | Allows node wire RPC without `--wire-token`; use only for development or trusted private tunnels. |
@@ -180,10 +158,15 @@ Important node flags:
 
 | Flag | Default | Purpose |
 | ---- | ------- | ------- |
+| `--backend` | `local` | Execution backend: `local` or `microsandbox`. |
+| `--sandbox-name` | none | Microsandbox sandbox name used with `--backend microsandbox`. |
 | `--node-id` | `local` | Node identifier advertised to the controller. |
 | `--controller-url` | none | Controller URL to register with. |
 | `--node-name` | generated | Human-readable node name. |
-| `--controller-token` | `MMUX_CONTROLLER_TOKEN` env fallback | Bearer token for controller wire endpoints. |
+| `--wire-token` | `MMUX_WIRE_TOKEN` env fallback | Bearer token for controller wire endpoints. |
+| `--controller-ca` | public WebPKI roots | PEM CA certificate(s) used to verify the HTTPS controller. |
+| `--client-cert` | none | PEM certificate chain to present for node wire mTLS. |
+| `--client-key` | none | PEM private key to present for node wire mTLS. |
 | `--poll-interval-ms` | `500` | Command polling interval. |
 | `--node-config` | none | Profile TOML loaded by the node process. |
 
@@ -195,7 +178,6 @@ make check
 make test
 make lint
 make release
-make generate-build
 make run-local
 make run-controller
 make run-node
@@ -208,7 +190,7 @@ Pass entrypoint flags through the target variables:
 ```bash
 make run-local LOCAL_ARGS="--port 3001"
 make run-controller CONTROLLER_ARGS="--mcp-token $MMUX_MCP_TOKEN --wire-token $MMUX_WIRE_TOKEN"
-make run-node NODE_ARGS="--controller-url http://<controller-host>:3000 --controller-token $MMUX_WIRE_TOKEN"
+make run-node NODE_ARGS="--controller-url http://<controller-host>:3000 --wire-token $MMUX_WIRE_TOKEN"
 ```
 
 Release publishing uses git tags. The release version comes from
@@ -217,25 +199,23 @@ with `version.workspace = true`. Bump that version with `make update-patch`,
 `make update-minor`, or `make update-major`, merge the version change to
 `main`, then run `make release-tag` from a clean `main` checkout. The
 `v<version>` tag triggers GitHub Actions to build and attach platform archives
-used by `scripts/install.sh`.
+used by `scripts/install.sh`, then publish the npm package with all supported
+platform archives.
 
-### Publish to npm from this checkout
+### Inspect the npm package locally
 
 The `npm/mmux` package provides an `npx`/`yarn dlx` wrapper around the native
-`mmux` binary. To prepare and publish the package to the public npm registry
-from this workstation:
+`mmux` binary. To inspect the package from this workstation:
 
 ```bash
 make npm-pack-dry-run
-npm login
-make npm-publish
 ```
 
 `make npm-package` builds the current platform, writes
 `npm/mmux/artifacts/mmux-<platform>.tar.gz`, and syncs the npm package version
-from `[workspace.package].version`. On Linux, the local package includes only
-the `mmux` binary by default; set `MMUX_NPM_INCLUDE_MICROSANDBOX=1` to also
-build and include `mmux-microsandbox-node`.
+from `[workspace.package].version`. The local package only contains the current
+platform archive; public npm publishing is done by the GitHub release workflow
+so the package contains all supported platform archives.
 
 `make npm-pack` creates a `.tgz` without publishing. Set `NPM_CACHE=/path/to/cache`
 if npm should use a cache directory other than `/tmp/mmux-npm-cache`.
@@ -247,6 +227,55 @@ npx @mmux/mmux controller --enable-local-node
 yarn dlx @mmux/mmux controller --enable-local-node
 ```
 
+## Node Wire Authentication
+
+Node wire RPC supports separate auth from the public MCP endpoint. Bearer token
+auth requires every node request to present the configured shared secret.
+
+```bash
+mmux controller --wire-token "$MMUX_WIRE_TOKEN"
+mmux node --controller-url https://<controller-host>:3000 --wire-token "$MMUX_WIRE_TOKEN"
+```
+
+The controller resolves a single node wire auth policy at startup: bearer token,
+mTLS identity, or explicit `unauthenticated` development mode. Mixed
+configuration is rejected. If `--wire-mtls` is set, wire token flags/env must
+not also be set. If no wire auth is configured, the controller refuses to start
+unless `--allow-unauthenticated-node-wire` is explicit.
+
+mTLS is the zero-trust node identity mode. A verified mTLS identity is
+normalized to a node id before it reaches the registry, and the controller
+rejects requests where that identity tries to act as a different `node_id`.
+This is intentionally runtime-neutral: the native runtime or a future
+Cloudflare Worker/Durable Object runtime can perform certificate verification
+and pass the verified identity into the same core policy.
+
+Native local runtime mTLS uses controller-side TLS termination:
+
+```bash
+mmux controller \
+  --wire-mtls \
+  --tls-cert ./certs/controller.pem \
+  --tls-key ./certs/controller-key.pem \
+  --wire-client-ca ./certs/node-ca.pem
+```
+
+The node can present a client certificate when calling an HTTPS controller:
+
+```bash
+mmux node \
+  --controller-url https://<controller-host>:3000 \
+  --node-id msb-1 \
+  --controller-ca ./controller-ca.pem \
+  --client-cert ./node.pem \
+  --client-key ./node-key.pem
+```
+
+The native runtime requires node identity in URI SAN `mmux:node:<node-id>` or
+`spiffe://mmux/node/<node-id>`. DNS SAN and CN are ignored for node identity.
+Use `--controller-ca` when the controller uses a private or self-signed CA.
+See `MTSL.md` for OpenSSL commands.
+
 ## Coder Profiles
 
 Coder profiles are built into mmux for common coding CLIs, so local mode works
@@ -257,18 +286,15 @@ overlay the built-ins. Omitted fields keep their built-in values.
 Use TOML only for intentional changes:
 
 - backend-agnostic profile tweaks, such as changing a command or prompt marker;
-- backend-specific extensions, such as Microsandbox launch scripts/assets;
 - new custom profiles.
 
 Nested tables merge with the built-in profile. Scalar and list fields replace
 the built-in value, so do not copy full profile definitions unless you want to
 own every copied field. See `mmux.toml.example` and
-`mmux-microsandbox.toml.example` for copyable examples.
+the backend examples for copyable examples.
 
 The fields shown here are the backend-agnostic profile shape: they describe how
-mmux launches and drives a CLI once a node has the CLI available. Individual
-backends may add extra nested sections for environment preparation, assets, or
-secrets.
+mmux launches and drives a CLI once a node has the CLI available.
 
 Backend-agnostic override example:
 
@@ -434,8 +460,7 @@ Request and output limits are configurable with `--max-read-bytes`,
 │   ├── mmux-controller/       # MCP server, auth, policy, node registry
 │   ├── mmux-node/             # tmux/filesystem adapter and profile loader
 │   ├── mmux-shared/           # shared profile and file DTOs
-│   ├── mmux-wire/             # ConnectRPC/Buffa wire schema and generated code
-│   └── backends/microsandbox/ # Microsandbox launcher crate
+│   └── mmux-wire/             # ConnectRPC/Buffa wire schema and generated code
 ├── example-backends/
 │   ├── local/                 # local profile config
 │   └── microsandbox/          # sandbox config, scripts, assets, README
@@ -457,42 +482,19 @@ The canonical controller/node wire schema lives in
 
 - Local mode uses built-in coder profiles by default.
 - `mmux.toml.example` shows optional local/node profile overlays.
-- `mmux-microsandbox.toml.example` shows portable sandbox runtime config plus
-  Microsandbox-specific setup assets.
-- `example-backends/microsandbox/mmux.toml` defines controller-only runtime
-  policy for prepared sandboxes.
-- `example-backends/microsandbox/microsandbox-setup.toml` defines first-time setup
-  assets. It is used with `make prepare`, which uses open setup egress by
-  default and does not start/register `mmux node`.
-The Microsandbox backend:
+- `example-backends/microsandbox/` shows how to run the host-side connector
+  against an existing Microsandbox runtime.
 
-- can install `mmux` from the configured release version during setup, copy a
-  host-built `mmux` binary for development, or use a prepared image/snapshot
-  that already contains `/usr/local/bin/mmux`;
-- loads shared scripts from `mmux_sources/scripts` when the selected config
-  declares them;
-- copies `mmux_sources/assets/tmux.conf` into the guest during setup when that
-  file exists and sources it from `/etc/tmux.conf`;
-- automatically allows the `host.microsandbox.internal:<port>` controller URL
-  as launcher plumbing, without requiring that rule in user TOML;
-- can snapshot/export/import prepared sandboxes for faster relaunch.
+Microsandbox lifecycle belongs to `msb`. mmux does not create, launch, stop,
+snapshot, import, or export Microsandbox runtimes. The node connector runs on
+the host with `mmux node --backend microsandbox` and attaches to an existing
+sandbox by name, so controller credentials and node private keys stay out of
+sandbox config and sandbox files.
 
-Sandbox-wide runtime, network, secret bindings, volumes, and mounts live under
-`[sandbox.*]`. Microsandbox-only setup inputs, such as release installs,
-scripts, and patches, stay under `[microsandbox.*]`.
-
-The checked-in sandbox config uses `default_egress = "deny"` and
-`default_ingress = "deny"`. Use `[[sandbox.network.egress]]` rules only
-for extra runtime access the sandbox should have beyond controller
-communication. Do not mutate the runtime config back and forth for setup. Use
-`microsandbox-setup.toml` for one-time preparation, then create a snapshot and
-launch that snapshot with `mmux.toml`.
-
-For bundle launch, `mmux.toml` is still the runtime config. The launcher starts
-from the imported snapshot, so `[sandbox.runtime].image` is ignored, but
-resource limits, network policy, secrets, mounts, and coder profile overrides
-are still read from `mmux.toml`. The launcher also copies that same file into
-the guest as `/etc/mmux/mmux-node.toml` before starting `mmux node`.
+To keep a host workspace mounted into the sandbox, add an explicit
+`[[sandbox.mounts]]` bind mount, normally with `guest = "/workspace"`. This is
+opt-in because coder CLI processes in the sandbox can read and write the
+mounted tree when the mount is not readonly.
 
 For service access, prefer exact domain rules over broad public egress. DNS is
 also policy-gated under default deny, so a narrow OpenAI runtime rule looks

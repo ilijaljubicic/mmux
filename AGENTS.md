@@ -154,8 +154,7 @@ fields replace the built-in value. For this repo, backend examples live under
 `example-backends/`:
 
 - `example-backends/local/mmux.toml` for local overrides
-- `example-backends/microsandbox/mmux.toml` for Microsandbox launch config
-- `mmux.toml.example` and `mmux-microsandbox.toml.example` for root examples
+- `mmux.toml.example` for root examples
 
 The canonical profile section name is `coder_profile`.
 
@@ -281,5 +280,5 @@ Both accept optional `profile` and `session` arguments.
 - `thread::sleep` has been replaced with `tokio::time::sleep`. Long waits (e.g., `wait_for` with 60s timeout) do not block other requests.
 - The controller does not start the local backend by default. Use `--enable-local-node` for the built-in local tmux backend.
 - The local backend does not need a TOML file unless you want profile overlays.
-- The Microsandbox backend config lives at `example-backends/microsandbox/mmux.toml`; its coder profile sections should normally only add backend launch extensions.
+- Microsandbox lifecycle is managed by `msb`, not mmux. Use `mmux node --backend microsandbox --sandbox-name <name>` only to attach an existing sandbox to a controller.
 - Pass `--config` to override the default config file if needed.

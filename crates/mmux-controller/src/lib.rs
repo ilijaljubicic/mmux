@@ -4,7 +4,9 @@ use connectrpc::{
     ConnectError, ConnectRpcService, RequestContext as ConnectRequestContext,
     Response as ConnectResponse, ServiceResult,
 };
-use mmux_controller_core::NodeRegistry;
+use mmux_controller_core::{
+    NodeRegistry, NodeWireAuthContext, NodeWireAuthMode, NodeWireAuthPolicy, NodeWireIdentity,
+};
 use mmux_node::ProfileRegistry;
 use mmux_shared::{CliProfile, ReadFileResult, SaveFileResult};
 use mmux_wire::connect::mmux::wire::v1::{
@@ -24,20 +26,35 @@ use mmux_wire::{
 use serde_json::{json, Map, Value};
 use std::collections::HashMap;
 use std::ffi::OsString;
+use std::io::BufReader;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     body::Body,
-    extract::DefaultBodyLimit,
+    extract::{connect_info::Connected, ConnectInfo, DefaultBodyLimit},
     http::{Request, StatusCode},
     middleware::{self, Next},
     response::Response,
+    serve::IncomingStream,
 };
 use ractor::{rpc::CallResult, Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
+use rustls::{
+    pki_types::{CertificateDer, PrivateKeyDer},
+    server::WebPkiClientVerifier,
+    RootCertStore, ServerConfig,
+};
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::TcpStream,
+};
+use tokio_rustls::{server::TlsStream, TlsAcceptor};
 use tower_http::cors::{Any, CorsLayer};
+use x509_parser::{extensions::GeneralName, prelude::FromDer};
 
 mod runtime;
 
@@ -125,6 +142,23 @@ struct Cli {
     mcp_token_env: String,
     #[arg(long, help = "Bearer token protecting node wire RPC endpoints.")]
     wire_token: Option<String>,
+    #[arg(
+        long,
+        help = "Require runtime-verified mTLS identity for node wire RPC. Mutually exclusive with --wire-token."
+    )]
+    wire_mtls: bool,
+    #[arg(
+        long,
+        help = "PEM server certificate chain used when --wire-mtls is set."
+    )]
+    tls_cert: Option<String>,
+    #[arg(long, help = "PEM server private key used when --wire-mtls is set.")]
+    tls_key: Option<String>,
+    #[arg(
+        long,
+        help = "PEM CA certificate(s) that sign node client certificates."
+    )]
+    wire_client_ca: Option<String>,
     #[arg(
         long,
         help = "Path to a file containing the node wire bearer token. Prefer /run/secrets paths in containers."
@@ -644,7 +678,7 @@ async fn coding_send_with_profile(
     }
 
     tmux(&["send-keys", "-l", "-t", &pane, prompt]).map_err(|e| e.to_string())?;
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(coding_prompt_submit_delay(prompt)).await;
     tmux(&["send-keys", "-t", &pane, "Enter"]).map_err(|e| e.to_string())?;
     Ok(format!(
         "Sent to {} (profile: {}): {}",
@@ -760,6 +794,13 @@ fn tmux_send_key_sequence(target: &str, keys: &str) -> Result<String, String> {
     let mut args = vec!["send-keys", "-t", target];
     args.extend(key_sequence_parts(keys));
     tmux(&args)
+}
+
+fn coding_prompt_submit_delay(prompt: &str) -> Duration {
+    let line_count = prompt.lines().count().saturating_sub(1) as u64;
+    let char_count = prompt.chars().count() as u64;
+    let millis = 200 + line_count.saturating_mul(80) + char_count / 3;
+    Duration::from_millis(millis.clamp(200, 2_000))
 }
 
 fn remote_send_key_args(target: &str, keys: &str) -> Vec<String> {
@@ -1850,6 +1891,7 @@ impl ServerHandler for TmuxMcpServer {
                     "send_input",
                     "Send text input to any tmux session",
                     Arc::new(tool_schema(json!({
+                        "node": { "type": "string", "description": "Execution node id (default: local)" },
                         "session": { "type": "string" },
                         "text": { "type": "string", "description": "Text to send" },
                         "enter": { "type": "boolean", "description": "Send Enter after text (default: true)" }
@@ -1859,6 +1901,7 @@ impl ServerHandler for TmuxMcpServer {
                     "send_key",
                     "Send a special key (C-c, C-d, Escape, Enter, etc.)",
                     Arc::new(tool_schema(json!({
+                        "node": { "type": "string", "description": "Execution node id (default: local)" },
                         "session": { "type": "string" },
                         "key": { "type": "string", "description": "Key sequence (e.g. C-c, Escape, Enter)" }
                     }), Some(vec!["key"]))),
@@ -1867,6 +1910,7 @@ impl ServerHandler for TmuxMcpServer {
                     "capture_output",
                     "Capture pane output from a session",
                     Arc::new(tool_schema(json!({
+                        "node": { "type": "string", "description": "Execution node id (default: local)" },
                         "session": { "type": "string" },
                         "lines": { "type": "integer", "description": "Number of lines to capture" },
                         "scrollback": { "type": "boolean", "description": "Capture full scrollback" }
@@ -1876,6 +1920,7 @@ impl ServerHandler for TmuxMcpServer {
                     "wait_for",
                     "Wait for a condition in session output",
                     Arc::new(tool_schema(json!({
+                        "node": { "type": "string", "description": "Execution node id (default: local)" },
                         "session": { "type": "string" },
                         "mode": { "type": "string", "enum": ["stable", "sentinel", "prompt"], "description": "stable: output stops changing; sentinel: text appears; prompt: prompt marker appears" },
                         "sentinel": { "type": "string", "description": "Text to wait for (sentinel mode)" },
@@ -1889,6 +1934,7 @@ impl ServerHandler for TmuxMcpServer {
                     "interact",
                     "Send input and wait for output in one call",
                     Arc::new(tool_schema(json!({
+                        "node": { "type": "string", "description": "Execution node id (default: local)" },
                         "session": { "type": "string" },
                         "text": { "type": "string" },
                         "timeout_seconds": { "type": "number", "description": "Max seconds to wait (default: 30)" }
@@ -1898,6 +1944,7 @@ impl ServerHandler for TmuxMcpServer {
                     "exec",
                     "Execute a shell command in a session and return the output. Creates the session if it does not exist.",
                     Arc::new(tool_schema(json!({
+                        "node": { "type": "string", "description": "Execution node id (default: local)" },
                         "session": { "type": "string", "description": "Session name (default: mmux_shell)" },
                         "command": { "type": "string", "description": "Shell command to execute" },
                         "cwd": { "type": "string", "description": "Working directory (only used when creating session)" },
@@ -1923,6 +1970,7 @@ impl ServerHandler for TmuxMcpServer {
                     "session_info",
                     "Get detailed info about a tmux session: panes, windows, dimensions, running commands",
                     Arc::new(tool_schema(json!({
+                        "node": { "type": "string", "description": "Execution node id (default: local)" },
                         "session": { "type": "string", "description": "Session name" }
                     }), None)),
                 ),
@@ -1930,6 +1978,7 @@ impl ServerHandler for TmuxMcpServer {
                     "list_panes",
                     "List all panes in a tmux session with dimensions and running commands",
                     Arc::new(tool_schema(json!({
+                        "node": { "type": "string", "description": "Execution node id (default: local)" },
                         "session": { "type": "string", "description": "Session name" }
                     }), None)),
                 ),
@@ -1937,6 +1986,7 @@ impl ServerHandler for TmuxMcpServer {
                     "check_state",
                     "Quick non-blocking check: is the session at a prompt and not busy? Returns JSON.",
                     Arc::new(tool_schema(json!({
+                        "node": { "type": "string", "description": "Execution node id (default: local)" },
                         "session": { "type": "string" },
                         "profile": { "type": "string", "description": "CLI profile name (default: opencode)" }
                     }), None)),
@@ -1945,6 +1995,7 @@ impl ServerHandler for TmuxMcpServer {
                     "resize_pane",
                     "Resize the main pane in a tmux session. Useful for TUI apps.",
                     Arc::new(tool_schema(json!({
+                        "node": { "type": "string", "description": "Execution node id (default: local)" },
                         "session": { "type": "string" },
                         "width": { "type": "integer", "description": "New width in columns" },
                         "height": { "type": "integer", "description": "New height in rows" }
@@ -1955,6 +2006,7 @@ impl ServerHandler for TmuxMcpServer {
                     "read_file",
                     "Read a file from disk. Returns 'content' + 'encoding' (utf-8 or base64), compression detection, and mime_type.",
                     Arc::new(tool_schema(json!({
+                        "node": { "type": "string", "description": "Execution node id (default: local)" },
                         "path": { "type": "string", "description": "Absolute or relative file path" },
                         "offset": { "type": "integer", "description": "Optional byte offset" },
                         "limit": { "type": "integer", "description": "Optional max bytes (default 4 MiB)" }
@@ -1964,6 +2016,7 @@ impl ServerHandler for TmuxMcpServer {
                     "save_file",
                     "Save a file to disk. Accepts content + encoding (utf-8 or base64). Creates parent dirs.",
                     Arc::new(tool_schema(json!({
+                        "node": { "type": "string", "description": "Execution node id (default: local)" },
                         "path": { "type": "string", "description": "File path to write" },
                         "content": { "type": "string", "description": "File content" },
                         "encoding": { "type": "string", "enum": ["base64", "utf-8"], "description": "Use base64 for binary" },
@@ -1976,6 +2029,7 @@ impl ServerHandler for TmuxMcpServer {
                     "coding_send",
                     "Send a prompt to a coding CLI with profile-specific preprocessing (dismiss startup, etc.)",
                     Arc::new(tool_schema(json!({
+                        "node": { "type": "string", "description": "Execution node id (default: local)" },
                         "session": { "type": "string" },
                         "prompt": { "type": "string" },
                         "profile": { "type": "string", "description": "CLI profile name (default: opencode)" }
@@ -1985,6 +2039,7 @@ impl ServerHandler for TmuxMcpServer {
                     "coding_read",
                     "Capture the last N lines from a coding CLI pane",
                     Arc::new(tool_schema(json!({
+                        "node": { "type": "string", "description": "Execution node id (default: local)" },
                         "session": { "type": "string" },
                         "lines": { "type": "integer", "description": "Lines to capture (default: 40)" }
                     }), None)),
@@ -1993,6 +2048,7 @@ impl ServerHandler for TmuxMcpServer {
                     "coding_action",
                     "Send a profile-aware action to a coding CLI (approve, reject, cancel, escape, dismiss)",
                     Arc::new(tool_schema(json!({
+                        "node": { "type": "string", "description": "Execution node id (default: local)" },
                         "session": { "type": "string" },
                         "action": { "type": "string", "enum": ["approve", "reject", "cancel", "escape", "dismiss"], "description": "Action to perform" },
                         "profile": { "type": "string", "description": "CLI profile name (default: opencode)" }
@@ -2002,6 +2058,7 @@ impl ServerHandler for TmuxMcpServer {
                     "coding_wait_ready",
                     "Wait until a coding CLI is at a prompt and not busy",
                     Arc::new(tool_schema(json!({
+                        "node": { "type": "string", "description": "Execution node id (default: local)" },
                         "session": { "type": "string" },
                         "timeout_seconds": { "type": "integer", "description": "Max seconds to wait (default: 30)" },
                         "profile": { "type": "string", "description": "CLI profile name (default: opencode)" }
@@ -2846,7 +2903,7 @@ impl ServerHandler for TmuxMcpServer {
                     {
                         return Ok(Self::error_result(error));
                     }
-                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    tokio::time::sleep(coding_prompt_submit_delay(prompt)).await;
                     return match self
                         .remote_tmux(
                             node,
@@ -3615,22 +3672,164 @@ async fn auth_middleware(
 }
 
 async fn wire_auth_middleware(
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
+    policy: Arc<NodeWireAuthPolicy>,
     token: Option<Arc<String>>,
-    allow_unauthenticated: bool,
 ) -> Response {
-    if token.is_none() && !allow_unauthenticated {
-        return Response::builder()
+    let auth_header = request
+        .headers()
+        .get("authorization")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("");
+    let token_valid = token.as_ref().is_some_and(|expected| {
+        let expected_auth = format!("Bearer {}", expected);
+        constant_time_eq(auth_header.as_bytes(), expected_auth.as_bytes())
+    });
+    let mtls_identity = request
+        .extensions()
+        .get::<NodeWireIdentity>()
+        .cloned()
+        .or_else(|| {
+            request
+                .extensions()
+                .get::<ConnectInfo<LocalConnectInfo>>()
+                .and_then(|info| info.0.node_wire_identity.clone())
+        });
+    match policy.authenticate(token_valid, mtls_identity) {
+        Ok(context) => {
+            request.extensions_mut().insert(context);
+            next.run(request).await
+        }
+        Err(message) => Response::builder()
             .status(StatusCode::UNAUTHORIZED)
-            .body(Body::from("Unauthorized"))
-            .unwrap();
+            .body(Body::from(message))
+            .unwrap(),
     }
-    auth_middleware(request, next, token).await
 }
 
 struct NodeRegistryConnectService {
     registry: ActorRef<NodeRegistryMessage>,
+}
+
+#[derive(Clone, Debug)]
+struct LocalConnectInfo {
+    node_wire_identity: Option<NodeWireIdentity>,
+}
+
+struct NativeMtlsListener {
+    listener: tokio::net::TcpListener,
+    acceptor: TlsAcceptor,
+}
+
+struct NativeMtlsStream {
+    stream: TlsStream<TcpStream>,
+    node_wire_identity: Option<NodeWireIdentity>,
+}
+
+impl NativeMtlsListener {
+    fn new(listener: tokio::net::TcpListener, tls_config: Arc<ServerConfig>) -> Self {
+        Self {
+            listener,
+            acceptor: TlsAcceptor::from(tls_config),
+        }
+    }
+}
+
+impl axum::serve::Listener for NativeMtlsListener {
+    type Io = NativeMtlsStream;
+    type Addr = SocketAddr;
+
+    async fn accept(&mut self) -> (Self::Io, Self::Addr) {
+        loop {
+            let (stream, remote_addr) = match self.listener.accept().await {
+                Ok(value) => value,
+                Err(error) => {
+                    eprintln!("TLS listener accept failed: {}", error);
+                    tokio::time::sleep(Duration::from_secs(1)).await;
+                    continue;
+                }
+            };
+            match tokio::time::timeout(Duration::from_secs(10), self.acceptor.accept(stream)).await
+            {
+                Ok(Ok(tls_stream)) => {
+                    let node_wire_identity = tls_stream
+                        .get_ref()
+                        .1
+                        .peer_certificates()
+                        .and_then(|certs| certs.first())
+                        .and_then(|cert| node_wire_identity_from_cert(cert.as_ref()));
+                    return (
+                        NativeMtlsStream {
+                            stream: tls_stream,
+                            node_wire_identity,
+                        },
+                        remote_addr,
+                    );
+                }
+                Ok(Err(error)) => {
+                    eprintln!("TLS handshake failed from {}: {}", remote_addr, error);
+                }
+                Err(_) => {
+                    eprintln!("TLS handshake timed out from {}", remote_addr);
+                }
+            }
+        }
+    }
+
+    fn local_addr(&self) -> std::io::Result<Self::Addr> {
+        self.listener.local_addr()
+    }
+}
+
+impl AsyncRead for NativeMtlsStream {
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_read(cx, buf)
+    }
+}
+
+impl AsyncWrite for NativeMtlsStream {
+    fn poll_write(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.stream).poll_write(cx, buf)
+    }
+
+    fn poll_flush(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_flush(cx)
+    }
+
+    fn poll_shutdown(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.stream).poll_shutdown(cx)
+    }
+}
+
+impl Connected<IncomingStream<'_, NativeMtlsListener>> for LocalConnectInfo {
+    fn connect_info(stream: IncomingStream<'_, NativeMtlsListener>) -> Self {
+        Self {
+            node_wire_identity: stream.io().node_wire_identity.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedNodeWirePolicy {
+    policy: NodeWireAuthPolicy,
+    token: Option<String>,
+    native_mtls: Option<NativeMtlsConfig>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct NativeMtlsConfig {
+    server_cert: PathBuf,
+    server_key: PathBuf,
+    client_ca: PathBuf,
 }
 
 fn invalid_argument(error: impl ToString) -> ConnectError {
@@ -3641,15 +3840,138 @@ fn internal_error(error: impl ToString) -> ConnectError {
     ConnectError::internal(error.to_string())
 }
 
+fn build_native_mtls_server_config(config: &NativeMtlsConfig) -> Result<Arc<ServerConfig>, String> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let server_cert = load_cert_chain(&config.server_cert, "TLS server certificate")?;
+    let server_key = load_private_key(&config.server_key, "TLS server private key")?;
+    let mut client_roots = RootCertStore::empty();
+    for cert in load_cert_chain(&config.client_ca, "node client CA certificate")? {
+        client_roots.add(cert).map_err(|error| {
+            format!(
+                "failed to add node client CA '{}': {}",
+                config.client_ca.display(),
+                error
+            )
+        })?;
+    }
+    let client_verifier = WebPkiClientVerifier::builder(Arc::new(client_roots))
+        .allow_unauthenticated()
+        .build()
+        .map_err(|error| {
+            format!(
+                "failed to build node client certificate verifier: {}",
+                error
+            )
+        })?;
+    let tls_config = ServerConfig::builder()
+        .with_client_cert_verifier(client_verifier)
+        .with_single_cert(server_cert, server_key)
+        .map_err(|error| format!("failed to build TLS server config: {}", error))?;
+    Ok(Arc::new(tls_config))
+}
+
+fn load_cert_chain(path: &Path, description: &str) -> Result<Vec<CertificateDer<'static>>, String> {
+    let file = std::fs::File::open(path).map_err(|error| {
+        format!(
+            "failed to open {} '{}': {}",
+            description,
+            path.display(),
+            error
+        )
+    })?;
+    let certs = rustls_pemfile::certs(&mut BufReader::new(file))
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| {
+            format!(
+                "failed to parse {} '{}': {}",
+                description,
+                path.display(),
+                error
+            )
+        })?;
+    if certs.is_empty() {
+        return Err(format!(
+            "{} '{}' contains no certificates",
+            description,
+            path.display()
+        ));
+    }
+    Ok(certs)
+}
+
+fn load_private_key(path: &Path, description: &str) -> Result<PrivateKeyDer<'static>, String> {
+    let file = std::fs::File::open(path).map_err(|error| {
+        format!(
+            "failed to open {} '{}': {}",
+            description,
+            path.display(),
+            error
+        )
+    })?;
+    rustls_pemfile::private_key(&mut BufReader::new(file))
+        .map_err(|error| {
+            format!(
+                "failed to parse {} '{}': {}",
+                description,
+                path.display(),
+                error
+            )
+        })?
+        .ok_or_else(|| {
+            format!(
+                "{} '{}' contains no private key",
+                description,
+                path.display()
+            )
+        })
+}
+
+fn node_wire_identity_from_cert(cert_der: &[u8]) -> Option<NodeWireIdentity> {
+    let (_, cert) = x509_parser::certificate::X509Certificate::from_der(cert_der).ok()?;
+    if let Ok(Some(san)) = cert.subject_alternative_name() {
+        for name in &san.value.general_names {
+            if let GeneralName::URI(uri) = name {
+                if let Some(node_id) = node_id_from_uri_san(uri) {
+                    return Some(NodeWireIdentity::mtls(node_id));
+                }
+            }
+        }
+    }
+    None
+}
+
+fn node_id_from_uri_san(uri: &str) -> Option<String> {
+    uri.strip_prefix("mmux:node:")
+        .or_else(|| uri.strip_prefix("spiffe://mmux/node/"))
+        .map(str::trim)
+        .filter(|node_id| !node_id.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn require_wire_node_identity(
+    ctx: &ConnectRequestContext,
+    node_id: &str,
+) -> Result<(), ConnectError> {
+    match ctx.extensions.get::<NodeWireAuthContext>() {
+        Some(auth) => auth
+            .require_node_id(node_id)
+            .map_err(ConnectError::permission_denied),
+        None => Err(ConnectError::unauthenticated(
+            "node wire request was not authenticated",
+        )),
+    }
+}
+
 #[allow(refining_impl_trait)]
 impl MmuxNodeRegistryService for NodeRegistryConnectService {
     async fn register_node(
         &self,
-        _ctx: ConnectRequestContext,
+        ctx: ConnectRequestContext,
         request: OwnedRegisterNodeRequestView,
     ) -> ServiceResult<wire_proto::RegisterNodeResponse> {
         let request = register_node_request_from_proto(request.to_owned_message())
             .map_err(invalid_argument)?;
+        require_wire_node_identity(&ctx, &request.descriptor.node_id)?;
         let response = match registry_call(
             &self.registry,
             |reply| NodeRegistryMessage::Register {
@@ -3674,10 +3996,11 @@ impl MmuxNodeRegistryService for NodeRegistryConnectService {
 
     async fn pull_commands(
         &self,
-        _ctx: ConnectRequestContext,
+        ctx: ConnectRequestContext,
         request: OwnedPullCommandsRequestView,
     ) -> ServiceResult<wire_proto::PullCommandsResponse> {
         let request = pull_commands_request_from_proto(request.to_owned_message());
+        require_wire_node_identity(&ctx, &request.node_id)?;
         let commands = registry_call(
             &self.registry,
             |reply| NodeRegistryMessage::Pull {
@@ -3695,11 +4018,12 @@ impl MmuxNodeRegistryService for NodeRegistryConnectService {
 
     async fn submit_command_result(
         &self,
-        _ctx: ConnectRequestContext,
+        ctx: ConnectRequestContext,
         request: OwnedSubmitCommandResultRequestView,
     ) -> ServiceResult<wire_proto::SubmitCommandResultResponse> {
         let request = submit_command_result_request_from_proto(request.to_owned_message())
             .map_err(invalid_argument)?;
+        require_wire_node_identity(&ctx, &request.node_id)?;
         let accepted = registry_call(
             &self.registry,
             |reply| NodeRegistryMessage::SubmitResult {
@@ -3719,11 +4043,12 @@ impl MmuxNodeRegistryService for NodeRegistryConnectService {
 
     async fn heartbeat(
         &self,
-        _ctx: ConnectRequestContext,
+        ctx: ConnectRequestContext,
         request: OwnedHeartbeatRequestView,
     ) -> ServiceResult<wire_proto::HeartbeatResponse> {
         let request =
             heartbeat_request_from_proto(request.to_owned_message()).map_err(invalid_argument)?;
+        require_wire_node_identity(&ctx, &request.node_id)?;
         let accepted = registry_call(
             &self.registry,
             |reply| NodeRegistryMessage::Heartbeat {
@@ -3746,8 +4071,7 @@ pub(crate) async fn run_mcp_http_server(
     profiles: ProfileRegistry,
     policy: ControllerPolicy,
     mcp_token: Option<String>,
-    wire_token: Option<String>,
-    allow_unauthenticated_node_wire: bool,
+    wire_auth: ResolvedNodeWirePolicy,
     enable_local_node: bool,
 ) -> Result<(), String> {
     let local_node = if enable_local_node {
@@ -3786,8 +4110,11 @@ pub(crate) async fn run_mcp_http_server(
                 .disable_allowed_hosts(),
         );
 
+    let native_mtls = wire_auth.native_mtls.clone();
     let mcp_token_arc = mcp_token.map(Arc::new);
-    let wire_token_arc = wire_token.map(Arc::new);
+    let wire_auth_mode = wire_auth.policy.mode;
+    let wire_token_arc = wire_auth.token.map(Arc::new);
+    let wire_auth_policy = Arc::new(wire_auth.policy);
     let has_mcp_token = mcp_token_arc.is_some();
     let has_wire_token = wire_token_arc.is_some();
     let api_token_arc = mcp_token_arc.clone();
@@ -3816,7 +4143,8 @@ pub(crate) async fn run_mcp_http_server(
         .layer(DefaultBodyLimit::max(request_body_limit))
         .layer(middleware::from_fn(move |req, next| {
             let t = wire_token_arc.clone();
-            wire_auth_middleware(req, next, t, allow_unauthenticated_node_wire)
+            let p = wire_auth_policy.clone();
+            wire_auth_middleware(req, next, p, t)
         }))
         .layer(middleware::from_fn(security_middleware));
 
@@ -3824,7 +4152,15 @@ pub(crate) async fn run_mcp_http_server(
 
     let router = health_router.merge(api_router).merge(wire_router);
 
-    println!("mmux MCP HTTP server listening on http://{}/mcp", bind);
+    let scheme = if native_mtls.is_some() {
+        "https"
+    } else {
+        "http"
+    };
+    println!(
+        "mmux MCP HTTP server listening on {}://{}/mcp",
+        scheme, bind
+    );
     if let Some(root) = policy.workspace_root.as_ref() {
         println!("  Workspace root: {}", root.display());
     }
@@ -3835,16 +4171,32 @@ pub(crate) async fn run_mcp_http_server(
             "  Warning: no MCP bearer token set. Use --mcp-token to prevent unauthorized MCP access."
         );
     }
-    if has_wire_token {
+    println!("  Node wire auth mode: {}", wire_auth_mode.as_str());
+    if wire_auth_mode.allows_token() && has_wire_token {
         println!("  Node wire bearer token authentication enabled");
-    } else if allow_unauthenticated_node_wire {
+    }
+    if wire_auth_mode.allows_mtls() {
+        println!("  Node wire mTLS authentication enabled with native TLS termination.");
+    }
+    if wire_auth_mode == NodeWireAuthMode::Unauthenticated {
         println!(
             "  Warning: node wire RPC is unauthenticated. Use only for development or trusted private tunnels."
         );
-    } else {
+    } else if wire_auth_mode == NodeWireAuthMode::Token && !has_wire_token {
         println!(
             "  Node wire RPC requires --wire-token; unauthenticated node requests will be rejected."
         );
+    }
+
+    if let Some(native_mtls) = native_mtls {
+        let tls_config = build_native_mtls_server_config(&native_mtls)?;
+        let tls_listener = NativeMtlsListener::new(listener, tls_config);
+        return axum::serve(
+            tls_listener,
+            router.into_make_service_with_connect_info::<LocalConnectInfo>(),
+        )
+        .await
+        .map_err(|e| format!("server error: {}", e));
     }
 
     axum::serve(listener, router)
@@ -3926,7 +4278,7 @@ fn resolve_token_value(
                 ));
             }
         }
-        warn_if_token_file_permissions_are_loose(&real_token_path);
+        warn_if_secret_file_permissions_are_loose(&real_token_path);
         let token = std::fs::read_to_string(&real_token_path)
             .map_err(|e| format!("failed to read token file '{}': {}", path, e))?
             .trim()
@@ -3945,14 +4297,20 @@ fn resolve_token_value(
     }
 }
 
+fn canonicalize_required_path(flag: &str, path: Option<&String>) -> Result<PathBuf, String> {
+    let path = path.ok_or_else(|| format!("{} is required", flag))?;
+    std::fs::canonicalize(path)
+        .map_err(|error| format!("failed to canonicalize {} '{}': {}", flag, path, error))
+}
+
 #[cfg(unix)]
-fn warn_if_token_file_permissions_are_loose(path: &Path) {
+fn warn_if_secret_file_permissions_are_loose(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
     if let Ok(meta) = std::fs::metadata(path) {
         let mode = meta.permissions().mode();
         if mode & 0o077 != 0 {
             eprintln!(
-                "Warning: token file '{}' is readable or writable by group/other; prefer mode 0400 or 0440.",
+                "Warning: secret file '{}' is readable or writable by group/other; prefer mode 0400 or 0440.",
                 path.display()
             );
         }
@@ -3960,7 +4318,7 @@ fn warn_if_token_file_permissions_are_loose(path: &Path) {
 }
 
 #[cfg(not(unix))]
-fn warn_if_token_file_permissions_are_loose(_path: &Path) {}
+fn warn_if_secret_file_permissions_are_loose(_path: &Path) {}
 
 fn validate_remote_mcp_bind_auth(
     bind: SocketAddr,
@@ -3981,6 +4339,83 @@ fn validate_remote_mcp_bind_auth(
         "refusing to bind unauthenticated MCP to {}; set --mcp-token, --mcp-token-file, or MMUX_MCP_TOKEN, or deliberately use --allow-remote-without-mcp-token behind a trusted network boundary",
         bind
     ))
+}
+
+fn resolve_node_wire_policy(
+    cli: &Cli,
+    policy: &ControllerPolicy,
+) -> Result<ResolvedNodeWirePolicy, String> {
+    let token = resolve_token_value(
+        "--wire-token",
+        cli.wire_token.as_ref(),
+        cli.wire_token_file.as_ref(),
+        &cli.wire_token_env,
+        policy,
+    )?;
+
+    if cli.wire_mtls {
+        if token.is_some() {
+            return Err(
+                "--wire-mtls is mutually exclusive with --wire-token, --wire-token-file, or MMUX_WIRE_TOKEN"
+                    .into(),
+            );
+        }
+        if cli.allow_unauthenticated_node_wire {
+            return Err(
+                "--wire-mtls is mutually exclusive with --allow-unauthenticated-node-wire".into(),
+            );
+        }
+        let server_cert = canonicalize_required_path("--tls-cert", cli.tls_cert.as_ref())?;
+        let server_key = canonicalize_required_path("--tls-key", cli.tls_key.as_ref())?;
+        let client_ca =
+            canonicalize_required_path("--wire-client-ca", cli.wire_client_ca.as_ref())?;
+        warn_if_secret_file_permissions_are_loose(&server_key);
+        return Ok(ResolvedNodeWirePolicy {
+            policy: NodeWireAuthPolicy {
+                mode: NodeWireAuthMode::Mtls,
+            },
+            token: None,
+            native_mtls: Some(NativeMtlsConfig {
+                server_cert,
+                server_key,
+                client_ca,
+            }),
+        });
+    }
+
+    if cli.tls_cert.is_some() || cli.tls_key.is_some() || cli.wire_client_ca.is_some() {
+        return Err("--tls-cert, --tls-key, and --wire-client-ca require --wire-mtls".into());
+    }
+
+    if cli.allow_unauthenticated_node_wire {
+        if token.is_some() {
+            return Err(
+                "--allow-unauthenticated-node-wire is mutually exclusive with wire token configuration"
+                    .into(),
+            );
+        }
+        return Ok(ResolvedNodeWirePolicy {
+            policy: NodeWireAuthPolicy {
+                mode: NodeWireAuthMode::Unauthenticated,
+            },
+            token: None,
+            native_mtls: None,
+        });
+    }
+
+    match token {
+        Some(token) => Ok(ResolvedNodeWirePolicy {
+            policy: NodeWireAuthPolicy {
+                mode: NodeWireAuthMode::Token,
+            },
+            token: Some(token),
+            native_mtls: None,
+        }),
+        None => Err(
+            "node wire RPC requires --wire-token, --wire-token-file, MMUX_WIRE_TOKEN, --wire-mtls, or explicit --allow-unauthenticated-node-wire"
+                .into(),
+        ),
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -4012,15 +4447,8 @@ where
         eprintln!("MCP token error: {}", e);
         std::process::exit(1);
     });
-    let wire_token = resolve_token_value(
-        "--wire-token",
-        cli.wire_token.as_ref(),
-        cli.wire_token_file.as_ref(),
-        &cli.wire_token_env,
-        &policy,
-    )
-    .unwrap_or_else(|e| {
-        eprintln!("Wire token error: {}", e);
+    let wire_auth = resolve_node_wire_policy(&cli, &policy).unwrap_or_else(|e| {
+        eprintln!("Node wire policy error: {}", e);
         std::process::exit(1);
     });
 
@@ -4059,8 +4487,7 @@ where
         profiles,
         policy,
         mcp_token,
-        wire_token,
-        allow_unauthenticated_node_wire: cli.allow_unauthenticated_node_wire,
+        wire_auth,
         enable_local_node: cli.enable_local_node,
     });
     if let Err(e) = rt.block_on(runtime::ControllerRuntime::run(local_runtime)) {
@@ -4098,6 +4525,10 @@ mod tests {
             mcp_token_file: None,
             mcp_token_env: "MMUX_MCP_TOKEN".into(),
             wire_token: None,
+            wire_mtls: false,
+            tls_cert: None,
+            tls_key: None,
+            wire_client_ca: None,
             wire_token_file: None,
             wire_token_env: "MMUX_WIRE_TOKEN".into(),
             workspace_root: None,
@@ -4280,6 +4711,59 @@ triggers = ["Starting MCP servers"]
         assert!(validate_remote_mcp_bind_auth(bind, None, false).is_err());
         assert!(validate_remote_mcp_bind_auth(bind, None, true).is_ok());
         assert!(validate_remote_mcp_bind_auth(bind, Some(&"secret".to_owned()), false).is_ok());
+    }
+
+    #[test]
+    fn test_resolve_node_wire_policy_uses_one_canonical_mode() {
+        let mut cli = test_cli();
+        cli.wire_token_env = format!("MMUX_TEST_WIRE_TOKEN_{}", std::process::id());
+        std::env::remove_var(&cli.wire_token_env);
+        let policy = ControllerPolicy::new(&cli).unwrap();
+
+        assert!(resolve_node_wire_policy(&cli, &policy)
+            .unwrap_err()
+            .contains("node wire RPC requires"));
+
+        cli.wire_token = Some("secret".into());
+        let auth = resolve_node_wire_policy(&cli, &policy).unwrap();
+        assert_eq!(auth.policy.mode, NodeWireAuthMode::Token);
+        assert_eq!(auth.token.as_deref(), Some("secret"));
+
+        cli.wire_mtls = true;
+        assert!(resolve_node_wire_policy(&cli, &policy)
+            .unwrap_err()
+            .contains("mutually exclusive"));
+
+        cli.wire_token = None;
+        assert!(resolve_node_wire_policy(&cli, &policy)
+            .unwrap_err()
+            .contains("--tls-cert is required"));
+
+        let cert_dir = unique_temp_dir("mmux-mtls-policy");
+        fs::create_dir_all(&cert_dir).unwrap();
+        let cert = cert_dir.join("controller.pem");
+        let key = cert_dir.join("controller-key.pem");
+        let ca = cert_dir.join("node-ca.pem");
+        fs::write(&cert, "not parsed in policy resolver").unwrap();
+        fs::write(&key, "not parsed in policy resolver").unwrap();
+        fs::write(&ca, "not parsed in policy resolver").unwrap();
+        cli.tls_cert = Some(cert.to_string_lossy().into_owned());
+        cli.tls_key = Some(key.to_string_lossy().into_owned());
+        cli.wire_client_ca = Some(ca.to_string_lossy().into_owned());
+        let auth = resolve_node_wire_policy(&cli, &policy).unwrap();
+        assert_eq!(auth.policy.mode, NodeWireAuthMode::Mtls);
+        assert!(auth.token.is_none());
+        assert!(auth.native_mtls.is_some());
+
+        cli.wire_mtls = false;
+        cli.tls_cert = None;
+        cli.tls_key = None;
+        cli.wire_client_ca = None;
+        cli.allow_unauthenticated_node_wire = true;
+        let auth = resolve_node_wire_policy(&cli, &policy).unwrap();
+        assert_eq!(auth.policy.mode, NodeWireAuthMode::Unauthenticated);
+        assert!(auth.token.is_none());
+        let _ = fs::remove_dir_all(cert_dir);
     }
 
     #[test]
@@ -4520,6 +5004,19 @@ triggers = ["Starting MCP servers"]
         assert_eq!(
             remote_send_key_args("%1", "Down Enter"),
             vec!["send-keys", "-t", "%1", "Down", "Enter"]
+        );
+    }
+
+    #[test]
+    fn test_coding_prompt_submit_delay_scales_for_multiline_prompts() {
+        assert_eq!(
+            coding_prompt_submit_delay("ping"),
+            Duration::from_millis(201)
+        );
+        assert!(coding_prompt_submit_delay("line 1\nline 2") > Duration::from_millis(200));
+        assert_eq!(
+            coding_prompt_submit_delay(&"x".repeat(20_000)),
+            Duration::from_millis(2_000)
         );
     }
 }

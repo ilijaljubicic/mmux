@@ -53,22 +53,13 @@ for candidate in "$TMPDIR/mmux" "$TMPDIR/mmux-${PLATFORM}"; do
   fi
 done
 if [ -z "$MMUX_BIN" ]; then
-  MMUX_BIN="$(find "$TMPDIR" -maxdepth 1 -type f -name 'mmux-*' ! -name "$ARCHIVE" ! -name 'mmux-microsandbox-node*' | head -n 1)"
+  MMUX_BIN="$(find "$TMPDIR" -maxdepth 1 -type f -name 'mmux-*' ! -name "$ARCHIVE" | head -n 1)"
 fi
 if [ -z "$MMUX_BIN" ]; then
   echo "Archive did not contain an mmux binary" >&2
   exit 1
 fi
 chmod +x "$MMUX_BIN"
-
-MICROSANDBOX_BIN=""
-for candidate in "$TMPDIR/mmux-microsandbox-node" "$TMPDIR/mmux-microsandbox-node-${PLATFORM}"; do
-  if [ -f "$candidate" ]; then
-    MICROSANDBOX_BIN="$candidate"
-    chmod +x "$MICROSANDBOX_BIN"
-    break
-  fi
-done
 
 if [ -z "${INSTALL_DIR:-}" ]; then
   if [ "$OS" = "darwin" ] && [ -d "/opt/homebrew/bin" ]; then
@@ -81,17 +72,8 @@ fi
 mkdir -p "$INSTALL_DIR" 2>/dev/null || sudo mkdir -p "$INSTALL_DIR"
 if [ -w "$INSTALL_DIR" ]; then
   mv "$MMUX_BIN" "$INSTALL_DIR/mmux"
-  if [ -n "$MICROSANDBOX_BIN" ]; then
-    mv "$MICROSANDBOX_BIN" "$INSTALL_DIR/mmux-microsandbox-node"
-  fi
 else
   sudo mv "$MMUX_BIN" "$INSTALL_DIR/mmux"
-  if [ -n "$MICROSANDBOX_BIN" ]; then
-    sudo mv "$MICROSANDBOX_BIN" "$INSTALL_DIR/mmux-microsandbox-node"
-  fi
 fi
 
 echo "Installed mmux ${VERSION} to ${INSTALL_DIR}/mmux"
-if [ -n "$MICROSANDBOX_BIN" ]; then
-  echo "Installed mmux-microsandbox-node ${VERSION} to ${INSTALL_DIR}/mmux-microsandbox-node"
-fi
