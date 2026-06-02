@@ -797,13 +797,17 @@ dependencies = [
  "http-body",
  "http-body-util",
  "hyper",
+ "hyper-rustls",
  "hyper-util",
  "percent-encoding",
  "pin-project",
+ "rustls",
+ "rustls-pki-types",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-rustls",
  "tokio-util",
  "tower",
  "tracing",
@@ -2949,6 +2953,7 @@ dependencies = [
  "clap",
  "connectrpc",
  "mime",
+ "mmux-controller-core",
  "mmux-node",
  "mmux-shared",
  "mmux-wire",
@@ -2959,6 +2964,14 @@ dependencies = [
  "tokio",
  "toml",
  "tower-http",
+]
+
+[[package]]
+name = "mmux-controller-core"
+version = "0.1.0"
+dependencies = [
+ "mmux-wire",
+ "serde",
 ]
 
 [[package]]
@@ -2993,6 +3006,7 @@ dependencies = [
  "serde_json",
  "tokio",
  "toml",
+ "webpki-roots 1.0.7",
 ]
 
 [[package]]

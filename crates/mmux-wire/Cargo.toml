@@ -6,6 +6,10 @@ license.workspace = true
 
 [dependencies]
 buffa = { workspace = true }
-connectrpc = { workspace = true }
-http-body = { workspace = true }
+connectrpc = { workspace = true, optional = true }
+http-body = { workspace = true, optional = true }
 serde = { workspace = true }
+
+[features]
+default = ["connect"]
+connect = ["dep:connectrpc", "dep:http-body"]

@@ -29,12 +29,19 @@
 # [coder_profile.codex]
 # cmd = "codex --model gpt-5"
 
+# Example: launch a TUI from an interactive shell instead of making it the
+# direct detached tmux command.
+#
+# [coder_profile.opencode]
+# launch_strategy = "shell_send"
+
 # Example: define a new custom profile. New profiles do not have built-in
 # defaults, so provide the complete backend-agnostic profile shape.
 #
 # [coder_profile.custom]
 # name = "custom"
 # cmd = "custom-code"
+# launch_strategy = "direct"
 # prompt_indicator = ">"
 # busy_indicators = ["Working"]
 # approve_keys = "y Enter"

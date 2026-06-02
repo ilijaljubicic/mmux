@@ -10,11 +10,12 @@ define update_version
 	perl -0pi -e 's/(\[workspace\.package\]\nversion = ")[^"]+(")/$${1}$(1)$${2}/' $(CARGO_TOML)
 endef
 
-.PHONY: help build check test clean lint release release-build prepare-release release-tag update-patch update-minor update-major generate-build run-local run-controller run-node wire-check-tools wire-generate
+.PHONY: help build check test clean lint release release-build prepare-release release-tag npm-package npm-pack-dry-run npm-pack npm-publish update-patch update-minor update-major generate-build run-local run-controller run-node wire-check-tools wire-generate
 
 LOCAL_ARGS ?=
 CONTROLLER_ARGS ?=
 NODE_ARGS ?=
+NPM_CACHE ?= /tmp/mmux-npm-cache
 
 help:
 	@printf 'mmux make targets\n'
@@ -32,6 +33,10 @@ help:
 	@printf '  make update-major      Bump workspace major version\n'
 	@printf '  make prepare-release   Refresh lockfile and run release checks\n'
 	@printf '  make release-tag       Tag v$$(workspace.package.version) and push it to trigger GitHub release\n'
+	@printf '  make npm-package       Build current-platform npm archive under npm/mmux/artifacts\n'
+	@printf '  make npm-pack-dry-run  Build package, then inspect npm pack contents\n'
+	@printf '  make npm-pack          Build package, then run npm pack in npm/mmux\n'
+	@printf '  make npm-publish       Build package, then publish it to the npm registry\n'
 	@printf '\nRun locally:\n'
 	@printf '  make run-local         Run mmux controller with the built-in local node enabled\n'
 	@printf '  make run-controller    Run mmux controller\n'
@@ -102,6 +107,18 @@ release-tag:
 	git tag -a v$(VERSION) -m "Release version v$(VERSION)"
 	git push origin v$(VERSION)
 	@echo "Release v$(VERSION) tagged. GitHub Actions will build and publish artifacts."
+
+npm-package:
+	./scripts/npm-package.sh
+
+npm-pack-dry-run: npm-package
+	cd npm/mmux && npm --cache $(NPM_CACHE) pack --dry-run
+
+npm-pack: npm-package
+	cd npm/mmux && npm --cache $(NPM_CACHE) pack
+
+npm-publish: npm-package
+	cd npm/mmux && npm --cache $(NPM_CACHE) publish --access public
 
 # Generate wire sources, then build the full workspace
 generate-build: wire-generate build

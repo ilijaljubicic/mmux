@@ -164,6 +164,7 @@ Key fields:
 | Field | Meaning |
 |-------|---------|
 | `cmd` | Command to launch the CLI session |
+| `launch_strategy` | Launch mode: omitted/`direct` starts `cmd` as the tmux command; `shell_send` starts `bash` and sends `cmd Enter` |
 | `prompt_indicator` | Substring that means "the CLI is ready for input" |
 | `busy_indicators` | Substrings that mean "the CLI is still processing" |
 | `approve_keys` | Keys to send for approval (e.g., `y Enter`) |

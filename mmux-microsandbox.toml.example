@@ -39,7 +39,7 @@ default_ingress = "deny"
 
 [[sandbox.secrets]]
 env = "MMUX_CONTROLLER_TOKEN"
-value_from = "host.MMUX_TOKEN"
+value_from = "host.MMUX_WIRE_TOKEN"
 allowed_host = "host.microsandbox.internal"
 placeholder = "$MSB_MMUX_CONTROLLER_TOKEN"
 inject_headers = false

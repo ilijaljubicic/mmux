@@ -1,8 +1,8 @@
 //! Shared wire DTOs and schema mount points for mmux controller/node traffic.
 //!
 //! The canonical schema lives under `proto/mmux/wire/v1`. This crate mounts
-//! the generated Buffa/ConnectRPC modules and keeps stable DTO names for the
-//! controller/node actor boundary.
+//! the generated Buffa modules, optionally mounts generated ConnectRPC modules,
+//! and keeps stable DTO names for the controller/node actor boundary.
 
 use serde::{Deserialize, Serialize};
 
@@ -10,6 +10,7 @@ use serde::{Deserialize, Serialize};
 pub mod proto;
 
 #[path = "generated/connect/mod.rs"]
+#[cfg(feature = "connect")]
 pub mod connect;
 
 use proto::mmux::wire::v1 as wire;

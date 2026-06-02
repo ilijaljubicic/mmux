@@ -1,6 +1,9 @@
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use clap::Parser;
-use connectrpc::client::{ClientConfig, HttpClient};
+use connectrpc::{
+    client::{ClientConfig, HttpClient},
+    rustls,
+};
 use http::header::{HeaderValue, AUTHORIZATION};
 use mmux_shared::{CliProfile, ReadFileResult, SaveFileResult, StartupDismiss};
 use mmux_wire::connect::mmux::wire::v1::MmuxNodeRegistryServiceClient;
@@ -329,19 +332,37 @@ fn connect_client(
     controller_url: &str,
     token: Option<&str>,
 ) -> Result<MmuxNodeRegistryServiceClient<HttpClient>, String> {
-    let uri = controller_url
+    let uri: http::Uri = controller_url
         .parse()
         .map_err(|error| format!("invalid controller URL '{}': {}", controller_url, error))?;
+    let transport = controller_transport(&uri)?;
     let mut config = ClientConfig::new(uri);
     if let Some(token) = token {
         let value = HeaderValue::from_str(&format!("Bearer {}", token))
             .map_err(|error| format!("invalid controller token header: {}", error))?;
         config.default_headers.insert(AUTHORIZATION, value);
     }
-    Ok(MmuxNodeRegistryServiceClient::new(
-        HttpClient::plaintext(),
-        config,
-    ))
+    Ok(MmuxNodeRegistryServiceClient::new(transport, config))
+}
+
+fn controller_transport(uri: &http::Uri) -> Result<HttpClient, String> {
+    match uri.scheme_str() {
+        Some("http") => Ok(HttpClient::plaintext()),
+        Some("https") => Ok(HttpClient::with_tls(default_tls_config())),
+        Some(other) => Err(format!("unsupported controller URL scheme '{}'", other)),
+        None => Err("controller URL must include http:// or https:// scheme".into()),
+    }
+}
+
+fn default_tls_config() -> Arc<rustls::ClientConfig> {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+    let mut roots = rustls::RootCertStore::empty();
+    roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+    Arc::new(
+        rustls::ClientConfig::builder()
+            .with_root_certificates(roots)
+            .with_no_client_auth(),
+    )
 }
 
 #[derive(Clone, Debug, Default)]
@@ -444,8 +465,15 @@ fn default_profile_map() -> HashMap<String, CliProfile> {
             name: "opencode".into(),
             cmd: Some("opencode".into()),
             permission_bypass_cmd: None,
-            prompt_indicator: ">".into(),
-            busy_indicators: vec!["Processing".into(), "Generating".into()],
+            launch_strategy: Some("shell_send".into()),
+            prompt_indicator: "ctrl+p commands".into(),
+            busy_indicators: vec![
+                "Thinking".into(),
+                "Working".into(),
+                "Running".into(),
+                "Processing".into(),
+                "Generating".into(),
+            ],
             startup_dismiss: None,
             launch: None,
             approve_keys: "y Enter".into(),
@@ -461,6 +489,7 @@ fn default_profile_map() -> HashMap<String, CliProfile> {
             name: "kimi".into(),
             cmd: Some("kimi".into()),
             permission_bypass_cmd: Some("kimi --yolo".into()),
+            launch_strategy: None,
             prompt_indicator: ">".into(),
             busy_indicators: vec![
                 "Working".into(),
@@ -487,6 +516,7 @@ fn default_profile_map() -> HashMap<String, CliProfile> {
             name: "codex".into(),
             cmd: Some("codex".into()),
             permission_bypass_cmd: Some("codex --dangerously-bypass-approvals-and-sandbox".into()),
+            launch_strategy: None,
             prompt_indicator: "›".into(),
             busy_indicators: vec!["• Working".into(), "Starting MCP servers".into()],
             startup_dismiss: Some(StartupDismiss {
@@ -507,6 +537,7 @@ fn default_profile_map() -> HashMap<String, CliProfile> {
             name: "claude".into(),
             cmd: Some("claude".into()),
             permission_bypass_cmd: Some("claude --dangerously-skip-permissions".into()),
+            launch_strategy: None,
             prompt_indicator: "❯".into(),
             busy_indicators: vec!["Thinking".into(), "Working".into(), "Running".into()],
             startup_dismiss: Some(StartupDismiss {
@@ -809,8 +840,17 @@ prompt_indicator = "codex ready"
     }
 
     #[test]
-    fn default_profiles_include_tuned_codex_and_claude() {
+    fn default_profiles_include_tuned_coder_profiles() {
         let profiles = default_profiles();
+
+        let opencode = get_profile(&profiles, "opencode").expect("opencode profile");
+        assert_eq!(opencode.cmd.as_deref(), Some("opencode"));
+        assert_eq!(opencode.launch_strategy.as_deref(), Some("shell_send"));
+        assert_eq!(opencode.prompt_indicator, "ctrl+p commands");
+        assert!(opencode
+            .busy_indicators
+            .iter()
+            .any(|marker| marker == "Working"));
 
         let kimi = get_profile(&profiles, "kimi").expect("kimi profile");
         assert_eq!(kimi.cmd.as_deref(), Some("kimi"));
@@ -843,6 +883,24 @@ prompt_indicator = "codex ready"
             .busy_indicators
             .iter()
             .any(|marker| marker == "Thinking"));
+    }
+
+    #[test]
+    fn controller_transport_supports_http_and_https() {
+        let http_transport = controller_transport(&"http://localhost:3000".parse().unwrap())
+            .expect("http transport");
+        assert!(format!("{http_transport:?}").contains("plaintext"));
+
+        let https_transport = controller_transport(&"https://mmux.example.com".parse().unwrap())
+            .expect("https transport");
+        assert!(format!("{https_transport:?}").contains("tls"));
+    }
+
+    #[test]
+    fn controller_transport_rejects_unsupported_schemes() {
+        let error = controller_transport(&"ftp://mmux.example.com".parse().unwrap()).unwrap_err();
+
+        assert!(error.contains("unsupported controller URL scheme"));
     }
 
     #[test]

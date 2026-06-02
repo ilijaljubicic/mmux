@@ -4,6 +4,7 @@ use connectrpc::{
     ConnectError, ConnectRpcService, RequestContext as ConnectRequestContext,
     Response as ConnectResponse, ServiceResult,
 };
+use mmux_controller_core::NodeRegistry;
 use mmux_node::ProfileRegistry;
 use mmux_shared::{CliProfile, ReadFileResult, SaveFileResult};
 use mmux_wire::connect::mmux::wire::v1::{
@@ -21,12 +22,12 @@ use mmux_wire::{
     SubmitCommandResultResponse,
 };
 use serde_json::{json, Map, Value};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::net::SocketAddr;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use axum::{
     body::Body,
@@ -37,6 +38,8 @@ use axum::{
 };
 use ractor::{rpc::CallResult, Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
 use tower_http::cors::{Any, CorsLayer};
+
+mod runtime;
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  rmcp imports (MCP HTTP server)
@@ -107,22 +110,32 @@ struct Cli {
         help = "Port to bind the MCP HTTP server"
     )]
     port: u16,
+    #[arg(long, help = "Bearer token protecting the public MCP endpoint.")]
+    mcp_token: Option<String>,
     #[arg(
         long,
-        help = "Bearer token for API authentication. If set, all requests must include 'Authorization: Bearer <token>'."
+        help = "Path to a file containing the MCP bearer token. Prefer /run/secrets paths in containers."
     )]
-    token: Option<String>,
+    mcp_token_file: Option<String>,
     #[arg(
         long,
-        help = "Path to a file containing the bearer token. Prefer /run/secrets paths in containers."
+        default_value = "MMUX_MCP_TOKEN",
+        help = "Environment variable to read the MCP bearer token from when --mcp-token/--mcp-token-file are not set."
     )]
-    token_file: Option<String>,
+    mcp_token_env: String,
+    #[arg(long, help = "Bearer token protecting node wire RPC endpoints.")]
+    wire_token: Option<String>,
     #[arg(
         long,
-        default_value = "MMUX_TOKEN",
-        help = "Environment variable to read the bearer token from when --token/--token-file are not set."
+        help = "Path to a file containing the node wire bearer token. Prefer /run/secrets paths in containers."
     )]
-    token_env: String,
+    wire_token_file: Option<String>,
+    #[arg(
+        long,
+        default_value = "MMUX_WIRE_TOKEN",
+        help = "Environment variable to read the node wire bearer token from when --wire-token/--wire-token-file are not set."
+    )]
+    wire_token_env: String,
     #[arg(
         long,
         help = "Optional root used to confine local read_file/save_file path APIs."
@@ -130,9 +143,14 @@ struct Cli {
     workspace_root: Option<String>,
     #[arg(
         long,
-        help = "Permit a non-loopback unauthenticated bind. Intended only behind localhost-only port forwarding."
+        help = "Permit a non-loopback MCP bind without --mcp-token. Intended only behind localhost-only port forwarding."
     )]
-    allow_remote_without_token: bool,
+    allow_remote_without_mcp_token: bool,
+    #[arg(
+        long,
+        help = "Permit node wire RPC without --wire-token. Intended only for development or trusted private tunnels."
+    )]
+    allow_unauthenticated_node_wire: bool,
     #[arg(long, default_value_t = 4 * 1024 * 1024, help = "Maximum bytes returned by read_file.")]
     max_read_bytes: usize,
     #[arg(long, default_value_t = 4 * 1024 * 1024, help = "Maximum decoded bytes accepted by save_file.")]
@@ -155,7 +173,7 @@ struct Cli {
 }
 
 #[derive(Clone, Debug)]
-struct ControllerPolicy {
+pub(crate) struct ControllerPolicy {
     workspace_root: Option<PathBuf>,
     max_read_bytes: usize,
     max_write_bytes: usize,
@@ -529,6 +547,17 @@ fn profile_launch_command(profile: &CliProfile, bypass_permissions: bool) -> Res
         .ok_or_else(|| format!("profile '{}' does not define a launch cmd", profile.name))
 }
 
+fn profile_launch_strategy(profile: &CliProfile) -> Result<&str, String> {
+    let strategy = profile.launch_strategy.as_deref().unwrap_or("direct");
+    match strategy {
+        "direct" | "shell_send" => Ok(strategy),
+        other => Err(format!(
+            "profile '{}' uses unsupported launch_strategy '{}'",
+            profile.name, other
+        )),
+    }
+}
+
 async fn session_exec(
     session: &str,
     command: &str,
@@ -824,18 +853,9 @@ fn session_first_pane(session: &str) -> Result<String, String> {
 
 struct NodeRegistryActor;
 
-struct RegisteredNode {
-    descriptor: NodeDescriptor,
-    status: NodeStatus,
-    last_seen: Instant,
-}
-
 struct NodeRegistryState {
-    nodes: HashMap<String, RegisteredNode>,
-    queues: HashMap<String, VecDeque<NodeCommand>>,
+    registry: NodeRegistry,
     pending: HashMap<String, RpcReplyPort<Result<NodeCommandResult, String>>>,
-    next_command_id: u64,
-    local_enabled: bool,
 }
 
 enum NodeRegistryMessage {
@@ -883,11 +903,8 @@ impl Actor for NodeRegistryActor {
         args: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
         Ok(NodeRegistryState {
-            nodes: HashMap::new(),
-            queues: HashMap::new(),
+            registry: NodeRegistry::new(args),
             pending: HashMap::new(),
-            next_command_id: 1,
-            local_enabled: args,
         })
     }
 
@@ -899,50 +916,17 @@ impl Actor for NodeRegistryActor {
     ) -> Result<(), ActorProcessingErr> {
         match message {
             NodeRegistryMessage::Register { descriptor, reply } => {
-                if descriptor.node_id.trim().is_empty() {
-                    let _ = reply.send(Err("node_id must not be empty".into()));
-                    return Ok(());
-                }
-                if descriptor.node_id == "local" {
-                    let _ = reply.send(Err("'local' is reserved for the built-in node".into()));
-                    return Ok(());
-                }
-                let node_id = descriptor.node_id.clone();
-                state.nodes.insert(
-                    node_id.clone(),
-                    RegisteredNode {
-                        descriptor,
-                        status: NodeStatus::Ready,
-                        last_seen: Instant::now(),
-                    },
-                );
-                state.queues.entry(node_id.clone()).or_default();
-                let _ = reply.send(Ok(format!("registered node '{}'", node_id)));
+                let _ = reply.send(state.registry.register(descriptor, now_ms()));
             }
             NodeRegistryMessage::Heartbeat {
                 node_id,
                 status,
                 reply,
-            } => match state.nodes.get_mut(&node_id) {
-                Some(node) => {
-                    node.status = status;
-                    node.last_seen = Instant::now();
-                    let _ = reply.send(Ok(()));
-                }
-                None => {
-                    let _ = reply.send(Err(format!("node '{}' is not registered", node_id)));
-                }
-            },
+            } => {
+                let _ = reply.send(state.registry.heartbeat(&node_id, status, now_ms()));
+            }
             NodeRegistryMessage::Pull { node_id, reply } => {
-                if !state.nodes.contains_key(&node_id) {
-                    let _ = reply.send(Err(format!("node '{}' is not registered", node_id)));
-                    return Ok(());
-                }
-                if let Some(node) = state.nodes.get_mut(&node_id) {
-                    node.last_seen = Instant::now();
-                }
-                let commands = state.queues.entry(node_id).or_default().drain(..).collect();
-                let _ = reply.send(Ok(commands));
+                let _ = reply.send(state.registry.pull_commands(&node_id, now_ms()));
             }
             NodeRegistryMessage::SubmitResult {
                 node_id,
@@ -950,9 +934,7 @@ impl Actor for NodeRegistryActor {
                 result,
                 reply,
             } => {
-                if let Some(node) = state.nodes.get_mut(&node_id) {
-                    node.last_seen = Instant::now();
-                }
+                state.registry.note_result(&node_id, now_ms());
                 if let Some(waiter) = state.pending.remove(&command_id) {
                     let _ = waiter.send(Ok(result));
                     let _ = reply.send(Ok(()));
@@ -964,67 +946,29 @@ impl Actor for NodeRegistryActor {
                 node_id,
                 kind,
                 reply,
-            } => {
-                if !state.nodes.contains_key(&node_id) {
-                    let _ = reply.send(Err(format!("node '{}' is not registered", node_id)));
-                    return Ok(());
+            } => match state.registry.dispatch(&node_id, kind) {
+                Ok(command) => {
+                    state.pending.insert(command.command_id, reply);
                 }
-                let command_id = format!("cmd-{}", state.next_command_id);
-                state.next_command_id += 1;
-                state.pending.insert(command_id.clone(), reply);
-                state
-                    .queues
-                    .entry(node_id)
-                    .or_default()
-                    .push_back(NodeCommand { command_id, kind });
-            }
+                Err(error) => {
+                    let _ = reply.send(Err(error));
+                }
+            },
             NodeRegistryMessage::ListNodes { reply } => {
-                let mut nodes = Vec::new();
-                if state.local_enabled {
-                    nodes.push(json!({
-                        "node_id": "local",
-                        "display_name": "Local tmux node",
-                        "status": "ready",
-                        "last_seen_ms_ago": 0
-                    }));
-                }
-                for node in state.nodes.values() {
-                    nodes.push(json!({
-                        "node_id": node.descriptor.node_id,
-                        "display_name": node.descriptor.display_name,
-                        "status": format!("{:?}", node.status),
-                        "last_seen_ms_ago": node.last_seen.elapsed().as_millis()
-                    }));
-                }
+                let nodes = state.registry.list_nodes(now_ms());
                 let text = serde_json::to_string_pretty(&nodes)
                     .unwrap_or_else(|error| format!("{{\"error\":\"{}\"}}", error));
                 let _ = reply.send(Ok(text));
             }
             NodeRegistryMessage::NodeInfo { node_id, reply } => {
-                if node_id == "local" {
-                    let text = serde_json::to_string_pretty(&json!({
-                        "node_id": "local",
-                        "display_name": "Local tmux node",
-                        "status": if state.local_enabled { "ready" } else { "disabled" },
-                        "last_seen_ms_ago": 0,
-                    }))
-                    .unwrap_or_else(|error| format!("{{\"error\":\"{}\"}}", error));
-                    let _ = reply.send(Ok(text));
-                    return Ok(());
-                }
-                match state.nodes.get(&node_id) {
-                    Some(node) => {
-                        let text = serde_json::to_string_pretty(&json!({
-                            "node_id": node.descriptor.node_id,
-                            "display_name": node.descriptor.display_name,
-                            "status": format!("{:?}", node.status),
-                            "last_seen_ms_ago": node.last_seen.elapsed().as_millis()
-                        }))
-                        .unwrap_or_else(|error| format!("{{\"error\":\"{}\"}}", error));
+                match state.registry.node_info(&node_id, now_ms()) {
+                    Ok(summary) => {
+                        let text = serde_json::to_string_pretty(&summary)
+                            .unwrap_or_else(|error| format!("{{\"error\":\"{}\"}}", error));
                         let _ = reply.send(Ok(text));
                     }
-                    None => {
-                        let _ = reply.send(Err(format!("Node '{}' not found", node_id)));
+                    Err(error) => {
+                        let _ = reply.send(Err(error));
                     }
                 }
             }
@@ -1450,6 +1394,78 @@ impl TmuxMcpServer {
             reply,
         })
         .await
+    }
+
+    async fn create_coding_session_with_command(
+        &self,
+        node: &str,
+        session: &str,
+        cmd: &str,
+        cwd: Option<&str>,
+        profile: &CliProfile,
+    ) -> Result<String, String> {
+        match profile_launch_strategy(profile)? {
+            "direct" => {
+                self.create_session_with_command(node, session, cmd, cwd)
+                    .await
+            }
+            "shell_send" => {
+                let exists = if node == "local" {
+                    session_exists(session)
+                } else {
+                    self.node_session_exists(node, session).await
+                };
+                if exists {
+                    return Ok(format!("Session '{}' already exists", session));
+                }
+
+                self.create_session_with_command(node, session, "bash", cwd)
+                    .await?;
+
+                tokio::time::sleep(Duration::from_millis(1000)).await;
+
+                if node != "local" {
+                    self.remote_tmux(
+                        node,
+                        vec![
+                            "send-keys".into(),
+                            "-l".into(),
+                            "-t".into(),
+                            session.into(),
+                            cmd.into(),
+                        ],
+                        Duration::from_secs(20),
+                    )
+                    .await?;
+                    tokio::time::sleep(Duration::from_millis(200)).await;
+                    self.remote_tmux(
+                        node,
+                        vec![
+                            "send-keys".into(),
+                            "-t".into(),
+                            session.into(),
+                            "Enter".into(),
+                        ],
+                        Duration::from_secs(20),
+                    )
+                    .await?;
+                } else {
+                    self.local_node_call(|reply| LocalNodeMessage::SendInput {
+                        session: session.to_owned(),
+                        text: cmd.to_owned(),
+                        enter: true,
+                        reply,
+                    })
+                    .await?;
+                }
+
+                Ok(format!(
+                    "Created session '{}' with shell-send command '{}'",
+                    session, cmd
+                ))
+            }
+            _ => unreachable!("profile_launch_strategy validates supported values"),
+        }
     }
 
     async fn wait_coding_session_ready(
@@ -2099,6 +2115,7 @@ impl ServerHandler for TmuxMcpServer {
                                 "name": profile.name,
                                 "cmd": profile.cmd,
                                 "permission_bypass_cmd": profile.permission_bypass_cmd,
+                                "launch_strategy": profile.launch_strategy,
                                 "prompt_indicator": profile.prompt_indicator,
                                 "busy_indicators": profile.busy_indicators,
                                 "startup_dismiss": profile.startup_dismiss,
@@ -2908,7 +2925,13 @@ impl ServerHandler for TmuxMcpServer {
                     return Ok(Self::error_result(error));
                 }
                 match self
-                    .create_session_with_command(node, session_name, cmd, cwd_text.as_deref())
+                    .create_coding_session_with_command(
+                        node,
+                        session_name,
+                        cmd,
+                        cwd_text.as_deref(),
+                        &profile,
+                    )
                     .await
                 {
                     Ok(_) => {
@@ -3591,6 +3614,21 @@ async fn auth_middleware(
     next.run(request).await
 }
 
+async fn wire_auth_middleware(
+    request: Request<Body>,
+    next: Next,
+    token: Option<Arc<String>>,
+    allow_unauthenticated: bool,
+) -> Response {
+    if token.is_none() && !allow_unauthenticated {
+        return Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .body(Body::from("Unauthorized"))
+            .unwrap();
+    }
+    auth_middleware(request, next, token).await
+}
+
 struct NodeRegistryConnectService {
     registry: ActorRef<NodeRegistryMessage>,
 }
@@ -3703,11 +3741,13 @@ impl MmuxNodeRegistryService for NodeRegistryConnectService {
     }
 }
 
-async fn run_mcp_http_server(
+pub(crate) async fn run_mcp_http_server(
     bind: SocketAddr,
     profiles: ProfileRegistry,
     policy: ControllerPolicy,
-    token: Option<String>,
+    mcp_token: Option<String>,
+    wire_token: Option<String>,
+    allow_unauthenticated_node_wire: bool,
     enable_local_node: bool,
 ) -> Result<(), String> {
     let local_node = if enable_local_node {
@@ -3746,10 +3786,11 @@ async fn run_mcp_http_server(
                 .disable_allowed_hosts(),
         );
 
-    let token_arc = token.map(Arc::new);
-    let has_token = token_arc.is_some();
-    let api_token_arc = token_arc.clone();
-    let wire_token_arc = token_arc.clone();
+    let mcp_token_arc = mcp_token.map(Arc::new);
+    let wire_token_arc = wire_token.map(Arc::new);
+    let has_mcp_token = mcp_token_arc.is_some();
+    let has_wire_token = wire_token_arc.is_some();
+    let api_token_arc = mcp_token_arc.clone();
     let cors = CorsLayer::new()
         .allow_origin(Any)
         .allow_methods(Any)
@@ -3775,7 +3816,7 @@ async fn run_mcp_http_server(
         .layer(DefaultBodyLimit::max(request_body_limit))
         .layer(middleware::from_fn(move |req, next| {
             let t = wire_token_arc.clone();
-            auth_middleware(req, next, t)
+            wire_auth_middleware(req, next, t, allow_unauthenticated_node_wire)
         }))
         .layer(middleware::from_fn(security_middleware));
 
@@ -3787,10 +3828,23 @@ async fn run_mcp_http_server(
     if let Some(root) = policy.workspace_root.as_ref() {
         println!("  Workspace root: {}", root.display());
     }
-    if has_token {
-        println!("  Bearer token authentication enabled");
+    if has_mcp_token {
+        println!("  MCP bearer token authentication enabled");
     } else {
-        println!("  Warning: no bearer token set. Use --token to prevent unauthorized access.");
+        println!(
+            "  Warning: no MCP bearer token set. Use --mcp-token to prevent unauthorized MCP access."
+        );
+    }
+    if has_wire_token {
+        println!("  Node wire bearer token authentication enabled");
+    } else if allow_unauthenticated_node_wire {
+        println!(
+            "  Warning: node wire RPC is unauthenticated. Use only for development or trusted private tunnels."
+        );
+    } else {
+        println!(
+            "  Node wire RPC requires --wire-token; unauthenticated node requests will be rejected."
+        );
     }
 
     axum::serve(listener, router)
@@ -3811,6 +3865,15 @@ fn loopback_allowed_origins() -> [&'static str; 6] {
 
 fn is_loopback_bind(bind: SocketAddr) -> bool {
     bind.ip().is_loopback()
+}
+
+fn now_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .try_into()
+        .unwrap_or(u64::MAX)
 }
 
 fn nearest_existing_ancestor(path: &Path) -> PathBuf {
@@ -3837,15 +3900,21 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     diff == 0
 }
 
-fn resolve_token(cli: &Cli, policy: &ControllerPolicy) -> Result<Option<String>, String> {
-    if let Some(token) = cli.token.as_ref() {
+fn resolve_token_value(
+    token_flag: &str,
+    token: Option<&String>,
+    token_file: Option<&String>,
+    token_env: &str,
+    policy: &ControllerPolicy,
+) -> Result<Option<String>, String> {
+    if let Some(token) = token {
         if token.is_empty() {
-            return Err("--token must not be empty".into());
+            return Err(format!("{} must not be empty", token_flag));
         }
         return Ok(Some(token.clone()));
     }
 
-    if let Some(path) = cli.token_file.as_ref() {
+    if let Some(path) = token_file {
         let token_path = Path::new(path);
         let real_token_path = std::fs::canonicalize(token_path)
             .map_err(|e| format!("failed to canonicalize token file '{}': {}", path, e))?;
@@ -3868,11 +3937,11 @@ fn resolve_token(cli: &Cli, policy: &ControllerPolicy) -> Result<Option<String>,
         return Ok(Some(token));
     }
 
-    match std::env::var(&cli.token_env) {
+    match std::env::var(token_env) {
         Ok(token) if !token.is_empty() => Ok(Some(token)),
-        Ok(_) => Err(format!("{} is set but empty", cli.token_env)),
+        Ok(_) => Err(format!("{} is set but empty", token_env)),
         Err(std::env::VarError::NotPresent) => Ok(None),
-        Err(e) => Err(format!("failed to read {}: {}", cli.token_env, e)),
+        Err(e) => Err(format!("failed to read {}: {}", token_env, e)),
     }
 }
 
@@ -3893,23 +3962,23 @@ fn warn_if_token_file_permissions_are_loose(path: &Path) {
 #[cfg(not(unix))]
 fn warn_if_token_file_permissions_are_loose(_path: &Path) {}
 
-fn validate_remote_bind_auth(
+fn validate_remote_mcp_bind_auth(
     bind: SocketAddr,
-    token: Option<&String>,
-    allow_remote_without_token: bool,
+    mcp_token: Option<&String>,
+    allow_remote_without_mcp_token: bool,
 ) -> Result<(), String> {
-    if is_loopback_bind(bind) || token.is_some() {
+    if is_loopback_bind(bind) || mcp_token.is_some() {
         return Ok(());
     }
-    if allow_remote_without_token {
+    if allow_remote_without_mcp_token {
         eprintln!(
-            "Warning: mmux is bound to {} without authentication. Only use this behind localhost-only port forwarding or another trusted network boundary.",
+            "Warning: mmux MCP is bound to {} without authentication. Only use this behind localhost-only port forwarding or another trusted network boundary.",
             bind
         );
         return Ok(());
     }
     Err(format!(
-        "refusing to bind unauthenticated mmux to {}; set --token, --token-file, or MMUX_TOKEN, or deliberately use --allow-remote-without-token behind a trusted network boundary",
+        "refusing to bind unauthenticated MCP to {}; set --mcp-token, --mcp-token-file, or MMUX_MCP_TOKEN, or deliberately use --allow-remote-without-mcp-token behind a trusted network boundary",
         bind
     ))
 }
@@ -3932,8 +4001,26 @@ where
         eprintln!("Controller policy error: {}", e);
         std::process::exit(1);
     });
-    let token = resolve_token(&cli, &policy).unwrap_or_else(|e| {
-        eprintln!("Token error: {}", e);
+    let mcp_token = resolve_token_value(
+        "--mcp-token",
+        cli.mcp_token.as_ref(),
+        cli.mcp_token_file.as_ref(),
+        &cli.mcp_token_env,
+        &policy,
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("MCP token error: {}", e);
+        std::process::exit(1);
+    });
+    let wire_token = resolve_token_value(
+        "--wire-token",
+        cli.wire_token.as_ref(),
+        cli.wire_token_file.as_ref(),
+        &cli.wire_token_env,
+        &policy,
+    )
+    .unwrap_or_else(|e| {
+        eprintln!("Wire token error: {}", e);
         std::process::exit(1);
     });
 
@@ -3960,21 +4047,23 @@ where
     let bind: SocketAddr = format!("{}:{}", cli.host, cli.port)
         .parse()
         .unwrap_or_else(|_| "127.0.0.1:3000".parse().unwrap());
-    validate_remote_bind_auth(bind, token.as_ref(), cli.allow_remote_without_token).unwrap_or_else(
-        |e| {
+    validate_remote_mcp_bind_auth(bind, mcp_token.as_ref(), cli.allow_remote_without_mcp_token)
+        .unwrap_or_else(|e| {
             eprintln!("Controller policy error: {}", e);
             std::process::exit(1);
-        },
-    );
+        });
 
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
-    if let Err(e) = rt.block_on(run_mcp_http_server(
+    let local_runtime = runtime::LocalRuntime::new(runtime::LocalRuntimeConfig {
         bind,
         profiles,
         policy,
-        token,
-        cli.enable_local_node,
-    )) {
+        mcp_token,
+        wire_token,
+        allow_unauthenticated_node_wire: cli.allow_unauthenticated_node_wire,
+        enable_local_node: cli.enable_local_node,
+    });
+    if let Err(e) = rt.block_on(runtime::ControllerRuntime::run(local_runtime)) {
         eprintln!("MCP server error: {}", e);
         std::process::exit(1);
     }
@@ -4005,11 +4094,15 @@ mod tests {
             config: None,
             host: "127.0.0.1".into(),
             port: 3000,
-            token: None,
-            token_file: None,
-            token_env: "MMUX_TOKEN".into(),
+            mcp_token: None,
+            mcp_token_file: None,
+            mcp_token_env: "MMUX_MCP_TOKEN".into(),
+            wire_token: None,
+            wire_token_file: None,
+            wire_token_env: "MMUX_WIRE_TOKEN".into(),
             workspace_root: None,
-            allow_remote_without_token: false,
+            allow_remote_without_mcp_token: false,
+            allow_unauthenticated_node_wire: false,
             max_read_bytes: 4 * 1024 * 1024,
             max_write_bytes: 4 * 1024 * 1024,
             max_timeout_seconds: 60.0,
@@ -4078,6 +4171,24 @@ triggers = ["Starting MCP servers"]
             profile_launch_command(&profile, true).unwrap(),
             "test-cli --dangerously-bypass-permissions"
         );
+    }
+
+    #[test]
+    fn test_profile_launch_strategy_defaults_and_validates() {
+        let mut profile = CliProfile {
+            name: "test".into(),
+            ..CliProfile::default()
+        };
+
+        assert_eq!(profile_launch_strategy(&profile).unwrap(), "direct");
+
+        profile.launch_strategy = Some("shell_send".into());
+        assert_eq!(profile_launch_strategy(&profile).unwrap(), "shell_send");
+
+        profile.launch_strategy = Some("unknown".into());
+        assert!(profile_launch_strategy(&profile)
+            .unwrap_err()
+            .contains("unsupported launch_strategy"));
     }
 
     #[test]
@@ -4163,26 +4274,43 @@ triggers = ["Starting MCP servers"]
     }
 
     #[test]
-    fn test_validate_remote_bind_auth_rejects_remote_without_auth_unless_allowed() {
+    fn test_validate_remote_mcp_bind_auth_rejects_remote_without_auth_unless_allowed() {
         let bind: SocketAddr = "203.0.113.10:3000".parse().unwrap();
 
-        assert!(validate_remote_bind_auth(bind, None, false).is_err());
-        assert!(validate_remote_bind_auth(bind, None, true).is_ok());
-        assert!(validate_remote_bind_auth(bind, Some(&"secret".to_owned()), false).is_ok());
+        assert!(validate_remote_mcp_bind_auth(bind, None, false).is_err());
+        assert!(validate_remote_mcp_bind_auth(bind, None, true).is_ok());
+        assert!(validate_remote_mcp_bind_auth(bind, Some(&"secret".to_owned()), false).is_ok());
     }
 
     #[test]
-    fn test_resolve_token_reads_configured_env_and_rejects_empty() {
+    fn test_resolve_token_value_reads_configured_env_and_rejects_empty() {
         let mut cli = test_cli();
-        cli.token_env = format!("MMUX_TEST_TOKEN_{}", std::process::id());
+        cli.mcp_token_env = format!("MMUX_TEST_TOKEN_{}", std::process::id());
         let policy = ControllerPolicy::new(&cli).unwrap();
-        std::env::set_var(&cli.token_env, "abc123");
-        assert_eq!(resolve_token(&cli, &policy).unwrap(), Some("abc123".into()));
+        std::env::set_var(&cli.mcp_token_env, "abc123");
+        assert_eq!(
+            resolve_token_value(
+                "--mcp-token",
+                cli.mcp_token.as_ref(),
+                cli.mcp_token_file.as_ref(),
+                &cli.mcp_token_env,
+                &policy
+            )
+            .unwrap(),
+            Some("abc123".into())
+        );
 
-        std::env::set_var(&cli.token_env, "");
-        let error = resolve_token(&cli, &policy).unwrap_err();
+        std::env::set_var(&cli.mcp_token_env, "");
+        let error = resolve_token_value(
+            "--mcp-token",
+            cli.mcp_token.as_ref(),
+            cli.mcp_token_file.as_ref(),
+            &cli.mcp_token_env,
+            &policy,
+        )
+        .unwrap_err();
         assert!(error.contains("is set but empty"));
-        std::env::remove_var(&cli.token_env);
+        std::env::remove_var(&cli.mcp_token_env);
     }
 
     #[test]

@@ -12,6 +12,7 @@ clap = { workspace = true }
 connectrpc = { workspace = true }
 mime = { workspace = true }
 mmux-node = { path = "../mmux-node" }
+mmux-controller-core = { path = "../mmux-controller-core" }
 mmux-shared = { path = "../mmux-shared" }
 mmux-wire = { path = "../mmux-wire" }
 ractor = { workspace = true }

@@ -94,7 +94,7 @@ types:
 curl -X POST "http://<controller-host>:3000/mcp" \
   -H "Accept: application/json, text/event-stream" \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $MMUX_TOKEN" \
+  -H "Authorization: Bearer $MMUX_MCP_TOKEN" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 
@@ -103,8 +103,9 @@ curl -X POST "http://<controller-host>:3000/mcp" \
 Start a controller that remote nodes can reach:
 
 ```bash
-export MMUX_TOKEN=<token>
-make run-controller CONTROLLER_ARGS="--host <bind-host> --port 3000 --token $MMUX_TOKEN"
+export MMUX_MCP_TOKEN=<mcp-token>
+export MMUX_WIRE_TOKEN=<wire-token>
+make run-controller CONTROLLER_ARGS="--host <bind-host> --port 3000 --mcp-token $MMUX_MCP_TOKEN --wire-token $MMUX_WIRE_TOKEN"
 ```
 
 In another shell, prepare the Microsandbox guest once from a stock image:
@@ -118,7 +119,7 @@ make bundle-export SANDBOX=mmux-node SNAPSHOT_NAME=mmux-node-seed BUNDLE=.artifa
 Then launch the prepared bundle as a runtime node:
 
 ```bash
-export MMUX_TOKEN=<same-token>
+export MMUX_WIRE_TOKEN=<same-wire-token>
 make bundle-launch BUNDLE=.artifacts/mmux-node-seed.tar.zst NODE_CONFIG=mmux.toml
 ```
 
@@ -126,12 +127,12 @@ The Microsandbox example uses `http://host.microsandbox.internal:3000` by
 default. That is the Microsandbox-provided host alias for reaching the laptop
 or host machine from inside the sandbox. When `CONTROLLER_URL` targets that
 alias, the launcher automatically allows exactly that host TCP port for node
-registration and command polling. The controller token secret is scoped to
+registration and command polling. The wire token secret is scoped to
 `allowed_host = "host.microsandbox.internal"`.
 
 `microsandbox-setup.toml` is for first-time preparation only. `make prepare`
 uses an open setup egress policy by default so apt/curl/npm and tool installers
-can run, but it does not inject the controller token and does not start
+can run, but it does not inject the wire token and does not start
 `mmux node`. Export a snapshot after setup, then relaunch that snapshot with
 `mmux.toml` for the controller-only runtime policy.
 
@@ -165,9 +166,13 @@ Important controller flags:
 | `--node-config` | `mmux.toml` in the current directory, then built-ins | Loads coder profile overlays. |
 | `--host` | loopback interface | Bind host for the HTTP server. |
 | `--port` | `3000` | Bind port. |
-| `--token` | none | Bearer token for MCP and wire requests. |
-| `--token-file` | none | Reads the bearer token from a file. |
-| `--token-env` | `MMUX_TOKEN` | Env var used when token flags are omitted. |
+| `--mcp-token` | `MMUX_MCP_TOKEN` | Bearer token for public MCP requests. |
+| `--mcp-token-file` | none | Reads the MCP bearer token from a file. |
+| `--mcp-token-env` | `MMUX_MCP_TOKEN` | Env var used when MCP token flags are omitted. |
+| `--wire-token` | `MMUX_WIRE_TOKEN` | Bearer token for node wire RPC requests. |
+| `--wire-token-file` | none | Reads the node wire bearer token from a file. |
+| `--wire-token-env` | `MMUX_WIRE_TOKEN` | Env var used when wire token flags are omitted. |
+| `--allow-unauthenticated-node-wire` | false | Allows node wire RPC without `--wire-token`; use only for development or trusted private tunnels. |
 | `--workspace-root` | none | Optional root used to confine local `read_file` / `save_file` path APIs. |
 | `--enable-local-node` | false | Starts the built-in local tmux node in-process. |
 
@@ -202,8 +207,8 @@ Pass entrypoint flags through the target variables:
 
 ```bash
 make run-local LOCAL_ARGS="--port 3001"
-make run-controller CONTROLLER_ARGS="--token $MMUX_TOKEN"
-make run-node NODE_ARGS="--controller-url http://<controller-host>:3000"
+make run-controller CONTROLLER_ARGS="--mcp-token $MMUX_MCP_TOKEN --wire-token $MMUX_WIRE_TOKEN"
+make run-node NODE_ARGS="--controller-url http://<controller-host>:3000 --controller-token $MMUX_WIRE_TOKEN"
 ```
 
 Release publishing uses git tags. The release version comes from
@@ -213,6 +218,34 @@ with `version.workspace = true`. Bump that version with `make update-patch`,
 `main`, then run `make release-tag` from a clean `main` checkout. The
 `v<version>` tag triggers GitHub Actions to build and attach platform archives
 used by `scripts/install.sh`.
+
+### Publish to npm from this checkout
+
+The `npm/mmux` package provides an `npx`/`yarn dlx` wrapper around the native
+`mmux` binary. To prepare and publish the package to the public npm registry
+from this workstation:
+
+```bash
+make npm-pack-dry-run
+npm login
+make npm-publish
+```
+
+`make npm-package` builds the current platform, writes
+`npm/mmux/artifacts/mmux-<platform>.tar.gz`, and syncs the npm package version
+from `[workspace.package].version`. On Linux, the local package includes only
+the `mmux` binary by default; set `MMUX_NPM_INCLUDE_MICROSANDBOX=1` to also
+build and include `mmux-microsandbox-node`.
+
+`make npm-pack` creates a `.tgz` without publishing. Set `NPM_CACHE=/path/to/cache`
+if npm should use a cache directory other than `/tmp/mmux-npm-cache`.
+
+The published package can be run with:
+
+```bash
+npx @mmux/mmux controller --enable-local-node
+yarn dlx @mmux/mmux controller --enable-local-node
+```
 
 ## Coder Profiles
 
@@ -246,6 +279,11 @@ Backend-agnostic override example:
 cmd = "codex --model gpt-5"
 permission_bypass_cmd = "codex --model gpt-5 --dangerously-bypass-approvals-and-sandbox"
 ```
+
+Most profiles use the default direct launch strategy, which starts the CLI as
+the tmux session command. TUIs that need to be started from an interactive shell
+can set `launch_strategy = "shell_send"`; mmux then starts `bash` and sends
+`cmd` followed by Enter before waiting for the prompt marker.
 
 `permission_bypass_cmd` is optional and only used when `start_coding_session`
 receives `bypass_permissions = true`. Normal sessions always use `cmd`. This
@@ -360,13 +398,16 @@ is equivalent to giving that client shell access as the server user. The local
 backend is not sandboxed. Use trusted clients only, or run work through a
 sandboxed backend such as Microsandbox.
 
-The default bind host is loopback-only. A non-loopback unauthenticated bind is
-rejected unless you deliberately pass `--allow-remote-without-token`. For any
-non-local exposure, use a bearer token:
+The default bind host is loopback-only. A non-loopback MCP bind without a token
+is rejected unless you deliberately pass `--allow-remote-without-mcp-token`.
+Node wire RPC is rejected unless `--wire-token` is set or you deliberately pass
+`--allow-unauthenticated-node-wire`. For any non-local exposure, use separate
+MCP and wire bearer tokens:
 
 ```bash
-export MMUX_TOKEN="$(openssl rand -hex 32)"
-make run-controller CONTROLLER_ARGS="--host <bind-host> --token $MMUX_TOKEN"
+export MMUX_MCP_TOKEN="$(openssl rand -hex 32)"
+export MMUX_WIRE_TOKEN="$(openssl rand -hex 32)"
+make run-controller CONTROLLER_ARGS="--host <bind-host> --mcp-token $MMUX_MCP_TOKEN --wire-token $MMUX_WIRE_TOKEN"
 ```
 
 Authenticated requests must include:

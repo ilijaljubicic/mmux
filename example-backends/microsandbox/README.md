@@ -64,7 +64,7 @@ Choose one launch path:
 ```bash
 # First-time preparation from a stock image. make prepare uses open setup
 # egress by default so apt/curl/npm and tool installers can run. It does not
-# start mmux node and does not need the controller token.
+# start mmux node and does not need the node wire token.
 cd /mnt/Radni/aitools/mmux/example-backends/microsandbox
 make prepare NODE_CONFIG="microsandbox-setup.toml"
 make bundle-export SANDBOX=mmux-node SNAPSHOT_NAME=mmux-node-seed BUNDLE=.artifacts/mmux-node-seed.tar.zst
@@ -73,14 +73,14 @@ make bundle-export SANDBOX=mmux-node SNAPSHOT_NAME=mmux-node-seed BUNDLE=.artifa
 ```bash
 # Runtime from the prepared bundle. This is the step that starts mmux node and
 # registers it with the controller.
-export MMUX_TOKEN="...controller bearer token..."
+export MMUX_WIRE_TOKEN="...node wire bearer token..."
 make bundle-launch BUNDLE=.artifacts/mmux-node-seed.tar.zst NODE_CONFIG="mmux.toml"
 ```
 
 ```bash
 # Runtime from a prepared Docker/OCI image. The image already contains tmux,
 # mmux, and the coder CLIs, so launch does not open installer network access.
-export MMUX_TOKEN="...controller bearer token..."
+export MMUX_WIRE_TOKEN="...node wire bearer token..."
 cd /mnt/Radni/aitools/mmux/example-backends/microsandbox
 # Edit [sandbox.runtime].image in mmux.toml.
 make launch NODE_CONFIG="mmux.toml"
@@ -90,7 +90,7 @@ The default `CONTROLLER_URL` is
 `http://host.microsandbox.internal:3000`, the Microsandbox-provided alias for
 reaching the host machine from inside the sandbox. When `CONTROLLER_URL` uses
 that alias, the launcher automatically allows exactly the URL's host TCP port
-for controller communication. The controller token secret is scoped to
+for controller communication. The node wire token secret is scoped to
 `allowed_host = "host.microsandbox.internal"`.
 
 The runtime `mmux.toml` denies egress and ingress by default. First-time release
@@ -122,6 +122,21 @@ To import an exported bundle and launch from that imported snapshot in one go:
 ```bash
 make bundle-launch BUNDLE=.artifacts/mmux-node-seed.tar.zst NODE_CONFIG="mmux.toml"
 ```
+
+## Coder CLI auth
+
+For coder CLIs that support device-flow authentication, authenticate once
+inside the prepared sandbox:
+
+```bash
+msb ssh mmux-node
+# inside the guest, run the coder CLI and choose device-flow auth
+codex
+```
+
+The auth files are stored in the running sandbox filesystem. Later
+mmux-managed coder sessions in that sandbox use the saved auth state until the
+CLI's token expires.
 
 ## Node config
 
@@ -155,10 +170,10 @@ paths for `copy_file`, `copy_dir`, `scripts_dir`, and `assets_dir` are resolved
 relative to the directory that contains the selected config file.
 
 Secrets also live in `mmux.toml`. Use `[[sandbox.secrets]]` entries with a
-guest env name, a host env reference like `host.MMUX_TOKEN`, and an allowed
+guest env name, a host env reference like `host.MMUX_WIRE_TOKEN`, and an allowed
 host. The Rust backend resolves the host env var and injects the secret through
-the Microsandbox SDK. The controller token is injected this way into
-`MMUX_CONTROLLER_TOKEN`. For the example launch, export `MMUX_TOKEN` on the
+the Microsandbox SDK. The node wire token is injected this way into
+`MMUX_CONTROLLER_TOKEN`. For the example launch, export `MMUX_WIRE_TOKEN` on the
 host before running `make launch`; `allowed_host` must match the hostname used
 in `CONTROLLER_URL`.
 
