@@ -49,11 +49,11 @@ matches the pinned connect-rust revision in `Cargo.toml`.
 
 ### Run from npm
 
-For a local loopback-only MCP server with the built-in local tmux backend:
+For a local loopback-only MCP server with the built-in local tmux backend
+(least secure version; run only in trusted environments):
 
 ```bash
-env -u MMUX_MCP_TOKEN -u MMUX_WIRE_TOKEN \
-  npx --yes @mmux/mmux controller --enable-local-node
+npx --yes @mmux/mmux controller --enable-local-node --allow-remote-without-mcp-token
 ```
 
 The MCP endpoint is:
@@ -74,13 +74,27 @@ Register it with Claude Code:
 claude mcp add --transport http mmux http://127.0.0.1:3000/mcp
 ```
 
-For authenticated local setup:
+For authenticated local setup, start mmux with an MCP bearer token and register
+the same token with each MCP client:
 
 ```bash
 export MMUX_MCP_TOKEN="$(openssl rand -hex 32)"
 npx --yes @mmux/mmux controller --enable-local-node --mcp-token-env MMUX_MCP_TOKEN
-codex mcp add mmux --url http://127.0.0.1:3000/mcp --bearer-token-env-var MMUX_MCP_TOKEN
-claude mcp add --transport http mmux http://127.0.0.1:3000/mcp --header "Authorization: Bearer $MMUX_MCP_TOKEN"
+```
+
+In another shell with `MMUX_MCP_TOKEN` set, register Codex:
+
+```bash
+codex mcp add mmux \
+  --url http://127.0.0.1:3000/mcp \
+  --bearer-token-env-var MMUX_MCP_TOKEN
+```
+
+Register Claude Code by adding the bearer header:
+
+```bash
+claude mcp add --transport http mmux http://127.0.0.1:3000/mcp \
+  --header "Authorization: Bearer $MMUX_MCP_TOKEN"
 ```
 
 For local Microsandbox mode, prepare the sandbox with `msb` and run the same
@@ -90,7 +104,7 @@ npm package with the embedded Microsandbox node:
 cd example-backends/microsandbox
 make sandbox-prepare
 cd ../..
-npx --yes @mmux/mmux controller --enable-microsandbox-node --sandbox-name mmux-node
+npx --yes @mmux/mmux controller --enable-microsandbox-node --sandbox-name mmux-node --allow-remote-without-mcp-token
 ```
 
 ### Install native binary
@@ -141,7 +155,6 @@ types:
 curl -X POST "http://<controller-host>:3000/mcp" \
   -H "Accept: application/json, text/event-stream" \
   -H "Content-Type: application/json" \
-  -H "Authorization: Bearer $MMUX_MCP_TOKEN" \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
 

@@ -10,10 +10,12 @@ names another port.
 -H 'Content-Type: application/json'
 ```
 
-If auth is enabled, add:
+If MCP bearer auth is enabled, the server reads its expected token from
+`--mcp-token`, `--mcp-token-file`, or `MMUX_MCP_TOKEN`. HTTP clients must still
+send that value explicitly:
 
 ```bash
--H "Authorization: Bearer $MMUX_TOKEN"
+-H "Authorization: Bearer $MMUX_MCP_TOKEN"
 ```
 
 Never print token values.
