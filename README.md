@@ -10,10 +10,13 @@ The core idea is simple:
 - `mmux controller` exposes the MCP HTTP endpoint and the controller/node wire
   endpoint.
 - `mmux node` owns tmux and filesystem access in the environment where it runs.
-- Node-aware MCP tools accept a `node` argument. Omitted `node` means the
-  reserved `local` target, which is available only when the controller was
-  started with `--enable-local-node`. To target a remote node, pass the node id
-  registered by `mmux node` as the tool's `node` value.
+- mmux can run as one process for local convenience, or as a distributed
+  controller plus one or more node processes. In single-process mode, the
+  controller embeds a node backend and exposes it as the reserved `local` node.
+  In distributed mode, each `mmux node` registers with the controller over the
+  node wire RPC API.
+- Node-aware MCP tools accept a `node` argument. Omitted `node` means `local`.
+  To target a distributed node, pass the node id registered by `mmux node`.
 - Built-in coder profiles describe how to launch and drive CLIs such as
   `codex`, `opencode`, `kimi`, and `claude`.
 
@@ -66,6 +69,9 @@ Then run a local controller:
 mmux controller --enable-local-node
 ```
 
+That is the single-binary local mode: the controller and local tmux backend run
+in one process.
+
 ### Local backend
 
 From a repo checkout, the equivalent development command is:
@@ -99,6 +105,27 @@ curl -X POST "http://<controller-host>:3000/mcp" \
 ```
 
 ### Microsandbox backend
+
+For local development with an existing Microsandbox, mmux can also run in
+single-binary mode:
+
+```bash
+cd example-backends/microsandbox
+make sandbox-prepare
+cd ../..
+mmux controller --enable-microsandbox-node --sandbox-name mmux-node
+```
+
+This embeds a host-side Microsandbox connector in the controller process and
+exposes it as node `local`. mmux still does not create or own Microsandbox
+lifecycle; `msb` owns create, start, stop, snapshot, import, and export.
+
+Embedded modes do not need a node wire token for the embedded node. Configure
+`--wire-token`, `--wire-mtls`, or `--allow-unauthenticated-node-wire` only when
+you also want distributed `mmux node` processes to register with the same
+controller.
+
+Distributed mode keeps controller and node separate:
 
 Start a controller that remote nodes can reach:
 
@@ -153,6 +180,8 @@ Important controller flags:
 | `--allow-unauthenticated-node-wire` | false | Allows node wire RPC without `--wire-token`; use only for development or trusted private tunnels. |
 | `--workspace-root` | none | Optional root used to confine local `read_file` / `save_file` path APIs. |
 | `--enable-local-node` | false | Starts the built-in local tmux node in-process. |
+| `--enable-microsandbox-node` | false | Starts an embedded Microsandbox node in-process. Requires `--sandbox-name`. |
+| `--sandbox-name` | none | Existing Microsandbox sandbox name used with `--enable-microsandbox-node`. |
 
 Important node flags:
 

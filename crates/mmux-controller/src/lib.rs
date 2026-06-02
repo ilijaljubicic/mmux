@@ -204,6 +204,31 @@ struct Cli {
         help = "Start the built-in local tmux node inside the controller process."
     )]
     enable_local_node: bool,
+    #[arg(
+        long,
+        help = "Start an embedded Microsandbox node inside the controller process. Requires --sandbox-name."
+    )]
+    enable_microsandbox_node: bool,
+    #[arg(
+        long,
+        help = "Microsandbox sandbox name used with --enable-microsandbox-node."
+    )]
+    sandbox_name: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) enum EmbeddedNodeConfig {
+    Local,
+    Microsandbox { sandbox_name: String },
+}
+
+impl EmbeddedNodeConfig {
+    fn display_name(&self) -> &'static str {
+        match self {
+            Self::Local => "local tmux",
+            Self::Microsandbox { .. } => "Microsandbox",
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -348,183 +373,9 @@ impl ControllerPolicy {
     }
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Tmux operations
-// ═══════════════════════════════════════════════════════════════════════════════
-
-fn tmux(args: &[&str]) -> Result<String, String> {
-    mmux_node::tmux(args)
-}
-
 const SESSION_OBJECTIVE_OPTION: &str = "@mmux_objective";
 const SESSION_LIST_FORMAT: &str =
     "#{session_name}: #{session_windows} windows (#{session_attached} attached) objective=#{@mmux_objective}";
-
-fn session_exists(session: &str) -> bool {
-    mmux_node::session_exists(session)
-}
-
-async fn session_create(session: &str, command: &str, cwd: Option<&str>) -> Result<String, String> {
-    if session_exists(session) {
-        return Ok(format!("Session '{}' already exists", session));
-    }
-    let mut args = vec!["new-session", "-d", "-s", session];
-    if let Some(dir) = cwd {
-        args.push("-c");
-        args.push(dir);
-    }
-    args.push(command);
-    tmux(&args)?;
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    Ok(format!(
-        "Created session '{}' with command '{}'",
-        session, command
-    ))
-}
-
-fn session_kill(session: &str) -> Result<String, String> {
-    if !session_exists(session) {
-        return Ok(format!("Session '{}' not found", session));
-    }
-    tmux(&["kill-session", "-t", session])?;
-    Ok(format!("Killed session '{}'", session))
-}
-
-fn session_list() -> Result<String, String> {
-    match tmux(&["list-sessions", "-F", SESSION_LIST_FORMAT]) {
-        Ok(output) => Ok(output),
-        Err(_) => Ok("No tmux sessions running".into()),
-    }
-}
-
-fn set_session_objective(session: &str, objective: &str) -> Result<(), String> {
-    tmux(&[
-        "set-option",
-        "-t",
-        session,
-        SESSION_OBJECTIVE_OPTION,
-        objective,
-    ])?;
-    Ok(())
-}
-
-fn session_objective(session: &str) -> Option<String> {
-    tmux(&[
-        "show-options",
-        "-v",
-        "-t",
-        session,
-        SESSION_OBJECTIVE_OPTION,
-    ])
-    .ok()
-    .map(|value| value.trim().to_owned())
-    .filter(|value| !value.is_empty())
-}
-
-async fn session_send(session: &str, text: &str, enter: bool) -> Result<String, String> {
-    if !session_exists(session) {
-        return Err(format!("Session '{}' does not exist", session));
-    }
-    tmux(&["send-keys", "-l", "-t", session, text])?;
-    if enter {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        tmux(&["send-keys", "-t", session, "Enter"])?;
-    }
-    Ok(format!("Sent to {}: {}", session, text))
-}
-
-fn session_key(session: &str, key: &str) -> Result<String, String> {
-    if !session_exists(session) {
-        return Err(format!("Session '{}' does not exist", session));
-    }
-    tmux(&["send-keys", "-t", session, key])?;
-    Ok(format!("Sent key '{}' to {}", key, session))
-}
-
-fn session_capture(
-    session: &str,
-    lines: Option<usize>,
-    scrollback: bool,
-) -> Result<String, String> {
-    if !session_exists(session) {
-        return Err(format!("Session '{}' does not exist", session));
-    }
-    if scrollback {
-        tmux(&["capture-pane", "-t", session, "-p", "-S", "-"])
-    } else if let Some(n) = lines {
-        let s = format!("-{}", n);
-        tmux(&["capture-pane", "-t", session, "-p", "-S", &s])
-    } else {
-        tmux(&["capture-pane", "-t", session, "-p"])
-    }
-}
-
-async fn wait_for(
-    session: &str,
-    mode: &str,
-    sentinel: Option<&str>,
-    prompt: Option<&str>,
-    timeout: f64,
-    poll: f64,
-    stability: f64,
-) -> Result<String, String> {
-    if !session_exists(session) {
-        return Err(format!("Session '{}' does not exist", session));
-    }
-    let deadline = Instant::now() + Duration::from_secs_f64(timeout);
-    let poll_dur = Duration::from_secs_f64(poll);
-
-    match mode {
-        "sentinel" => {
-            let s = sentinel.ok_or("sentinel required for sentinel mode")?;
-            while Instant::now() < deadline {
-                let output = session_capture(session, Some(200), false)?;
-                if output.contains(s) {
-                    return Ok(format!("Sentinel '{}' found", s));
-                }
-                tokio::time::sleep(poll_dur).await;
-            }
-            Err(format!(
-                "Timeout after {}s waiting for sentinel '{}'",
-                timeout, s
-            ))
-        }
-        "prompt" => {
-            let p = prompt.ok_or("prompt required for prompt mode")?;
-            while Instant::now() < deadline {
-                let output = session_capture(session, Some(200), false)?;
-                if output.contains(p) {
-                    return Ok(format!("Prompt '{}' found", p));
-                }
-                tokio::time::sleep(poll_dur).await;
-            }
-            Err(format!(
-                "Timeout after {}s waiting for prompt '{}'",
-                timeout, p
-            ))
-        }
-        _ => {
-            // stable mode (default)
-            let stable_needed = (stability / poll).max(1.0) as usize;
-            let mut last_output = String::new();
-            let mut stable_count = 0;
-            while Instant::now() < deadline {
-                let output = session_capture(session, Some(200), false)?;
-                if output == last_output {
-                    stable_count += 1;
-                    if stable_count >= stable_needed {
-                        return Ok(format!("Output stable for {}s", stability));
-                    }
-                } else {
-                    stable_count = 0;
-                    last_output = output;
-                }
-                tokio::time::sleep(poll_dur).await;
-            }
-            Err(format!("Timeout after {}s", timeout))
-        }
-    }
-}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  File operations (read / save)
@@ -540,6 +391,7 @@ fn detect_mime_type(path: &Path, bytes: &[u8]) -> String {
     mmux_node::detect_mime_type(path, bytes)
 }
 
+#[cfg(test)]
 fn read_file_impl(
     path: &str,
     offset: Option<u64>,
@@ -548,6 +400,7 @@ fn read_file_impl(
     mmux_node::read_file_impl(path, offset, limit)
 }
 
+#[cfg(test)]
 fn save_file_impl(
     path: &str,
     content: &str,
@@ -592,46 +445,6 @@ fn profile_launch_strategy(profile: &CliProfile) -> Result<&str, String> {
     }
 }
 
-async fn session_exec(
-    session: &str,
-    command: &str,
-    cwd: Option<&str>,
-    timeout: f64,
-    max_lines: usize,
-) -> Result<String, String> {
-    if !session_exists(session) {
-        session_create(session, "bash", cwd).await?;
-    }
-    // Use a sentinel to isolate this command's output from scrollback history.
-    let sentinel = format!(
-        "__MMUX_{}__",
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos()
-    );
-    session_send(session, &format!("echo '{}'", sentinel), true).await?;
-    tokio::time::sleep(Duration::from_millis(200)).await;
-    session_send(session, command, true).await?;
-    wait_for(session, "stable", None, None, timeout, 0.5, 1.0).await?;
-    let output = session_capture(session, None, true)?; // full scrollback
-    let all_lines: Vec<&str> = output.lines().collect();
-    // Find the last occurrence of the sentinel output line
-    let mut sentinel_idx = None;
-    for (i, line) in all_lines.iter().enumerate() {
-        if line.trim() == sentinel {
-            sentinel_idx = Some(i);
-        }
-    }
-    let result_lines: Vec<&str> = if let Some(idx) = sentinel_idx {
-        all_lines.iter().skip(idx + 1).copied().collect()
-    } else {
-        let start = all_lines.len().saturating_sub(max_lines);
-        all_lines[start..].to_vec()
-    };
-    Ok(clean_exec_output(result_lines))
-}
-
 fn clean_exec_output(lines: Vec<&str>) -> String {
     let mut result = lines;
     // Skip the command line (first non-empty line after sentinel is the shell command)
@@ -656,89 +469,6 @@ fn clean_exec_output(lines: Vec<&str>) -> String {
         .rev()
         .collect();
     trimmed.join("\n")
-}
-
-async fn coding_send_with_profile(
-    session: &str,
-    prompt: &str,
-    profile: &CliProfile,
-) -> Result<String, String> {
-    if !session_exists(session) {
-        return Err(format!("Session '{}' does not exist", session));
-    }
-    let pane = session_first_pane(session)?;
-
-    // Dismiss startup noise if configured
-    if let Some(ref dismiss) = profile.startup_dismiss {
-        let buf = tmux(&["capture-pane", "-t", &pane, "-p"]).unwrap_or_default();
-        if dismiss.triggers.iter().any(|t| buf.contains(t)) {
-            tmux_send_key_sequence(&pane, &dismiss.key).map_err(|e| e.to_string())?;
-            tokio::time::sleep(Duration::from_millis(300)).await;
-        }
-    }
-
-    tmux(&["send-keys", "-l", "-t", &pane, prompt]).map_err(|e| e.to_string())?;
-    tokio::time::sleep(coding_prompt_submit_delay(prompt)).await;
-    tmux(&["send-keys", "-t", &pane, "Enter"]).map_err(|e| e.to_string())?;
-    Ok(format!(
-        "Sent to {} (profile: {}): {}",
-        session, profile.name, prompt
-    ))
-}
-
-async fn coding_wait_ready_with_profile(
-    session: &str,
-    timeout: u64,
-    profile: &CliProfile,
-) -> Result<String, String> {
-    if !session_exists(session) {
-        return Err(format!("Session '{}' does not exist", session));
-    }
-    let pane = session_first_pane(session)?;
-    let deadline = Instant::now() + Duration::from_secs(timeout);
-    loop {
-        let buf = tmux(&["capture-pane", "-t", &pane, "-p"]).unwrap_or_default();
-        if let Some(key) = startup_dismiss_key(&buf, profile) {
-            tmux_send_key_sequence(&pane, key)?;
-            tokio::time::sleep(Duration::from_millis(300)).await;
-            continue;
-        }
-        let has_prompt = buf.contains(&profile.prompt_indicator);
-        let busy = profile_is_busy(&buf, profile);
-        if has_prompt && !busy {
-            return Ok(format!("{} is ready (profile: {})", session, profile.name));
-        }
-        if Instant::now() > deadline {
-            return Err(format!(
-                "Timeout waiting for {} to be ready (profile: {})",
-                session, profile.name
-            ));
-        }
-        tokio::time::sleep(Duration::from_millis(500)).await;
-    }
-}
-
-fn coding_action_with_profile(
-    session: &str,
-    action: &str,
-    profile: &CliProfile,
-) -> Result<String, String> {
-    if !session_exists(session) {
-        return Err(format!("Session '{}' does not exist", session));
-    }
-    let pane = session_first_pane(session)?;
-    let keys = match action {
-        "approve" => &profile.approve_keys,
-        "reject" => &profile.reject_keys,
-        "cancel" => &profile.cancel_keys,
-        "escape" | "dismiss" => &profile.escape_keys,
-        other => return Err(format!("Unknown action: {}", other)),
-    };
-    tmux_send_key_sequence(&pane, keys)?;
-    Ok(format!(
-        "Sent action '{}' to {} (profile: {})",
-        action, session, profile.name
-    ))
 }
 
 const BUSY_SCAN_TRAILING_LINES: usize = 30;
@@ -790,12 +520,6 @@ fn key_sequence_parts(keys: &str) -> Vec<&str> {
     }
 }
 
-fn tmux_send_key_sequence(target: &str, keys: &str) -> Result<String, String> {
-    let mut args = vec!["send-keys", "-t", target];
-    args.extend(key_sequence_parts(keys));
-    tmux(&args)
-}
-
 fn coding_prompt_submit_delay(prompt: &str) -> Duration {
     let line_count = prompt.lines().count().saturating_sub(1) as u64;
     let char_count = prompt.chars().count() as u64;
@@ -807,85 +531,6 @@ fn remote_send_key_args(target: &str, keys: &str) -> Vec<String> {
     let mut args = vec!["send-keys".into(), "-t".into(), target.into()];
     args.extend(key_sequence_parts(keys).into_iter().map(ToOwned::to_owned));
     args
-}
-
-// ═══════════════════════════════════════════════════════════════════════════════
-//  Extended tmux operations for agents
-// ═══════════════════════════════════════════════════════════════════════════════
-
-fn session_info(session: &str) -> Result<String, String> {
-    if !session_exists(session) {
-        return Err(format!("Session '{}' does not exist", session));
-    }
-    let info = tmux(&[
-        "list-panes",
-        "-t", session,
-        "-F", "pane_id=#{pane_id} index=#{pane_index} width=#{pane_width} height=#{pane_height} command=#{pane_current_command} title=#{pane_title}",
-    ])?;
-    let windows = tmux(&[
-        "list-windows",
-        "-t",
-        session,
-        "-F",
-        "window_id=#{window_id} index=#{window_index} name=#{window_name} active=#{window_active}",
-    ])?;
-    let objective = session_objective(session)
-        .map(|value| format!("\nObjective: {}", value))
-        .unwrap_or_default();
-    Ok(format!(
-        "Session: {}{}\nPanes:\n{}\nWindows:\n{}",
-        session, objective, info, windows
-    ))
-}
-
-fn list_panes(session: &str) -> Result<String, String> {
-    if !session_exists(session) {
-        return Err(format!("Session '{}' does not exist", session));
-    }
-    tmux(&[
-        "list-panes",
-        "-t",
-        session,
-        "-F",
-        "#{pane_index}\t#{pane_width}x#{pane_height}\t#{pane_current_command}\t#{pane_title}",
-    ])
-}
-
-fn check_state(session: &str, profile: &CliProfile) -> Result<String, String> {
-    if !session_exists(session) {
-        return Err(format!("Session '{}' does not exist", session));
-    }
-    let pane = session_first_pane(session)?;
-    let buf = tmux(&["capture-pane", "-t", &pane, "-p"]).unwrap_or_default();
-    let has_prompt = buf.contains(&profile.prompt_indicator);
-    let busy = profile_is_busy(&buf, profile);
-    Ok(format!(
-        "{{\"session\":\"{}\",\"has_prompt\":{},\"busy\":{},\"profile\":\"{}\"}}",
-        session, has_prompt, busy, profile.name
-    ))
-}
-
-fn resize_pane(session: &str, width: Option<u32>, height: Option<u32>) -> Result<String, String> {
-    if !session_exists(session) {
-        return Err(format!("Session '{}' does not exist", session));
-    }
-    let pane = session_first_pane(session)?;
-    if let Some(w) = width {
-        tmux(&["resize-pane", "-t", &pane, "-x", &w.to_string()])?;
-    }
-    if let Some(h) = height {
-        tmux(&["resize-pane", "-t", &pane, "-y", &h.to_string()])?;
-    }
-    Ok(format!("Resized pane {}", pane))
-}
-
-fn session_first_pane(session: &str) -> Result<String, String> {
-    let panes = tmux(&["list-panes", "-t", session, "-F", "#{pane_id}"])?;
-    panes
-        .lines()
-        .find(|line| !line.trim().is_empty())
-        .map(|line| line.trim().to_string())
-        .ok_or_else(|| format!("Session '{}' has no panes", session))
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1025,6 +670,14 @@ impl Actor for NodeRegistryActor {
 struct LocalNodeActor;
 
 enum LocalNodeMessage {
+    Tmux {
+        args: Vec<String>,
+        reply: RpcReplyPort<Result<String, String>>,
+    },
+    SessionExists {
+        session: String,
+        reply: RpcReplyPort<Result<bool, String>>,
+    },
     CreateSession {
         session: String,
         command: String,
@@ -1124,41 +777,53 @@ enum LocalNodeMessage {
         height: Option<u32>,
         reply: RpcReplyPort<Result<String, String>>,
     },
+    SetObjective {
+        session: String,
+        objective: String,
+        reply: RpcReplyPort<Result<(), String>>,
+    },
 }
 
 impl Actor for LocalNodeActor {
     type Msg = LocalNodeMessage;
-    type State = ();
-    type Arguments = ();
+    type State = mmux_node::EmbeddedNodeBackend;
+    type Arguments = mmux_node::EmbeddedNodeBackend;
 
     async fn pre_start(
         &self,
         _myself: ActorRef<Self::Msg>,
-        _args: Self::Arguments,
+        args: Self::Arguments,
     ) -> Result<Self::State, ActorProcessingErr> {
-        Ok(())
+        Ok(args)
     }
 
     async fn handle(
         &self,
         _myself: ActorRef<Self::Msg>,
         message: Self::Msg,
-        _state: &mut Self::State,
+        state: &mut Self::State,
     ) -> Result<(), ActorProcessingErr> {
         match message {
+            LocalNodeMessage::Tmux { args, reply } => {
+                let _ = reply.send(embedded_tmux(state, args).await);
+            }
+            LocalNodeMessage::SessionExists { session, reply } => {
+                let _ = reply.send(Ok(embedded_session_exists(state, &session).await));
+            }
             LocalNodeMessage::CreateSession {
                 session,
                 command,
                 cwd,
                 reply,
             } => {
-                let _ = reply.send(session_create(&session, &command, cwd.as_deref()).await);
+                let _ = reply
+                    .send(embedded_session_create(state, &session, &command, cwd.as_deref()).await);
             }
             LocalNodeMessage::KillSession { session, reply } => {
-                let _ = reply.send(session_kill(&session));
+                let _ = reply.send(embedded_session_kill(state, &session).await);
             }
             LocalNodeMessage::ListSessions { reply } => {
-                let _ = reply.send(session_list());
+                let _ = reply.send(embedded_session_list(state).await);
             }
             LocalNodeMessage::SendInput {
                 session,
@@ -1166,14 +831,14 @@ impl Actor for LocalNodeActor {
                 enter,
                 reply,
             } => {
-                let _ = reply.send(session_send(&session, &text, enter).await);
+                let _ = reply.send(embedded_session_send(state, &session, &text, enter).await);
             }
             LocalNodeMessage::SendKey {
                 session,
                 key,
                 reply,
             } => {
-                let _ = reply.send(session_key(&session, &key));
+                let _ = reply.send(embedded_session_key(state, &session, &key).await);
             }
             LocalNodeMessage::CaptureOutput {
                 session,
@@ -1181,7 +846,8 @@ impl Actor for LocalNodeActor {
                 scrollback,
                 reply,
             } => {
-                let _ = reply.send(session_capture(&session, lines, scrollback));
+                let _ =
+                    reply.send(embedded_session_capture(state, &session, lines, scrollback).await);
             }
             LocalNodeMessage::WaitFor {
                 session,
@@ -1194,7 +860,8 @@ impl Actor for LocalNodeActor {
                 reply,
             } => {
                 let _ = reply.send(
-                    wait_for(
+                    embedded_wait_for(
+                        state,
                         &session,
                         &mode,
                         sentinel.as_deref(),
@@ -1215,7 +882,15 @@ impl Actor for LocalNodeActor {
                 reply,
             } => {
                 let _ = reply.send(
-                    session_exec(&session, &command, cwd.as_deref(), timeout, max_lines).await,
+                    embedded_session_exec(
+                        state,
+                        &session,
+                        &command,
+                        cwd.as_deref(),
+                        timeout,
+                        max_lines,
+                    )
+                    .await,
                 );
             }
             LocalNodeMessage::ReadFile {
@@ -1224,7 +899,7 @@ impl Actor for LocalNodeActor {
                 limit,
                 reply,
             } => {
-                let _ = reply.send(read_file_impl(&path, offset, limit));
+                let _ = reply.send(embedded_read_file(state, &path, offset, limit).await);
             }
             LocalNodeMessage::SaveFile {
                 path,
@@ -1234,9 +909,9 @@ impl Actor for LocalNodeActor {
                 max_bytes,
                 reply,
             } => {
-                let _ = reply.send(save_file_impl(
-                    &path, &content, &encoding, append, max_bytes,
-                ));
+                let _ = reply.send(
+                    embedded_save_file(state, &path, &content, &encoding, append, max_bytes).await,
+                );
             }
             LocalNodeMessage::CodingSend {
                 session,
@@ -1244,7 +919,7 @@ impl Actor for LocalNodeActor {
                 profile,
                 reply,
             } => {
-                let _ = reply.send(coding_send_with_profile(&session, &prompt, &profile).await);
+                let _ = reply.send(embedded_coding_send(state, &session, &prompt, &profile).await);
             }
             LocalNodeMessage::CodingWaitReady {
                 session,
@@ -1252,8 +927,8 @@ impl Actor for LocalNodeActor {
                 profile,
                 reply,
             } => {
-                let _ =
-                    reply.send(coding_wait_ready_with_profile(&session, timeout, &profile).await);
+                let _ = reply
+                    .send(embedded_coding_wait_ready(state, &session, timeout, &profile).await);
             }
             LocalNodeMessage::CodingAction {
                 session,
@@ -1261,20 +936,21 @@ impl Actor for LocalNodeActor {
                 profile,
                 reply,
             } => {
-                let _ = reply.send(coding_action_with_profile(&session, &action, &profile));
+                let _ =
+                    reply.send(embedded_coding_action(state, &session, &action, &profile).await);
             }
             LocalNodeMessage::SessionInfo { session, reply } => {
-                let _ = reply.send(session_info(&session));
+                let _ = reply.send(embedded_session_info(state, &session).await);
             }
             LocalNodeMessage::ListPanes { session, reply } => {
-                let _ = reply.send(list_panes(&session));
+                let _ = reply.send(embedded_list_panes(state, &session).await);
             }
             LocalNodeMessage::CheckState {
                 session,
                 profile,
                 reply,
             } => {
-                let _ = reply.send(check_state(&session, &profile));
+                let _ = reply.send(embedded_check_state(state, &session, &profile).await);
             }
             LocalNodeMessage::ResizePane {
                 session,
@@ -1282,11 +958,669 @@ impl Actor for LocalNodeActor {
                 height,
                 reply,
             } => {
-                let _ = reply.send(resize_pane(&session, width, height));
+                let _ = reply.send(embedded_resize_pane(state, &session, width, height).await);
+            }
+            LocalNodeMessage::SetObjective {
+                session,
+                objective,
+                reply,
+            } => {
+                let _ =
+                    reply.send(embedded_set_session_objective(state, &session, &objective).await);
             }
         }
         Ok(())
     }
+}
+
+async fn embedded_tmux(
+    backend: &mut mmux_node::EmbeddedNodeBackend,
+    args: Vec<String>,
+) -> Result<String, String> {
+    match backend.execute(NodeCommandKind::Tmux { args }).await {
+        NodeCommandResult::TmuxOutput(output) => Ok(output),
+        NodeCommandResult::Error { message } => Err(message),
+        other => Err(format!("unexpected tmux command result: {:?}", other)),
+    }
+}
+
+async fn embedded_session_exists(
+    backend: &mut mmux_node::EmbeddedNodeBackend,
+    session: &str,
+) -> bool {
+    embedded_tmux(
+        backend,
+        vec!["has-session".into(), "-t".into(), session.into()],
+    )
+    .await
+    .is_ok()
+}
+
+async fn embedded_session_create(
+    backend: &mut mmux_node::EmbeddedNodeBackend,
+    session: &str,
+    command: &str,
+    cwd: Option<&str>,
+) -> Result<String, String> {
+    if embedded_session_exists(backend, session).await {
+        return Ok(format!("Session '{}' already exists", session));
+    }
+    let mut args = vec![
+        "new-session".into(),
+        "-d".into(),
+        "-s".into(),
+        session.into(),
+    ];
+    if let Some(cwd) = cwd {
+        args.push("-c".into());
+        args.push(cwd.into());
+    }
+    args.push(command.into());
+    embedded_tmux(backend, args).await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    Ok(format!(
+        "Created session '{}' with command '{}'",
+        session, command
+    ))
+}
+
+async fn embedded_session_kill(
+    backend: &mut mmux_node::EmbeddedNodeBackend,
+    session: &str,
+) -> Result<String, String> {
+    if !embedded_session_exists(backend, session).await {
+        return Ok(format!("Session '{}' not found", session));
+    }
+    embedded_tmux(
+        backend,
+        vec!["kill-session".into(), "-t".into(), session.into()],
+    )
+    .await?;
+    Ok(format!("Killed session '{}'", session))
+}
+
+async fn embedded_session_list(
+    backend: &mut mmux_node::EmbeddedNodeBackend,
+) -> Result<String, String> {
+    match embedded_tmux(
+        backend,
+        vec![
+            "list-sessions".into(),
+            "-F".into(),
+            SESSION_LIST_FORMAT.into(),
+        ],
+    )
+    .await
+    {
+        Ok(output) => Ok(output),
+        Err(_) => Ok("No tmux sessions running".into()),
+    }
+}
+
+async fn embedded_session_send(
+    backend: &mut mmux_node::EmbeddedNodeBackend,
+    session: &str,
+    text: &str,
+    enter: bool,
+) -> Result<String, String> {
+    if !embedded_session_exists(backend, session).await {
+        return Err(format!("Session '{}' does not exist", session));
+    }
+    embedded_tmux(
+        backend,
+        vec![
+            "send-keys".into(),
+            "-l".into(),
+            "-t".into(),
+            session.into(),
+            text.into(),
+        ],
+    )
+    .await?;
+    if enter {
+        tokio::time::sleep(coding_prompt_submit_delay(text)).await;
+        embedded_tmux(
+            backend,
+            vec![
+                "send-keys".into(),
+                "-t".into(),
+                session.into(),
+                "Enter".into(),
+            ],
+        )
+        .await?;
+    }
+    Ok(format!("Sent to {}: {}", session, text))
+}
+
+async fn embedded_session_key(
+    backend: &mut mmux_node::EmbeddedNodeBackend,
+    session: &str,
+    key: &str,
+) -> Result<String, String> {
+    if !embedded_session_exists(backend, session).await {
+        return Err(format!("Session '{}' does not exist", session));
+    }
+    embedded_tmux(backend, remote_send_key_args(session, key)).await?;
+    Ok(format!("Sent key '{}' to {}", key, session))
+}
+
+async fn embedded_session_capture(
+    backend: &mut mmux_node::EmbeddedNodeBackend,
+    session: &str,
+    lines: Option<usize>,
+    scrollback: bool,
+) -> Result<String, String> {
+    if !embedded_session_exists(backend, session).await {
+        return Err(format!("Session '{}' does not exist", session));
+    }
+    let args = if scrollback {
+        vec![
+            "capture-pane".into(),
+            "-t".into(),
+            session.into(),
+            "-p".into(),
+            "-S".into(),
+            "-".into(),
+        ]
+    } else if let Some(lines) = lines {
+        vec![
+            "capture-pane".into(),
+            "-t".into(),
+            session.into(),
+            "-p".into(),
+            "-S".into(),
+            format!("-{}", lines),
+        ]
+    } else {
+        vec![
+            "capture-pane".into(),
+            "-t".into(),
+            session.into(),
+            "-p".into(),
+        ]
+    };
+    embedded_tmux(backend, args).await
+}
+
+async fn embedded_wait_for(
+    backend: &mut mmux_node::EmbeddedNodeBackend,
+    session: &str,
+    mode: &str,
+    sentinel: Option<&str>,
+    prompt: Option<&str>,
+    timeout: f64,
+    poll: f64,
+    stability: f64,
+) -> Result<String, String> {
+    if !embedded_session_exists(backend, session).await {
+        return Err(format!("Session '{}' does not exist", session));
+    }
+    let deadline = Instant::now() + Duration::from_secs_f64(timeout);
+    let poll_dur = Duration::from_secs_f64(poll);
+
+    match mode {
+        "sentinel" => {
+            let sentinel = sentinel.ok_or("sentinel required for sentinel mode")?;
+            while Instant::now() < deadline {
+                let output = embedded_session_capture(backend, session, Some(200), false).await?;
+                if output.contains(sentinel) {
+                    return Ok(format!("Sentinel '{}' found", sentinel));
+                }
+                tokio::time::sleep(poll_dur).await;
+            }
+            Err(format!(
+                "Timeout after {}s waiting for sentinel '{}'",
+                timeout, sentinel
+            ))
+        }
+        "prompt" => {
+            let prompt = prompt.ok_or("prompt required for prompt mode")?;
+            while Instant::now() < deadline {
+                let output = embedded_session_capture(backend, session, Some(200), false).await?;
+                if output.contains(prompt) {
+                    return Ok(format!("Prompt '{}' found", prompt));
+                }
+                tokio::time::sleep(poll_dur).await;
+            }
+            Err(format!(
+                "Timeout after {}s waiting for prompt '{}'",
+                timeout, prompt
+            ))
+        }
+        _ => {
+            let stable_needed = (stability / poll).max(1.0) as usize;
+            let mut last_output = String::new();
+            let mut stable_count = 0;
+            while Instant::now() < deadline {
+                let output = embedded_session_capture(backend, session, Some(200), false).await?;
+                if output == last_output {
+                    stable_count += 1;
+                    if stable_count >= stable_needed {
+                        return Ok(format!("Output stable for {}s", stability));
+                    }
+                } else {
+                    stable_count = 0;
+                    last_output = output;
+                }
+                tokio::time::sleep(poll_dur).await;
+            }
+            Err(format!("Timeout after {}s", timeout))
+        }
+    }
+}
+
+async fn embedded_session_exec(
+    backend: &mut mmux_node::EmbeddedNodeBackend,
+    session: &str,
+    command: &str,
+    cwd: Option<&str>,
+    timeout: f64,
+    max_lines: usize,
+) -> Result<String, String> {
+    if !embedded_session_exists(backend, session).await {
+        embedded_session_create(backend, session, "bash", cwd).await?;
+    }
+    let sentinel = format!(
+        "__MMUX_{}__",
+        SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos()
+    );
+    embedded_session_send(backend, session, &format!("echo '{}'", sentinel), true).await?;
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    embedded_session_send(backend, session, command, true).await?;
+    embedded_wait_for(backend, session, "stable", None, None, timeout, 0.5, 1.0).await?;
+    let output = embedded_session_capture(backend, session, None, true).await?;
+    let all_lines: Vec<&str> = output.lines().collect();
+    let sentinel_idx = all_lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| (line.trim() == sentinel).then_some(idx))
+        .last();
+    let result_lines: Vec<&str> = if let Some(idx) = sentinel_idx {
+        all_lines.iter().skip(idx + 1).copied().collect()
+    } else {
+        let start = all_lines.len().saturating_sub(max_lines);
+        all_lines[start..].to_vec()
+    };
+    Ok(clean_exec_output(result_lines))
+}
+
+async fn embedded_read_file(
+    backend: &mut mmux_node::EmbeddedNodeBackend,
+    path: &str,
+    offset: Option<u64>,
+    limit: Option<usize>,
+) -> Result<ReadFileResult, String> {
+    let limit = limit.unwrap_or(4 * 1024 * 1024);
+    match backend
+        .execute(NodeCommandKind::ReadFile {
+            path: path.into(),
+            offset,
+            limit,
+        })
+        .await
+    {
+        NodeCommandResult::FileContent { content_base64 } => {
+            let bytes = BASE64
+                .decode(content_base64.as_bytes())
+                .map_err(|error| format!("base64 decode error: {}", error))?;
+            let compression = mmux_node::detect_compression(&bytes);
+            let mime_type = mmux_node::detect_mime_type(Path::new(path), &bytes);
+            let read_bytes = bytes.len();
+            let (content, encoding) = match String::from_utf8(bytes) {
+                Ok(text) => (text, "utf-8".to_owned()),
+                Err(error) => (BASE64.encode(error.into_bytes()), "base64".to_owned()),
+            };
+            Ok(ReadFileResult {
+                path: path.into(),
+                content,
+                encoding,
+                mime_type,
+                size_bytes: read_bytes as u64,
+                read_bytes,
+                compression,
+            })
+        }
+        NodeCommandResult::Error { message } => Err(message),
+        other => Err(format!("unexpected read file result: {:?}", other)),
+    }
+}
+
+async fn embedded_save_file(
+    backend: &mut mmux_node::EmbeddedNodeBackend,
+    path: &str,
+    content: &str,
+    encoding: &str,
+    append: bool,
+    max_bytes: Option<usize>,
+) -> Result<SaveFileResult, String> {
+    let bytes = match encoding {
+        "utf-8" | "utf8" => content.as_bytes().to_vec(),
+        "base64" => BASE64
+            .decode(content.as_bytes())
+            .map_err(|error| format!("base64 decode error: {}", error))?,
+        other => return Err(format!("unsupported encoding '{}'", other)),
+    };
+    if let Some(max_bytes) = max_bytes {
+        if bytes.len() > max_bytes {
+            return Err(format!(
+                "decoded content is {} bytes, exceeding max {}",
+                bytes.len(),
+                max_bytes
+            ));
+        }
+    }
+    let content_base64 = BASE64.encode(&bytes);
+    match backend
+        .execute(NodeCommandKind::WriteFile {
+            path: path.into(),
+            content_base64,
+            append,
+        })
+        .await
+    {
+        NodeCommandResult::WriteComplete { bytes_written } => Ok(SaveFileResult {
+            path: path.into(),
+            bytes_written,
+            mime_type: Some(mmux_node::detect_mime_type(Path::new(path), &bytes)),
+        }),
+        NodeCommandResult::Error { message } => Err(message),
+        other => Err(format!("unexpected write file result: {:?}", other)),
+    }
+}
+
+async fn embedded_coding_send(
+    backend: &mut mmux_node::EmbeddedNodeBackend,
+    session: &str,
+    prompt: &str,
+    profile: &CliProfile,
+) -> Result<String, String> {
+    if !embedded_session_exists(backend, session).await {
+        return Err(format!("Session '{}' does not exist", session));
+    }
+    let pane = embedded_session_first_pane(backend, session).await?;
+    if let Some(dismiss) = profile.startup_dismiss.as_ref() {
+        let buf = embedded_tmux(
+            backend,
+            vec![
+                "capture-pane".into(),
+                "-t".into(),
+                pane.clone(),
+                "-p".into(),
+            ],
+        )
+        .await
+        .unwrap_or_default();
+        if dismiss.triggers.iter().any(|trigger| buf.contains(trigger)) {
+            embedded_tmux(backend, remote_send_key_args(&pane, &dismiss.key)).await?;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+    }
+    embedded_tmux(
+        backend,
+        vec![
+            "send-keys".into(),
+            "-l".into(),
+            "-t".into(),
+            pane.clone(),
+            prompt.into(),
+        ],
+    )
+    .await?;
+    tokio::time::sleep(coding_prompt_submit_delay(prompt)).await;
+    embedded_tmux(
+        backend,
+        vec!["send-keys".into(), "-t".into(), pane, "Enter".into()],
+    )
+    .await?;
+    Ok(format!(
+        "Sent to {} (profile: {}): {}",
+        session, profile.name, prompt
+    ))
+}
+
+async fn embedded_coding_wait_ready(
+    backend: &mut mmux_node::EmbeddedNodeBackend,
+    session: &str,
+    timeout: u64,
+    profile: &CliProfile,
+) -> Result<String, String> {
+    if !embedded_session_exists(backend, session).await {
+        return Err(format!("Session '{}' does not exist", session));
+    }
+    let deadline = Instant::now() + Duration::from_secs(timeout);
+    while Instant::now() <= deadline {
+        let buf = embedded_session_capture(backend, session, None, false)
+            .await
+            .unwrap_or_default();
+        if let Some(key) = startup_dismiss_key(&buf, profile) {
+            let _ = embedded_tmux(backend, remote_send_key_args(session, key)).await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            continue;
+        }
+        let has_prompt = buf.contains(&profile.prompt_indicator);
+        let busy = profile_is_busy(&buf, profile);
+        if has_prompt && !busy {
+            return Ok(format!("{} is ready (profile: {})", session, profile.name));
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    Err(format!(
+        "Timeout waiting for {} to be ready (profile: {})",
+        session, profile.name
+    ))
+}
+
+async fn embedded_coding_action(
+    backend: &mut mmux_node::EmbeddedNodeBackend,
+    session: &str,
+    action: &str,
+    profile: &CliProfile,
+) -> Result<String, String> {
+    if !embedded_session_exists(backend, session).await {
+        return Err(format!("Session '{}' does not exist", session));
+    }
+    let keys = match action {
+        "approve" => &profile.approve_keys,
+        "reject" => &profile.reject_keys,
+        "cancel" => &profile.cancel_keys,
+        "escape" => &profile.escape_keys,
+        other => return Err(format!("Unknown action '{}'", other)),
+    };
+    embedded_tmux(backend, remote_send_key_args(session, keys)).await?;
+    Ok(format!(
+        "Action '{}' sent to {} using profile {}",
+        action, session, profile.name
+    ))
+}
+
+async fn embedded_session_info(
+    backend: &mut mmux_node::EmbeddedNodeBackend,
+    session: &str,
+) -> Result<String, String> {
+    if !embedded_session_exists(backend, session).await {
+        return Err(format!("Session '{}' does not exist", session));
+    }
+    let info = embedded_tmux(
+        backend,
+        vec![
+            "list-panes".into(),
+            "-t".into(),
+            session.into(),
+            "-F".into(),
+            "pane_id=#{pane_id} index=#{pane_index} width=#{pane_width} height=#{pane_height} command=#{pane_current_command} title=#{pane_title}".into(),
+        ],
+    )
+    .await?;
+    let windows = embedded_tmux(
+        backend,
+        vec![
+            "list-windows".into(),
+            "-t".into(),
+            session.into(),
+            "-F".into(),
+            "window_id=#{window_id} index=#{window_index} name=#{window_name} active=#{window_active}".into(),
+        ],
+    )
+    .await?;
+    let objective = embedded_session_objective(backend, session)
+        .await
+        .map(|value| format!("\nObjective: {}", value))
+        .unwrap_or_default();
+    Ok(format!(
+        "Session: {}{}\nPanes:\n{}\nWindows:\n{}",
+        session, objective, info, windows
+    ))
+}
+
+async fn embedded_list_panes(
+    backend: &mut mmux_node::EmbeddedNodeBackend,
+    session: &str,
+) -> Result<String, String> {
+    if !embedded_session_exists(backend, session).await {
+        return Err(format!("Session '{}' does not exist", session));
+    }
+    embedded_tmux(
+        backend,
+        vec![
+            "list-panes".into(),
+            "-t".into(),
+            session.into(),
+            "-F".into(),
+            "#{pane_index}\t#{pane_width}x#{pane_height}\t#{pane_current_command}\t#{pane_title}"
+                .into(),
+        ],
+    )
+    .await
+}
+
+async fn embedded_check_state(
+    backend: &mut mmux_node::EmbeddedNodeBackend,
+    session: &str,
+    profile: &CliProfile,
+) -> Result<String, String> {
+    if !embedded_session_exists(backend, session).await {
+        return Err(format!("Session '{}' does not exist", session));
+    }
+    let pane = embedded_session_first_pane(backend, session).await?;
+    let buf = embedded_tmux(
+        backend,
+        vec!["capture-pane".into(), "-t".into(), pane, "-p".into()],
+    )
+    .await
+    .unwrap_or_default();
+    let has_prompt = buf.contains(&profile.prompt_indicator);
+    let busy = profile_is_busy(&buf, profile);
+    Ok(json!({
+        "session": session,
+        "has_prompt": has_prompt,
+        "busy": busy,
+        "profile": profile.name,
+    })
+    .to_string())
+}
+
+async fn embedded_resize_pane(
+    backend: &mut mmux_node::EmbeddedNodeBackend,
+    session: &str,
+    width: Option<u32>,
+    height: Option<u32>,
+) -> Result<String, String> {
+    if !embedded_session_exists(backend, session).await {
+        return Err(format!("Session '{}' does not exist", session));
+    }
+    let pane = embedded_session_first_pane(backend, session).await?;
+    if let Some(width) = width {
+        embedded_tmux(
+            backend,
+            vec![
+                "resize-pane".into(),
+                "-t".into(),
+                pane.clone(),
+                "-x".into(),
+                width.to_string(),
+            ],
+        )
+        .await?;
+    }
+    if let Some(height) = height {
+        embedded_tmux(
+            backend,
+            vec![
+                "resize-pane".into(),
+                "-t".into(),
+                pane.clone(),
+                "-y".into(),
+                height.to_string(),
+            ],
+        )
+        .await?;
+    }
+    Ok(format!("Resized pane {}", pane))
+}
+
+async fn embedded_session_first_pane(
+    backend: &mut mmux_node::EmbeddedNodeBackend,
+    session: &str,
+) -> Result<String, String> {
+    let panes = embedded_tmux(
+        backend,
+        vec![
+            "list-panes".into(),
+            "-t".into(),
+            session.into(),
+            "-F".into(),
+            "#{pane_id}".into(),
+        ],
+    )
+    .await?;
+    panes
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.trim().to_string())
+        .ok_or_else(|| format!("Session '{}' has no panes", session))
+}
+
+async fn embedded_set_session_objective(
+    backend: &mut mmux_node::EmbeddedNodeBackend,
+    session: &str,
+    objective: &str,
+) -> Result<(), String> {
+    embedded_tmux(
+        backend,
+        vec![
+            "set-option".into(),
+            "-t".into(),
+            session.into(),
+            SESSION_OBJECTIVE_OPTION.into(),
+            objective.into(),
+        ],
+    )
+    .await?;
+    Ok(())
+}
+
+async fn embedded_session_objective(
+    backend: &mut mmux_node::EmbeddedNodeBackend,
+    session: &str,
+) -> Option<String> {
+    embedded_tmux(
+        backend,
+        vec![
+            "show-options".into(),
+            "-v".into(),
+            "-t".into(),
+            session.into(),
+            SESSION_OBJECTIVE_OPTION.into(),
+        ],
+    )
+    .await
+    .ok()
+    .map(|value| value.trim().to_owned())
+    .filter(|value| !value.is_empty())
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1382,7 +1716,16 @@ impl TmuxMcpServer {
                 )
                 .await?;
             } else {
-                tmux(&["set-environment", "-g", key, value])?;
+                self.local_node_call(|reply| LocalNodeMessage::Tmux {
+                    args: vec![
+                        "set-environment".into(),
+                        "-g".into(),
+                        key.clone(),
+                        value.clone(),
+                    ],
+                    reply,
+                })
+                .await?;
             }
         }
         Ok(())
@@ -1452,7 +1795,12 @@ impl TmuxMcpServer {
             }
             "shell_send" => {
                 let exists = if node == "local" {
-                    session_exists(session)
+                    self.local_node_call(|reply| LocalNodeMessage::SessionExists {
+                        session: session.to_owned(),
+                        reply,
+                    })
+                    .await
+                    .unwrap_or(false)
                 } else {
                     self.node_session_exists(node, session).await
                 };
@@ -1626,7 +1974,13 @@ impl TmuxMcpServer {
 
     async fn node_session_exists(&self, node_id: &str, session: &str) -> bool {
         if node_id == "local" {
-            return session_exists(session);
+            return self
+                .local_node_call(|reply| LocalNodeMessage::SessionExists {
+                    session: session.to_owned(),
+                    reply,
+                })
+                .await
+                .unwrap_or(false);
         }
         self.remote_tmux(
             node_id,
@@ -1719,7 +2073,12 @@ impl TmuxMcpServer {
             )
             .await?;
         } else {
-            set_session_objective(session, objective)?;
+            self.local_node_call(|reply| LocalNodeMessage::SetObjective {
+                session: session.to_owned(),
+                objective: objective.to_owned(),
+                reply,
+            })
+            .await?;
         }
         Ok(())
     }
@@ -4072,17 +4431,25 @@ pub(crate) async fn run_mcp_http_server(
     policy: ControllerPolicy,
     mcp_token: Option<String>,
     wire_auth: ResolvedNodeWirePolicy,
-    enable_local_node: bool,
+    embedded_node: Option<EmbeddedNodeConfig>,
 ) -> Result<(), String> {
-    let local_node = if enable_local_node {
-        let (local_node, _local_node_handle) = Actor::spawn(None, LocalNodeActor, ())
+    let embedded_node_label = embedded_node.as_ref().map(|config| config.display_name());
+    let local_node = if let Some(config) = embedded_node {
+        let backend = match config {
+            EmbeddedNodeConfig::Local => mmux_node::EmbeddedNodeBackend::local().await?,
+            EmbeddedNodeConfig::Microsandbox { sandbox_name } => {
+                mmux_node::EmbeddedNodeBackend::microsandbox(&sandbox_name).await?
+            }
+        };
+        let (local_node, _local_node_handle) = Actor::spawn(None, LocalNodeActor, backend)
             .await
-            .map_err(|error| format!("failed to start local node actor: {}", error))?;
+            .map_err(|error| format!("failed to start embedded node actor: {}", error))?;
         Some(local_node)
     } else {
         None
     };
-    let (registry, _registry_handle) = Actor::spawn(None, NodeRegistryActor, enable_local_node)
+    let has_embedded_node = local_node.is_some();
+    let (registry, _registry_handle) = Actor::spawn(None, NodeRegistryActor, has_embedded_node)
         .await
         .map_err(|error| format!("failed to start node registry actor: {}", error))?;
     let listener = tokio::net::TcpListener::bind(bind)
@@ -4163,6 +4530,9 @@ pub(crate) async fn run_mcp_http_server(
     );
     if let Some(root) = policy.workspace_root.as_ref() {
         println!("  Workspace root: {}", root.display());
+    }
+    if let Some(label) = embedded_node_label {
+        println!("  Embedded node enabled: {} backend as node 'local'", label);
     }
     if has_mcp_token {
         println!("  MCP bearer token authentication enabled");
@@ -4344,6 +4714,7 @@ fn validate_remote_mcp_bind_auth(
 fn resolve_node_wire_policy(
     cli: &Cli,
     policy: &ControllerPolicy,
+    allow_reject_all_without_wire_auth: bool,
 ) -> Result<ResolvedNodeWirePolicy, String> {
     let token = resolve_token_value(
         "--wire-token",
@@ -4411,10 +4782,43 @@ fn resolve_node_wire_policy(
             token: Some(token),
             native_mtls: None,
         }),
+        None if allow_reject_all_without_wire_auth => Ok(ResolvedNodeWirePolicy {
+            policy: NodeWireAuthPolicy {
+                mode: NodeWireAuthMode::Token,
+            },
+            token: None,
+            native_mtls: None,
+        }),
         None => Err(
             "node wire RPC requires --wire-token, --wire-token-file, MMUX_WIRE_TOKEN, --wire-mtls, or explicit --allow-unauthenticated-node-wire"
                 .into(),
         ),
+    }
+}
+
+fn resolve_embedded_node_config(cli: &Cli) -> Result<Option<EmbeddedNodeConfig>, String> {
+    match (cli.enable_local_node, cli.enable_microsandbox_node) {
+        (true, true) => {
+            Err("--enable-local-node is mutually exclusive with --enable-microsandbox-node".into())
+        }
+        (true, false) => {
+            if cli.sandbox_name.is_some() {
+                return Err("--sandbox-name requires --enable-microsandbox-node".into());
+            }
+            Ok(Some(EmbeddedNodeConfig::Local))
+        }
+        (false, true) => {
+            let sandbox_name = cli.sandbox_name.clone().ok_or_else(|| {
+                "--sandbox-name is required with --enable-microsandbox-node".to_owned()
+            })?;
+            Ok(Some(EmbeddedNodeConfig::Microsandbox { sandbox_name }))
+        }
+        (false, false) => {
+            if cli.sandbox_name.is_some() {
+                return Err("--sandbox-name requires --enable-microsandbox-node".into());
+            }
+            Ok(None)
+        }
     }
 }
 
@@ -4447,10 +4851,15 @@ where
         eprintln!("MCP token error: {}", e);
         std::process::exit(1);
     });
-    let wire_auth = resolve_node_wire_policy(&cli, &policy).unwrap_or_else(|e| {
-        eprintln!("Node wire policy error: {}", e);
+    let embedded_node = resolve_embedded_node_config(&cli).unwrap_or_else(|e| {
+        eprintln!("Embedded node config error: {}", e);
         std::process::exit(1);
     });
+    let wire_auth = resolve_node_wire_policy(&cli, &policy, embedded_node.is_some())
+        .unwrap_or_else(|e| {
+            eprintln!("Node wire policy error: {}", e);
+            std::process::exit(1);
+        });
 
     // Resolve node profile config path: --node-config/--config > mmux.toml in cwd > built-in defaults
     let node_config = cli.node_config.clone().or_else(|| cli.config.clone());
@@ -4488,7 +4897,7 @@ where
         policy,
         mcp_token,
         wire_auth,
-        enable_local_node: cli.enable_local_node,
+        embedded_node,
     });
     if let Err(e) = rt.block_on(runtime::ControllerRuntime::run(local_runtime)) {
         eprintln!("MCP server error: {}", e);
@@ -4540,7 +4949,42 @@ mod tests {
             max_request_bytes: 2 * 1024 * 1024,
             max_capture_bytes: 2 * 1024 * 1024,
             enable_local_node: false,
+            enable_microsandbox_node: false,
+            sandbox_name: None,
         }
+    }
+
+    #[test]
+    fn test_resolve_embedded_node_config_validates_flags() {
+        let mut cli = test_cli();
+        assert!(resolve_embedded_node_config(&cli).unwrap().is_none());
+
+        cli.enable_local_node = true;
+        assert!(matches!(
+            resolve_embedded_node_config(&cli).unwrap(),
+            Some(EmbeddedNodeConfig::Local)
+        ));
+
+        cli.enable_microsandbox_node = true;
+        assert!(resolve_embedded_node_config(&cli)
+            .unwrap_err()
+            .contains("mutually exclusive"));
+
+        cli.enable_local_node = false;
+        assert!(resolve_embedded_node_config(&cli)
+            .unwrap_err()
+            .contains("--sandbox-name is required"));
+
+        cli.sandbox_name = Some("mmux-node".into());
+        assert!(matches!(
+            resolve_embedded_node_config(&cli).unwrap(),
+            Some(EmbeddedNodeConfig::Microsandbox { sandbox_name }) if sandbox_name == "mmux-node"
+        ));
+
+        cli.enable_microsandbox_node = false;
+        assert!(resolve_embedded_node_config(&cli)
+            .unwrap_err()
+            .contains("--sandbox-name requires"));
     }
 
     #[test]
@@ -4720,22 +5164,26 @@ triggers = ["Starting MCP servers"]
         std::env::remove_var(&cli.wire_token_env);
         let policy = ControllerPolicy::new(&cli).unwrap();
 
-        assert!(resolve_node_wire_policy(&cli, &policy)
+        assert!(resolve_node_wire_policy(&cli, &policy, false)
             .unwrap_err()
             .contains("node wire RPC requires"));
 
+        let embedded_auth = resolve_node_wire_policy(&cli, &policy, true).unwrap();
+        assert_eq!(embedded_auth.policy.mode, NodeWireAuthMode::Token);
+        assert!(embedded_auth.token.is_none());
+
         cli.wire_token = Some("secret".into());
-        let auth = resolve_node_wire_policy(&cli, &policy).unwrap();
+        let auth = resolve_node_wire_policy(&cli, &policy, false).unwrap();
         assert_eq!(auth.policy.mode, NodeWireAuthMode::Token);
         assert_eq!(auth.token.as_deref(), Some("secret"));
 
         cli.wire_mtls = true;
-        assert!(resolve_node_wire_policy(&cli, &policy)
+        assert!(resolve_node_wire_policy(&cli, &policy, false)
             .unwrap_err()
             .contains("mutually exclusive"));
 
         cli.wire_token = None;
-        assert!(resolve_node_wire_policy(&cli, &policy)
+        assert!(resolve_node_wire_policy(&cli, &policy, false)
             .unwrap_err()
             .contains("--tls-cert is required"));
 
@@ -4750,7 +5198,7 @@ triggers = ["Starting MCP servers"]
         cli.tls_cert = Some(cert.to_string_lossy().into_owned());
         cli.tls_key = Some(key.to_string_lossy().into_owned());
         cli.wire_client_ca = Some(ca.to_string_lossy().into_owned());
-        let auth = resolve_node_wire_policy(&cli, &policy).unwrap();
+        let auth = resolve_node_wire_policy(&cli, &policy, false).unwrap();
         assert_eq!(auth.policy.mode, NodeWireAuthMode::Mtls);
         assert!(auth.token.is_none());
         assert!(auth.native_mtls.is_some());
@@ -4760,7 +5208,7 @@ triggers = ["Starting MCP servers"]
         cli.tls_key = None;
         cli.wire_client_ca = None;
         cli.allow_unauthenticated_node_wire = true;
-        let auth = resolve_node_wire_policy(&cli, &policy).unwrap();
+        let auth = resolve_node_wire_policy(&cli, &policy, false).unwrap();
         assert_eq!(auth.policy.mode, NodeWireAuthMode::Unauthenticated);
         assert!(auth.token.is_none());
         let _ = fs::remove_dir_all(cert_dir);
