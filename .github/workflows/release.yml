@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write
 
 jobs:
   build:
@@ -96,17 +97,29 @@ jobs:
           path: artifacts/*.tar.gz
 
   release:
-    name: Create GitHub Release
+    name: Create GitHub Release & Publish npm
     needs: build
     runs-on: ubuntu-latest
 
     steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v5
+        with:
+          node-version: "24"
+          registry-url: "https://registry.npmjs.org"
+
       - name: Download archives
         uses: actions/download-artifact@v6
         with:
           pattern: binaries-*
           merge-multiple: true
           path: artifacts
+
+      - name: List downloaded archives
+        run: ls -R artifacts
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
@@ -119,3 +132,18 @@ jobs:
           files: artifacts/*.tar.gz
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Publish npm package
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          VERSION="${GITHUB_REF_NAME#v}"
+          cd npm/mmux
+
+          npm version "$VERSION" --no-git-tag-version --allow-same-version
+          mkdir -p artifacts
+          cp ../../artifacts/*.tar.gz artifacts/
+
+          npm pack --dry-run
+          npm publish --access public
