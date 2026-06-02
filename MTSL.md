@@ -152,8 +152,9 @@ mmux controller \
   --wire-client-ca ./certs/node-ca.pem
 ```
 
-When `--wire-mtls` is set, `--wire-token`, `--wire-token-file`,
-`MMUX_WIRE_TOKEN`, and `--allow-unauthenticated-node-wire` are rejected.
+When `--wire-mtls` is set, `--wire-token`, `--wire-token-file`, and
+`--allow-unauthenticated-node-wire` are rejected. The default
+`MMUX_WIRE_TOKEN` env fallback is ignored because the explicit mTLS mode wins.
 
 ## Run A Node
 

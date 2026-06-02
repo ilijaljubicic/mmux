@@ -1,6 +1,6 @@
 {
   "name": "@mmux/mmux",
-  "version": "0.1.0",
+  "version": "0.1.2",
   "description": "MCP controller for tmux-backed local and remote coding sessions.",
   "license": "Apache-2.0",
   "homepage": "https://github.com/ilijaljubicic/mmux",

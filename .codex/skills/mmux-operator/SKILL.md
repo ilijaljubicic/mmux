@@ -17,8 +17,10 @@ when needed.
   env vars by name only. Never ask a coder to print API keys or tokens.
 - Prefer mmux MCP tools over direct terminal driving for interactive coder CLIs.
 - Do not use `mmux microsandbox`; mmux does not manage Microsandbox lifecycle.
-  Use `msb` for sandbox lifecycle and `mmux node --backend microsandbox` only
-  to attach an existing sandbox to a controller.
+  Use `msb` for sandbox lifecycle. For single-process local operation, use
+  `mmux controller --enable-microsandbox-node --sandbox-name <name>`. For
+  distributed operation, use `mmux node --backend microsandbox --sandbox-name
+  <name>` to attach an existing sandbox to a controller.
 - Keep coder prompts specific: objective, constraints, expected output, and stop
   condition.
 - After each significant coder action, capture output and check state before

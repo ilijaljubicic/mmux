@@ -113,8 +113,6 @@ use rmcp::{
 struct Cli {
     #[arg(long, help = "Path to node profile TOML file")]
     node_config: Option<String>,
-    #[arg(long, hide = true, help = "Deprecated alias for --node-config")]
-    config: Option<String>,
     #[arg(
         long,
         default_value = "127.0.0.1",
@@ -144,7 +142,7 @@ struct Cli {
     wire_token: Option<String>,
     #[arg(
         long,
-        help = "Require runtime-verified mTLS identity for node wire RPC. Mutually exclusive with --wire-token."
+        help = "Require runtime-verified mTLS identity for node wire RPC. Mutually exclusive with explicit wire token flags."
     )]
     wire_mtls: bool,
     #[arg(
@@ -177,12 +175,12 @@ struct Cli {
     workspace_root: Option<String>,
     #[arg(
         long,
-        help = "Permit a non-loopback MCP bind without --mcp-token. Intended only behind localhost-only port forwarding."
+        help = "Permit MCP without bearer auth and ignore MMUX_MCP_TOKEN. Intended only behind localhost-only port forwarding."
     )]
     allow_remote_without_mcp_token: bool,
     #[arg(
         long,
-        help = "Permit node wire RPC without --wire-token. Intended only for development or trusted private tunnels."
+        help = "Permit node wire RPC without bearer auth and ignore MMUX_WIRE_TOKEN. Intended only for development or trusted private tunnels."
     )]
     allow_unauthenticated_node_wire: bool,
     #[arg(long, default_value_t = 4 * 1024 * 1024, help = "Maximum bytes returned by read_file.")]
@@ -4667,6 +4665,30 @@ fn resolve_token_value(
     }
 }
 
+fn explicit_token_source_configured(token: Option<&String>, token_file: Option<&String>) -> bool {
+    token.is_some() || token_file.is_some()
+}
+
+fn resolve_mcp_token_value(cli: &Cli, policy: &ControllerPolicy) -> Result<Option<String>, String> {
+    if cli.allow_remote_without_mcp_token {
+        if explicit_token_source_configured(cli.mcp_token.as_ref(), cli.mcp_token_file.as_ref()) {
+            return Err(
+                "--allow-remote-without-mcp-token is mutually exclusive with --mcp-token or --mcp-token-file"
+                    .into(),
+            );
+        }
+        return Ok(None);
+    }
+
+    resolve_token_value(
+        "--mcp-token",
+        cli.mcp_token.as_ref(),
+        cli.mcp_token_file.as_ref(),
+        &cli.mcp_token_env,
+        policy,
+    )
+}
+
 fn canonicalize_required_path(flag: &str, path: Option<&String>) -> Result<PathBuf, String> {
     let path = path.ok_or_else(|| format!("{} is required", flag))?;
     std::fs::canonicalize(path)
@@ -4716,19 +4738,13 @@ fn resolve_node_wire_policy(
     policy: &ControllerPolicy,
     allow_reject_all_without_wire_auth: bool,
 ) -> Result<ResolvedNodeWirePolicy, String> {
-    let token = resolve_token_value(
-        "--wire-token",
-        cli.wire_token.as_ref(),
-        cli.wire_token_file.as_ref(),
-        &cli.wire_token_env,
-        policy,
-    )?;
+    let explicit_wire_token =
+        explicit_token_source_configured(cli.wire_token.as_ref(), cli.wire_token_file.as_ref());
 
     if cli.wire_mtls {
-        if token.is_some() {
+        if explicit_wire_token {
             return Err(
-                "--wire-mtls is mutually exclusive with --wire-token, --wire-token-file, or MMUX_WIRE_TOKEN"
-                    .into(),
+                "--wire-mtls is mutually exclusive with --wire-token or --wire-token-file".into(),
             );
         }
         if cli.allow_unauthenticated_node_wire {
@@ -4759,9 +4775,9 @@ fn resolve_node_wire_policy(
     }
 
     if cli.allow_unauthenticated_node_wire {
-        if token.is_some() {
+        if explicit_wire_token {
             return Err(
-                "--allow-unauthenticated-node-wire is mutually exclusive with wire token configuration"
+                "--allow-unauthenticated-node-wire is mutually exclusive with --wire-token or --wire-token-file"
                     .into(),
             );
         }
@@ -4773,6 +4789,14 @@ fn resolve_node_wire_policy(
             native_mtls: None,
         });
     }
+
+    let token = resolve_token_value(
+        "--wire-token",
+        cli.wire_token.as_ref(),
+        cli.wire_token_file.as_ref(),
+        &cli.wire_token_env,
+        policy,
+    )?;
 
     match token {
         Some(token) => Ok(ResolvedNodeWirePolicy {
@@ -4840,14 +4864,7 @@ where
         eprintln!("Controller policy error: {}", e);
         std::process::exit(1);
     });
-    let mcp_token = resolve_token_value(
-        "--mcp-token",
-        cli.mcp_token.as_ref(),
-        cli.mcp_token_file.as_ref(),
-        &cli.mcp_token_env,
-        &policy,
-    )
-    .unwrap_or_else(|e| {
+    let mcp_token = resolve_mcp_token_value(&cli, &policy).unwrap_or_else(|e| {
         eprintln!("MCP token error: {}", e);
         std::process::exit(1);
     });
@@ -4861,8 +4878,8 @@ where
             std::process::exit(1);
         });
 
-    // Resolve node profile config path: --node-config/--config > mmux.toml in cwd > built-in defaults
-    let node_config = cli.node_config.clone().or_else(|| cli.config.clone());
+    // Resolve node profile config path: --node-config > mmux.toml in cwd > built-in defaults
+    let node_config = cli.node_config.clone();
     let profiles = if let Some(path) = node_config {
         mmux_node::load_profiles_from_config(&path).unwrap_or_else(|e| {
             eprintln!("Node profile config error: {}", e);
@@ -4927,7 +4944,6 @@ mod tests {
     fn test_cli() -> Cli {
         Cli {
             node_config: None,
-            config: None,
             host: "127.0.0.1".into(),
             port: 3000,
             mcp_token: None,
@@ -5212,6 +5228,53 @@ triggers = ["Starting MCP servers"]
         assert_eq!(auth.policy.mode, NodeWireAuthMode::Unauthenticated);
         assert!(auth.token.is_none());
         let _ = fs::remove_dir_all(cert_dir);
+    }
+
+    #[test]
+    fn test_allow_unauthenticated_flags_ignore_default_token_env() {
+        let mut cli = test_cli();
+        cli.mcp_token_env = format!("MMUX_TEST_MCP_TOKEN_{}", std::process::id());
+        cli.wire_token_env = format!("MMUX_TEST_WIRE_TOKEN_{}", std::process::id());
+        std::env::set_var(&cli.mcp_token_env, "mcp-secret");
+        std::env::set_var(&cli.wire_token_env, "wire-secret");
+        let policy = ControllerPolicy::new(&cli).unwrap();
+
+        cli.allow_remote_without_mcp_token = true;
+        assert_eq!(resolve_mcp_token_value(&cli, &policy).unwrap(), None);
+
+        cli.allow_remote_without_mcp_token = false;
+        assert_eq!(
+            resolve_mcp_token_value(&cli, &policy).unwrap().as_deref(),
+            Some("mcp-secret")
+        );
+
+        cli.allow_unauthenticated_node_wire = true;
+        let auth = resolve_node_wire_policy(&cli, &policy, false).unwrap();
+        assert_eq!(auth.policy.mode, NodeWireAuthMode::Unauthenticated);
+        assert!(auth.token.is_none());
+
+        std::env::remove_var(&cli.mcp_token_env);
+        std::env::remove_var(&cli.wire_token_env);
+    }
+
+    #[test]
+    fn test_unauthenticated_flags_reject_explicit_token_sources() {
+        let mut cli = test_cli();
+        let policy = ControllerPolicy::new(&cli).unwrap();
+
+        cli.allow_remote_without_mcp_token = true;
+        cli.mcp_token = Some("secret".into());
+        assert!(resolve_mcp_token_value(&cli, &policy)
+            .unwrap_err()
+            .contains("mutually exclusive"));
+
+        cli.mcp_token = None;
+        cli.allow_remote_without_mcp_token = false;
+        cli.allow_unauthenticated_node_wire = true;
+        cli.wire_token = Some("secret".into());
+        assert!(resolve_node_wire_policy(&cli, &policy, false)
+            .unwrap_err()
+            .contains("mutually exclusive"));
     }
 
     #[test]

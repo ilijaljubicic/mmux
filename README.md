@@ -32,6 +32,7 @@ configuration for your environment and use mmux at your own risk.
 
 | Dependency | Required for | Notes |
 | ---------- | ------------ | ----- |
+| Node.js and npm | `npx @mmux/mmux` quick start | The npm package downloads and runs the native `mmux` binary for the current platform. |
 | Rust and Cargo | Build, test, run | Install with rustup or your system package manager. |
 | tmux | Local and node runtime | `mmux-node` shells out to the system `tmux` binary. |
 | Microsandbox | Microsandbox backend | Required only when running the Microsandbox backend. |
@@ -46,7 +47,53 @@ matches the pinned connect-rust revision in `Cargo.toml`.
 
 ## Quick Start
 
-### Install Controller
+### Run from npm
+
+For a local loopback-only MCP server with the built-in local tmux backend:
+
+```bash
+env -u MMUX_MCP_TOKEN -u MMUX_WIRE_TOKEN \
+  npx --yes @mmux/mmux controller --enable-local-node
+```
+
+The MCP endpoint is:
+
+```text
+http://127.0.0.1:3000/mcp
+```
+
+Register that HTTP MCP server with Codex:
+
+```bash
+codex mcp add mmux --url http://127.0.0.1:3000/mcp
+```
+
+Register it with Claude Code:
+
+```bash
+claude mcp add --transport http mmux http://127.0.0.1:3000/mcp
+```
+
+For authenticated local setup:
+
+```bash
+export MMUX_MCP_TOKEN="$(openssl rand -hex 32)"
+npx --yes @mmux/mmux controller --enable-local-node --mcp-token-env MMUX_MCP_TOKEN
+codex mcp add mmux --url http://127.0.0.1:3000/mcp --bearer-token-env-var MMUX_MCP_TOKEN
+claude mcp add --transport http mmux http://127.0.0.1:3000/mcp --header "Authorization: Bearer $MMUX_MCP_TOKEN"
+```
+
+For local Microsandbox mode, prepare the sandbox with `msb` and run the same
+npm package with the embedded Microsandbox node:
+
+```bash
+cd example-backends/microsandbox
+make sandbox-prepare
+cd ../..
+npx --yes @mmux/mmux controller --enable-microsandbox-node --sandbox-name mmux-node
+```
+
+### Install native binary
 
 Install the latest released `mmux` binary:
 
@@ -86,12 +133,6 @@ the built-in coder profiles.
 Warning: the local backend is not sandboxed. Tools run tmux commands and file
 operations on the same host as the controller, with the controller process
 user's permissions. Use it only for trusted clients and trusted workspaces.
-
-The MCP endpoint is:
-
-```text
-http://<controller-host>:3000/mcp
-```
 
 If you are calling the MCP endpoint directly, include both accepted response
 types:
@@ -170,14 +211,15 @@ Important controller flags:
 | `--mcp-token` | `MMUX_MCP_TOKEN` | Bearer token for public MCP requests. |
 | `--mcp-token-file` | none | Reads the MCP bearer token from a file. |
 | `--mcp-token-env` | `MMUX_MCP_TOKEN` | Env var used when MCP token flags are omitted. |
+| `--allow-remote-without-mcp-token` | false | Allows MCP without bearer auth and ignores `MMUX_MCP_TOKEN`; mutually exclusive with explicit MCP token flags. |
 | `--wire-token` | `MMUX_WIRE_TOKEN` | Bearer token for node wire RPC requests. |
-| `--wire-mtls` | false | Enables native TLS termination and requires mTLS node identity for wire RPC; mutually exclusive with wire token flags/env. |
+| `--wire-mtls` | false | Enables native TLS termination and requires mTLS node identity for wire RPC; mutually exclusive with explicit wire token flags. |
 | `--tls-cert` | none | PEM server certificate chain used when `--wire-mtls` is set. |
 | `--tls-key` | none | PEM server private key used when `--wire-mtls` is set. |
 | `--wire-client-ca` | none | PEM CA certificate(s) used to verify node client certificates. |
 | `--wire-token-file` | none | Reads the node wire bearer token from a file. |
 | `--wire-token-env` | `MMUX_WIRE_TOKEN` | Env var used when wire token flags are omitted. |
-| `--allow-unauthenticated-node-wire` | false | Allows node wire RPC without `--wire-token`; use only for development or trusted private tunnels. |
+| `--allow-unauthenticated-node-wire` | false | Allows node wire RPC without bearer auth and ignores `MMUX_WIRE_TOKEN`; mutually exclusive with explicit wire token flags. |
 | `--workspace-root` | none | Optional root used to confine local `read_file` / `save_file` path APIs. |
 | `--enable-local-node` | false | Starts the built-in local tmux node in-process. |
 | `--enable-microsandbox-node` | false | Starts an embedded Microsandbox node in-process. Requires `--sandbox-name`. |
@@ -253,7 +295,9 @@ The published package can be run with:
 
 ```bash
 npx @mmux/mmux controller --enable-local-node
+npx @mmux/mmux controller --enable-microsandbox-node --sandbox-name mmux-node
 yarn dlx @mmux/mmux controller --enable-local-node
+yarn dlx @mmux/mmux controller --enable-microsandbox-node --sandbox-name mmux-node
 ```
 
 ## Node Wire Authentication
@@ -268,9 +312,15 @@ mmux node --controller-url https://<controller-host>:3000 --wire-token "$MMUX_WI
 
 The controller resolves a single node wire auth policy at startup: bearer token,
 mTLS identity, or explicit `unauthenticated` development mode. Mixed
-configuration is rejected. If `--wire-mtls` is set, wire token flags/env must
-not also be set. If no wire auth is configured, the controller refuses to start
-unless `--allow-unauthenticated-node-wire` is explicit.
+configuration is rejected when conflicting modes are explicit. If `--wire-mtls`
+is set, explicit wire token flags/files must not also be set; the default
+`MMUX_WIRE_TOKEN` env fallback is ignored. If
+`--allow-unauthenticated-node-wire` is set, `MMUX_WIRE_TOKEN` is also ignored.
+If no wire auth is configured, a distributed-only controller refuses to start
+unless `--allow-unauthenticated-node-wire` is explicit. An embedded-node
+controller can start without node wire credentials; in that case the embedded
+node is usable as `local`, while unauthenticated distributed node wire requests
+are rejected.
 
 mTLS is the zero-trust node identity mode. A verified mTLS identity is
 normalized to a node id before it reaches the registry, and the controller
@@ -455,9 +505,14 @@ sandboxed backend such as Microsandbox.
 
 The default bind host is loopback-only. A non-loopback MCP bind without a token
 is rejected unless you deliberately pass `--allow-remote-without-mcp-token`.
-Node wire RPC is rejected unless `--wire-token` is set or you deliberately pass
-`--allow-unauthenticated-node-wire`. For any non-local exposure, use separate
-MCP and wire bearer tokens:
+That flag also ignores the default `MMUX_MCP_TOKEN` env fallback and is
+mutually exclusive with explicit MCP token flags/files.
+Node wire RPC is rejected unless you configure `--wire-token`, configure
+`--wire-mtls`, or deliberately pass `--allow-unauthenticated-node-wire`.
+Embedded modes do not need node wire credentials for the embedded node, but the
+public MCP endpoint still needs either MCP bearer auth or an explicit
+unauthenticated bind decision for non-local exposure. For distributed
+bearer-token mode, use separate MCP and wire tokens:
 
 ```bash
 export MMUX_MCP_TOKEN="$(openssl rand -hex 32)"
@@ -471,10 +526,10 @@ Authenticated requests must include:
 Authorization: Bearer <token>
 ```
 
-`--workspace-root` is a file API guardrail for the built-in local node: when it
-is set, local `read_file`, `save_file`, and local coding-session `cwd`
-resolution are confined under that root. It is not a sandbox for terminal
-commands.
+`--workspace-root` is a file API guardrail for MCP operations that target
+`node=local`: when it is set, local `read_file`, `save_file`, and
+coding-session `cwd` resolution are confined under that root. Distributed node
+ids receive paths unchanged. This is not a sandbox for terminal commands.
 
 Request and output limits are configurable with `--max-read-bytes`,
 `--max-write-bytes`, `--max-timeout-seconds`, `--max-request-bytes`, and
@@ -511,41 +566,24 @@ The canonical controller/node wire schema lives in
 
 - Local mode uses built-in coder profiles by default.
 - `mmux.toml.example` shows optional local/node profile overlays.
-- `example-backends/microsandbox/` shows how to run the host-side connector
-  against an existing Microsandbox runtime.
+- `example-backends/microsandbox/` shows how to prepare a local Microsandbox
+  runtime and attach mmux to it.
 
 Microsandbox lifecycle belongs to `msb`. mmux does not create, launch, stop,
-snapshot, import, or export Microsandbox runtimes. The node connector runs on
-the host with `mmux node --backend microsandbox` and attaches to an existing
-sandbox by name, so controller credentials and node private keys stay out of
-sandbox config and sandbox files.
+snapshot, import, or export Microsandbox runtimes. For single-binary local
+mode, the controller starts an embedded host-side connector with
+`--enable-microsandbox-node --sandbox-name <name>` and exposes it as node
+`local`. For distributed mode, run `mmux node --backend microsandbox
+--sandbox-name <name>` and register it to a controller. In both modes the
+connector runs on the host and attaches to an existing sandbox by name, so
+controller credentials and node private keys stay out of sandbox config and
+sandbox files.
 
-To keep a host workspace mounted into the sandbox, add an explicit
-`[[sandbox.mounts]]` bind mount, normally with `guest = "/workspace"`. This is
-opt-in because coder CLI processes in the sandbox can read and write the
-mounted tree when the mount is not readonly.
-
-For service access, prefer exact domain rules over broad public egress. DNS is
-also policy-gated under default deny, so a narrow OpenAI runtime rule looks
-like:
-
-```toml
-[[sandbox.network.egress]]
-action = "allow"
-destination_domain = "api.openai.com"
-protocol = "udp"
-ports = [53]
-
-[[sandbox.network.egress]]
-action = "allow"
-destination_domain = "api.openai.com"
-protocol = "tcp"
-ports = [443]
-```
-
-There are two supported ways to avoid installer egress at runtime:
-use a prepared snapshot with `mmux.toml`, or use a prepared Docker/OCI image
-by setting `[sandbox.runtime].image` in `mmux.toml`.
+Workspace persistence is handled by Microsandbox or the surrounding deployment
+system, not by mmux. The local example Makefile creates a sandbox with the
+repo-local `workspace/` mounted read-write at `/workspace` and setup assets
+mounted read-only at `/mmux-setup`. For other deployments, configure mounts
+with `msb`, Kubernetes, or your image/runtime tooling before starting mmux.
 
 ## Health Check
 

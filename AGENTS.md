@@ -278,7 +278,13 @@ Both accept optional `profile` and `session` arguments.
 - mmux shells out to the system `tmux` binary. If tmux is not installed, all tools fail.
 - The server is single-process but async-concurrent. Multiple agents can call tools simultaneously.
 - `thread::sleep` has been replaced with `tokio::time::sleep`. Long waits (e.g., `wait_for` with 60s timeout) do not block other requests.
-- The controller does not start the local backend by default. Use `--enable-local-node` for the built-in local tmux backend.
+- The controller does not start an embedded execution backend by default. Use
+  `--enable-local-node` for the built-in local tmux backend, or
+  `--enable-microsandbox-node --sandbox-name <name>` to embed the host-side
+  Microsandbox connector as node `local`.
 - The local backend does not need a TOML file unless you want profile overlays.
-- Microsandbox lifecycle is managed by `msb`, not mmux. Use `mmux node --backend microsandbox --sandbox-name <name>` only to attach an existing sandbox to a controller.
-- Pass `--config` to override the default config file if needed.
+- Microsandbox lifecycle is managed by `msb`, not mmux. Use embedded
+  Microsandbox mode for a single controller process, or use
+  `mmux node --backend microsandbox --sandbox-name <name>` to attach an
+  existing sandbox to a distributed controller.
+- Pass `--node-config` to override the default profile config file if needed.
