@@ -4,7 +4,7 @@ use std::pin::Pin;
 
 use mmux_node::ProfileRegistry;
 
-use crate::{run_mcp_http_server, ControllerPolicy};
+use crate::{run_mcp_http_server, ControllerPolicy, ResolvedNodeWirePolicy};
 
 pub(crate) trait ControllerRuntime {
     fn run(self) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>>;
@@ -15,8 +15,7 @@ pub(crate) struct LocalRuntimeConfig {
     pub(crate) profiles: ProfileRegistry,
     pub(crate) policy: ControllerPolicy,
     pub(crate) mcp_token: Option<String>,
-    pub(crate) wire_token: Option<String>,
-    pub(crate) allow_unauthenticated_node_wire: bool,
+    pub(crate) wire_auth: ResolvedNodeWirePolicy,
     pub(crate) enable_local_node: bool,
 }
 
@@ -39,8 +38,7 @@ impl ControllerRuntime for LocalRuntime {
                 config.profiles,
                 config.policy,
                 config.mcp_token,
-                config.wire_token,
-                config.allow_unauthenticated_node_wire,
+                config.wire_auth,
                 config.enable_local_node,
             )
             .await

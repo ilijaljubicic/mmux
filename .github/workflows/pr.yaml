@@ -39,21 +39,7 @@ jobs:
           sudo apt-get install -y libcap-ng-dev pkg-config
 
       - name: Check
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ "$RUNNER_OS" == "Linux" ]]; then
-            cargo check --workspace --locked
-          else
-            cargo check --workspace --exclude mmux-microsandbox-node --locked
-          fi
+        run: cargo check --workspace --locked
 
       - name: Test
-        shell: bash
-        run: |
-          set -euo pipefail
-          if [[ "$RUNNER_OS" == "Linux" ]]; then
-            cargo test --workspace --locked
-          else
-            cargo test --workspace --exclude mmux-microsandbox-node --locked
-          fi
+        run: cargo test --workspace --locked

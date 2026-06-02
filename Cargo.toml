@@ -1,7 +1,6 @@
 [workspace]
 members = [
     ".",
-    "crates/backends/microsandbox",
     "crates/mmux-controller",
     "crates/mmux-controller-core",
     "crates/mmux-node",
@@ -11,7 +10,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.2"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -28,12 +27,16 @@ mime = "0.3.17"
 rmcp = { version = "1.7", features = ["server", "transport-streamable-http-server"] }
 ractor = "0.15"
 ractor_actors = { version = "0.4.9", default-features = false, features = ["time"] }
+rustls-pemfile = "2"
+rustls = "0.23"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "time", "io-util"] }
+tokio-rustls = "0.26"
 toml = "1.1.2"
 tower-http = { version = "0.6", features = ["cors"] }
 webpki-roots = "1"
+x509-parser = "0.16"
 
 [package]
 name = "mmux"
@@ -43,4 +46,9 @@ license.workspace = true
 
 [dependencies]
 mmux-controller = { path = "crates/mmux-controller" }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+mmux-node = { path = "crates/mmux-node", features = ["microsandbox"] }
+
+[target.'cfg(not(target_os = "linux"))'.dependencies]
 mmux-node = { path = "crates/mmux-node" }

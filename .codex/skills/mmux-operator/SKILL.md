@@ -16,6 +16,9 @@ when needed.
 - Keep secrets out of prompts, transcripts, and final answers. Refer to secret
   env vars by name only. Never ask a coder to print API keys or tokens.
 - Prefer mmux MCP tools over direct terminal driving for interactive coder CLIs.
+- Do not use `mmux microsandbox`; mmux does not manage Microsandbox lifecycle.
+  Use `msb` for sandbox lifecycle and `mmux node --backend microsandbox` only
+  to attach an existing sandbox to a controller.
 - Keep coder prompts specific: objective, constraints, expected output, and stop
   condition.
 - After each significant coder action, capture output and check state before

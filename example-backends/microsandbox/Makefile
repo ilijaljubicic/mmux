@@ -1,126 +1,55 @@
-.DEFAULT_GOAL := help
+.DEFAULT_GOAL := sandbox-prepare
 
 SANDBOX ?= mmux-node
+SANDBOX_IMAGE ?= debian:bookworm-slim
+SANDBOX_MEMORY ?= 4096M
+SANDBOX_CPUS ?= 2
+REPO_ROOT ?= $(abspath ../..)
+WORKSPACE_ROOT ?= $(REPO_ROOT)/workspace
+SETUP_ROOT ?= $(abspath .)
 NODE_ID ?= msb-mmux-1
 NODE_NAME ?= Microsandbox mmux node
-CONTROLLER_URL ?= http://host.microsandbox.internal:3000
-NODE_CONFIG ?= mmux.toml
-SNAPSHOT_NAME ?= $(SANDBOX)-seed
-BUNDLE ?= .artifacts/$(SANDBOX)-seed.tar.zst
-MMUX_MICROSANDBOX ?= mmux-microsandbox-node
-MMUX_MICROSANDBOX_DEV = cargo run -p mmux-microsandbox-node --
-MMUX_DEV_TARGET ?= x86_64-unknown-linux-musl
-MMUX_DEV_BINARY ?= ../../target/$(MMUX_DEV_TARGET)/release/mmux
-.PHONY: help build-dev dev-build dev-prepare dev-launch dev-bundle-launch dev-bundle-export dev-status dev-logs dev-resume dev-stop prepare-dev launch-dev bundle-launch-dev prepare launch bundle-launch bundle-export status logs stop resume
+CONTROLLER_URL ?= http://127.0.0.1:3000
+MMUX ?= mmux
+MMUX_DEV = cargo run --manifest-path ../../Cargo.toml --
+
+.PHONY: help _sandbox-create _sandbox-setup _sandbox-tmux sandbox-prepare launch dev-launch
 
 help:
-	@printf 'Microsandbox mmux backend example\n'
+	@printf 'Microsandbox mmux connector example\n'
 	@printf '\n'
-	@printf '  make prepare     Prepare sandbox from NODE_CONFIG without starting mmux node\n'
-	@printf '  make launch      Launch mmux node from NODE_CONFIG\n'
-	@printf '  make bundle-launch  Import a bundle and launch from that snapshot\n'
-	@printf '  make bundle-export  Stop, snapshot, and export a bundle\n'
-	@printf '  make status      Show sandbox status\n'
-	@printf '  make logs        Show sandbox logs\n'
-	@printf '  make resume      Start an existing sandbox\n'
-	@printf '  make stop        Stop the sandbox\n'
+	@printf '  make sandbox-prepare  Create/start sandbox and run setup assets\n'
+	@printf '  make launch      Run host-side mmux node connector for an existing sandbox\n'
+	@printf '  make dev-launch  Run connector through cargo for local development\n'
 	@printf '\n'
-	@printf '  make build-dev   Build the local development launcher\n'
-	@printf '  make dev-prepare Run prepare through cargo for local development\n'
-	@printf '  make dev-launch  Run launch through cargo for local development\n'
-	@printf '  make dev-bundle-launch  Run bundle-launch through cargo for local development\n'
+	@printf 'Use msb directly for advanced lifecycle operations such as stop, snapshot, import, and export.\n'
 
-build-dev:
-	cd ../.. && cargo build -p mmux-microsandbox-node
-	cd ../.. && rustup target add $(MMUX_DEV_TARGET)
-	cd ../.. && cargo build --release --target $(MMUX_DEV_TARGET) --bin mmux
+_sandbox-create:
+	msb create $(SANDBOX_IMAGE) \
+		--name $(SANDBOX) \
+		--replace \
+		--memory $(SANDBOX_MEMORY) \
+		--cpus $(SANDBOX_CPUS) \
+		--volume $(WORKSPACE_ROOT):/workspace \
+		--volume $(SETUP_ROOT):/mmux-setup:ro \
+		--workdir /workspace \
+		--shell /bin/bash $(MSB_CREATE_ARGS)
 
-dev-build: build-dev
+_sandbox-setup:
+	msb exec $(SANDBOX) -- bash -lc 'set -eu; for script in /mmux-setup/mmux_sources/scripts/*.sh; do bash "$$script"; done'
 
-dev-prepare:
-	$(MAKE) prepare MMUX_MICROSANDBOX="$(MMUX_MICROSANDBOX_DEV)" PREPARE_ARGS="--mmux-binary $(MMUX_DEV_BINARY)"
+_sandbox-tmux:
+	msb exec $(SANDBOX) -- bash -lc 'set -eu; mkdir -p /mmux; cp /mmux-setup/mmux_sources/assets/tmux.conf /mmux/tmux.conf; printf "source-file /mmux/tmux.conf\n" > /etc/tmux.conf'
+
+sandbox-prepare: _sandbox-create _sandbox-setup _sandbox-tmux
 
 dev-launch:
-	$(MAKE) launch MMUX_MICROSANDBOX="$(MMUX_MICROSANDBOX_DEV)"
-
-dev-bundle-launch:
-	$(MAKE) bundle-launch MMUX_MICROSANDBOX="$(MMUX_MICROSANDBOX_DEV)"
-
-dev-bundle-export:
-	$(MAKE) bundle-export MMUX_MICROSANDBOX="$(MMUX_MICROSANDBOX_DEV)"
-
-dev-status:
-	$(MAKE) status MMUX_MICROSANDBOX="$(MMUX_MICROSANDBOX_DEV)"
-
-dev-logs:
-	$(MAKE) logs MMUX_MICROSANDBOX="$(MMUX_MICROSANDBOX_DEV)"
-
-dev-resume:
-	$(MAKE) resume MMUX_MICROSANDBOX="$(MMUX_MICROSANDBOX_DEV)"
-
-dev-stop:
-	$(MAKE) stop MMUX_MICROSANDBOX="$(MMUX_MICROSANDBOX_DEV)"
-
-prepare-dev: dev-prepare
-
-launch-dev: dev-launch
-
-bundle-launch-dev: dev-bundle-launch
-
-prepare:
-	$(MMUX_MICROSANDBOX) prepare \
-		--name $(SANDBOX) \
-		--node-config $(NODE_CONFIG) \
-		$(PREPARE_ARGS)
+	$(MAKE) launch MMUX="$(MMUX_DEV)"
 
 launch:
-	$(MMUX_MICROSANDBOX) launch \
-		--name $(SANDBOX) \
-		--node-config $(NODE_CONFIG) \
+	$(MMUX) node \
+		--backend microsandbox \
+		--sandbox-name $(SANDBOX) \
 		--controller-url $(CONTROLLER_URL) \
 		--node-id $(NODE_ID) \
-		--node-name "$(NODE_NAME)"
-
-bundle-launch:
-	@set -e; \
-	imported="$$($(MMUX_MICROSANDBOX) snapshot-import --bundle $(BUNDLE) | sed -n 's/.*"path": "\(.*\)",/\1/p' | head -n 1)"; \
-	if [ -z "$$imported" ]; then \
-		echo "failed to import snapshot bundle $(BUNDLE)" >&2; \
-		exit 1; \
-	fi; \
-	$(MMUX_MICROSANDBOX) launch \
-		--name $(SANDBOX) \
-		--node-config $(NODE_CONFIG) \
-		--snapshot "$$imported" \
-		--controller-url $(CONTROLLER_URL) \
-		--node-id $(NODE_ID) \
-		--node-name "$(NODE_NAME)"
-
-bundle-export:
-	@set -e; \
-	if [ "$(origin SANDBOX)" != "command line" ] && [ "$(origin SANDBOX)" != "environment" ] && [ "$(origin SANDBOX)" != "environment override" ]; then \
-		echo "SANDBOX is required for bundle-export because the snapshot is tied to a sandbox instance." >&2; \
-		echo "Example:" >&2; \
-		echo "  make bundle-export SANDBOX=mmux-node SNAPSHOT_NAME=mmux-node-seed BUNDLE=.artifacts/mmux-node-seed.tar.zst" >&2; \
-		exit 1; \
-	fi; \
-	$(MMUX_MICROSANDBOX) snapshot-export \
-		--name $(SANDBOX) \
-		--snapshot-name $(SNAPSHOT_NAME) \
-		--bundle $(BUNDLE)
-
-status:
-	$(MMUX_MICROSANDBOX) status \
-		--name $(SANDBOX)
-
-logs:
-	$(MMUX_MICROSANDBOX) logs \
-		--name $(SANDBOX)
-
-resume:
-	$(MMUX_MICROSANDBOX) resume \
-		--name $(SANDBOX)
-
-stop:
-	$(MMUX_MICROSANDBOX) stop \
-		--name $(SANDBOX)
+		--node-name "$(NODE_NAME)" $(NODE_ARGS)

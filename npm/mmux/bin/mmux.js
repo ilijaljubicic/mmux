@@ -56,11 +56,6 @@ if (!fs.existsSync(binaryPath)) {
     process.exit(1);
   }
   fs.chmodSync(binaryPath, 0o755);
-
-  const microsandboxPath = path.join(cacheDir, "mmux-microsandbox-node");
-  if (fs.existsSync(microsandboxPath)) {
-    fs.chmodSync(microsandboxPath, 0o755);
-  }
 }
 
 const result = childProcess.spawnSync(binaryPath, process.argv.slice(2), {

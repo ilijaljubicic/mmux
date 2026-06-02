@@ -32,17 +32,9 @@ mkdir -p "$PACKAGE_DIR" "$ARTIFACTS_DIR"
 
 if [ "${MMUX_NPM_SKIP_BUILD:-0}" != "1" ]; then
   cargo build --release --bin mmux
-  if [ "$OS" = "linux" ] && [ "${MMUX_NPM_INCLUDE_MICROSANDBOX:-0}" = "1" ]; then
-    cargo build --release -p mmux-microsandbox-node --bin mmux-microsandbox-node
-  fi
 fi
 
 cp "$ROOT/target/release/mmux" "$PACKAGE_DIR/mmux"
-if [ "$OS" = "linux" ] \
-  && [ "${MMUX_NPM_INCLUDE_MICROSANDBOX:-0}" = "1" ] \
-  && [ -f "$ROOT/target/release/mmux-microsandbox-node" ]; then
-  cp "$ROOT/target/release/mmux-microsandbox-node" "$PACKAGE_DIR/mmux-microsandbox-node"
-fi
 
 tar -czf "$ARTIFACTS_DIR/$ARCHIVE" -C "$PACKAGE_DIR" .
 
@@ -56,12 +48,7 @@ fs.writeFileSync(path, JSON.stringify(pkg, null, 2) + "\n");
 ' "$NPM_DIR/package.json" "$VERSION"
 
 echo "Created $ARTIFACTS_DIR/$ARCHIVE"
-if [ "$OS" = "linux" ] && [ ! -f "$PACKAGE_DIR/mmux-microsandbox-node" ]; then
-  echo "Note: mmux-microsandbox-node was not included."
-  echo "      Set MMUX_NPM_INCLUDE_MICROSANDBOX=1 to include it in the Linux npm archive."
-fi
 echo
 echo "Next steps:"
 echo "  make npm-pack-dry-run"
-echo "  npm login"
-echo "  make npm-publish"
+echo "  make npm-pack"

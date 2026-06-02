@@ -10,7 +10,7 @@ define update_version
 	perl -0pi -e 's/(\[workspace\.package\]\nversion = ")[^"]+(")/$${1}$(1)$${2}/' $(CARGO_TOML)
 endef
 
-.PHONY: help build check test clean lint release release-build prepare-release release-tag npm-package npm-pack-dry-run npm-pack npm-publish update-patch update-minor update-major generate-build run-local run-controller run-node wire-check-tools wire-generate
+.PHONY: help build check test clean lint release release-tag npm-package npm-pack-dry-run npm-pack update-patch update-minor update-major run-local run-controller run-node wire-check-tools wire-generate
 
 LOCAL_ARGS ?=
 CONTROLLER_ARGS ?=
@@ -25,18 +25,14 @@ help:
 	@printf '  make test              Run workspace tests\n'
 	@printf '  make lint              Run clippy across workspace targets\n'
 	@printf '  make release           Release-build the full Cargo workspace\n'
-	@printf '  make release-build     Alias for make release\n'
-	@printf '  make generate-build    Generate wire sources, then debug-build\n'
 	@printf '\nRelease publishing:\n'
 	@printf '  make update-patch      Bump workspace patch version\n'
 	@printf '  make update-minor      Bump workspace minor version\n'
 	@printf '  make update-major      Bump workspace major version\n'
-	@printf '  make prepare-release   Refresh lockfile and run release checks\n'
 	@printf '  make release-tag       Tag v$$(workspace.package.version) and push it to trigger GitHub release\n'
 	@printf '  make npm-package       Build current-platform npm archive under npm/mmux/artifacts\n'
 	@printf '  make npm-pack-dry-run  Build package, then inspect npm pack contents\n'
 	@printf '  make npm-pack          Build package, then run npm pack in npm/mmux\n'
-	@printf '  make npm-publish       Build package, then publish it to the npm registry\n'
 	@printf '\nRun locally:\n'
 	@printf '  make run-local         Run mmux controller with the built-in local node enabled\n'
 	@printf '  make run-controller    Run mmux controller\n'
@@ -55,9 +51,7 @@ check:
 	cargo check --workspace
 
 # Release build
-release: release-build
-
-release-build:
+release:
 	cargo build --workspace --release
 
 update-patch:
@@ -80,15 +74,6 @@ update-major:
 	$(eval NEW_VERSION := $(shell echo $(CURRENT_VERSION) | awk -F. '{$$1=$$1+1; $$2=0; $$3=0} 1' OFS=.))
 	$(call update_version,$(NEW_VERSION))
 	@echo "Version updated from $(CURRENT_VERSION) to $(NEW_VERSION)"
-
-prepare-release:
-	@echo "Preparing release..."
-	$(eval VERSION := $(call get_version))
-	@echo "Current version: $(VERSION)"
-	cargo update
-	cargo test --workspace
-	cargo build --workspace --release
-	@echo "Release preparation complete for version $(VERSION)"
 
 release-tag:
 	@echo "Creating release tag from current branch..."
@@ -116,12 +101,6 @@ npm-pack-dry-run: npm-package
 
 npm-pack: npm-package
 	cd npm/mmux && npm --cache $(NPM_CACHE) pack
-
-npm-publish: npm-package
-	cd npm/mmux && npm --cache $(NPM_CACHE) publish --access public
-
-# Generate wire sources, then build the full workspace
-generate-build: wire-generate build
 
 # Run workspace tests
 test:

@@ -5,6 +5,13 @@
 //! local runtime dependencies such as axum, tokio networking, ractor, tmux, and
 //! filesystem access.
 
+mod auth;
+
+pub use auth::{
+    NodeWireAuthContext, NodeWireAuthMethod, NodeWireAuthMode, NodeWireAuthPolicy,
+    NodeWireIdentity, NodeWireIdentitySource,
+};
+
 use std::collections::{HashMap, VecDeque};
 
 use mmux_wire::{NodeCommand, NodeCommandKind, NodeDescriptor, NodeStatus};
