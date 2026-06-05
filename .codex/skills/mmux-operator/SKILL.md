@@ -46,7 +46,9 @@ when needed.
 ## Default Workflow
 
 1. Confirm the mmux server:
-   `GET /health`, then `list_coder_profiles` and `list_sessions`.
+   `GET /health`, then `list_coder_profiles` and project-scoped
+   `list_sessions(project_id)`. Use `admin_list_node_sessions` only for raw
+   node/tmux admin debugging.
 2. Start or reuse the right coder session:
    `start_coding_session(profile, session, workspace_path, objective)`.
    This creates or adopts the tmux session and returns without waiting for the
@@ -56,7 +58,8 @@ when needed.
    for quick checks use `check_state` or `capture_output`.
    If `check_state` shows `promptable=true` and `turn_idle=false`, you may send
    steering text, but the previous foreground turn is still active.
-4. Delegate the task with `coding_send`.
+4. Delegate initial task work with `coding_task_send`; use `coding_send` for
+   follow-up steering or non-task prompts.
 5. Wait, read, and steer:
    `wait_start`, `wait_status`, `wait_cancel`, `coding_read`,
    `coding_action`, `capture_output`.
@@ -91,42 +94,62 @@ Use this flow when coordinating tasks through the orchestration tools:
    explicit `node`, `profile`, `workspace_path`, boolean `bypass_permissions`,
    `task_ids`, `role`, `kind`, `skills`, and `objective`. Provide `session`, or
    request `generate_session_name = true`.
+   When `task_ids` is present, `node` is mandatory. Pass the selected runtime
+   node explicitly, such as `node = "local"` for the embedded local node.
+   `TaskAgent` metadata is planning intent only; mmux does not infer node,
+   profile, workspace, or bypass settings from it.
 10. Do not assume non-`mmux-*` sessions are orchestration-owned.
 11. Record existing or manually adopted coder sessions with `session_record`.
-12. Select a static role prompt example below, then build a compact context
-    block from `orchestration_status` and session output before sending it with
-    `coding_send`. Do not only reference task IDs. Include task titles,
-    summaries, changed-file groups, gates, dependency state, selected
-    `TaskAgent` intent, session hints, and expected report fields that the
-    worker needs to decide correctly without looking up orchestration state.
+12. Use `coding_task_send` for initial task delegation. Pass `task_id_or_slug`
+    and a concrete instruction; mmux builds deterministic task context from
+    orchestration state and appends your instruction before sending. Use
+    `template = "task"` for implementation/delegation, `template = "validate"`
+    for gate validation, `template = "review"` for bug/risk review, and
+    `template = "quality-guard"` for maintainability, architecture fit, naming,
+    boundaries, lifecycle, API shape, and operator/project quality preferences.
+    Use `coding_send` only for follow-up prompts, steering, corrections, or
+    non-task sessions.
 13. Update task state with `task_status_update`. Include `status` and a concise
     `summary`; include `blockers` when blocked. For gated moves to `Passed` or
     `Delivered`, include evidence in the summary.
 
-Task-owned `gates` are validation checks. Validator, auditor, and reviewer
-prompts should request pass/fail findings, evidence references, blockers, and
-unresolved questions. Moving a gated task to `Passed` or `Delivered` requires
-an operator-recorded summary.
+Task-owned `gates` are validation checks. Moving a gated task to `Passed` or
+`Delivered` requires an operator-recorded summary.
 
-When delegating validation or review, copy the relevant task details into the
-prompt as data. A good prompt includes a compact block like:
+`coding_task_send` templates answer different orchestration questions:
+
+- `template = "task"` answers: "What work should this agent perform for this
+  task?" Use it for the initial implementation/delegation prompt. Put concrete
+  execution instructions in `prompt`: scope, constraints, expected report, and
+  what not to mutate.
+- `template = "validate"` answers: "Does the result satisfy the task gates and
+  objective?" Use it for validator sessions. Put the validation focus in
+  `prompt`: which gates, evidence, commands, files, or reports to inspect.
+- `template = "review"` answers: "Are there correctness risks, regressions,
+  missing tests, contract breaks, or scope drift?" Use it for reviewer/auditor
+  sessions. Put the changed files, suspected risks, or review angle in
+  `prompt`.
+- `template = "quality-guard"` answers: "Does the change conform to the
+  project/operator quality bar?" Use it for maintainability and design-quality
+  checks. Put operator-specific guard points in `prompt`, such as architecture
+  boundaries, naming preferences, lifecycle clarity, API shape, compatibility
+  policy, or abstraction discipline.
+
+Templates provide the operating mode and task context. The `prompt` provides
+the specific assignment. Do not rely on a task id alone; include the concrete
+focus the worker should act on.
+
+For validation, prefer `coding_task_send` with `template = "validate"`, for
+example:
 
 ```text
-Task context:
-- task-20: <title>; status <status>; summary <summary>; gates <gate results>
-- task-21: <title>; status <status>; summary <summary>; gates <gate results>
-
-Changed-file groups:
-- docs: <paths>
-- skills: <paths>
-
-Expected validation gates:
-- <gate 1>
-- <gate 2>
+Validate this task against its gates. Report pass/fail findings, evidence
+references, blockers, unresolved questions, and recommended status. Do not
+mutate mmux task state directly.
 ```
 
-Do not send a prompt that says only "validate task-20/task-21" unless the
-worker is explicitly allowed to query mmux state itself.
+Do not send empty prompts or placeholder prompt text such as `null` or
+`undefined`; these indicate a bad extraction/parsing path.
 
 Use cancellable runtime wait jobs as the canonical orchestration wait API:
 `wait_start`, `wait_status`, and `wait_cancel`. Supported wait kinds are
@@ -156,12 +179,11 @@ Do not touch unrelated worktree changes.
 
 ## Orchestration Role Prompt Examples
 
-These are copy/edit examples for `coding_send`, not MCP prompts and not
-controller runtime features. Fill the prompt with copied task details from
-`orchestration_status`; do not only refer to task IDs. Include summaries,
-changed-file groups, selected `TaskAgent` intent/prompt, session hints,
-dependencies, gates, and expected report fields. Worker sessions should propose
-and report; the operator records accepted task mutations.
+These are copy/edit examples for the `prompt` field of `coding_task_send` or
+follow-up `coding_send`; they are not MCP prompts and not controller runtime
+features. With `coding_task_send`, mmux supplies the task context. Worker
+sessions should propose and report; the operator records accepted task
+mutations.
 
 ```text
 Role: planner
@@ -249,6 +271,17 @@ Gates and expected behavior: <gate list, acceptance criteria, expected outcomes>
 Review for regressions, contract breaks, stale docs, and missing tests. Report:
 verdict pass|fail, findings with severity and evidence reference,
 changed_files reviewed, blockers, unresolved_questions.
+Do not edit files.
+```
+
+```text
+Role: quality-guard
+Task/change context: <task, files, summaries, operator preferences>
+Guard points: <project/operator-specific quality concerns>
+Check maintainability, architecture fit, naming, boundaries, lifecycle, state
+ownership, API coherence, and project conventions. Report: overall
+recommendation proceed|revise|escalate, relevant built-in heuristic concerns,
+operator guard point results, evidence refs, recommended corrections, blockers.
 Do not edit files.
 ```
 

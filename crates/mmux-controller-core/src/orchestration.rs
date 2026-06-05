@@ -192,6 +192,7 @@ pub struct TaskSummary {
     pub status: TaskStatus,
     pub summary: Option<String>,
     pub owner: Option<TaskParticipant>,
+    pub agents: Vec<TaskAgent>,
     pub parent: Option<TaskId>,
     pub child_count: usize,
     pub dependency_count: usize,
@@ -562,6 +563,7 @@ impl OrchestrationState {
                     status: task.status,
                     summary: task.summary.clone(),
                     owner: task.owner.clone(),
+                    agents: task.agents.clone(),
                     parent: parent_by_child
                         .get(&task.id)
                         .and_then(|parents| parents.first().cloned()),
@@ -734,6 +736,7 @@ impl OrchestrationState {
         if input.objective.trim().is_empty() {
             return Err("task objective must not be empty".into());
         }
+        validate_task_agents(&input.agents)?;
 
         let id = TaskId(format!("task-{}", self.next_task_id));
         self.next_task_id += 1;
@@ -776,6 +779,9 @@ impl OrchestrationState {
             if objective.trim().is_empty() {
                 return Err("task objective must not be empty".into());
             }
+        }
+        if let Some(agents) = update.agents.as_ref() {
+            validate_task_agents(agents)?;
         }
 
         let task = self
@@ -1069,6 +1075,26 @@ impl OrchestrationState {
         }
         Ok(())
     }
+}
+
+fn validate_prompt_text(field: &str, prompt: &str) -> Result<(), String> {
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    if matches!(trimmed, "null" | "undefined") {
+        return Err(format!(
+            "{field} must not be the placeholder string '{trimmed}'"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_task_agents(agents: &[TaskAgent]) -> Result<(), String> {
+    for (index, agent) in agents.iter().enumerate() {
+        validate_prompt_text(&format!("agents[{index}].prompt"), &agent.prompt)?;
+    }
+    Ok(())
 }
 
 fn empty_task_status_counts() -> BTreeMap<TaskStatus, usize> {
@@ -1454,6 +1480,22 @@ mod tests {
     }
 
     #[test]
+    fn task_creation_rejects_empty_or_placeholder_agent_prompts() {
+        for prompt in ["", "   ", "null", " undefined "] {
+            let mut state = state_with_project();
+            let mut agent = agent();
+            agent.prompt = prompt.into();
+            let error = state
+                .create_task(create_task_with_agent("Bad Agent Prompt", agent), 100)
+                .unwrap_err();
+            assert!(
+                error.contains("agents[0].prompt"),
+                "expected agent prompt validation error for {prompt:?}, got {error}"
+            );
+        }
+    }
+
+    #[test]
     fn task_update_mutates_metadata_without_identity_runtime_or_status_changes() {
         let mut state = state_with_project();
         let mut input = create_task("Original Task");
@@ -1522,6 +1564,27 @@ mod tests {
         assert_eq!(updated.updated_at_ms, 200);
         assert_eq!(state.task_edges, original_edges);
         assert_eq!(state.sessions, original_sessions);
+    }
+
+    #[test]
+    fn task_update_rejects_empty_or_placeholder_agent_prompts() {
+        let mut state = state_with_project();
+        let task = state.create_task(create_task("Task"), 100).unwrap();
+        let mut agent = agent();
+        agent.prompt = "null".into();
+
+        let error = state
+            .update_task(
+                &task.id,
+                UpdateTask {
+                    agents: Some(vec![agent]),
+                    ..UpdateTask::default()
+                },
+                200,
+            )
+            .unwrap_err();
+
+        assert!(error.contains("agents[0].prompt"), "{error}");
     }
 
     #[test]
@@ -2007,6 +2070,24 @@ mod tests {
         for task_status in TaskStatus::ALL {
             assert_eq!(project.task_status_counts[&task_status], 0);
         }
+    }
+
+    #[test]
+    fn orchestration_status_includes_task_agent_prompts() {
+        let mut state = state_with_project();
+        let agent = agent();
+        let task = state
+            .create_task(create_task_with_agent("Agent Summary", agent.clone()), 100)
+            .unwrap();
+
+        let status = state.orchestration_status(200);
+        let summary = status
+            .tasks
+            .iter()
+            .find(|summary| summary.id == task.id)
+            .unwrap();
+
+        assert_eq!(summary.agents, vec![agent]);
     }
 
     #[test]

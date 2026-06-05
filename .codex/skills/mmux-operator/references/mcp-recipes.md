@@ -17,6 +17,12 @@ values:
 -H "Authorization: Bearer $MMUX_MCP_TOKEN"
 ```
 
+When calling MCP directly, check both JSON-RPC `error` and tool-level
+`isError` before parsing the result as a success payload. Tool failures are
+returned clearly inside the MCP envelope. For task-aware `start_coding_session`,
+`node` is mandatory when `task_ids` is present; pass `node: "local"` for the
+embedded local node.
+
 ## Discovery
 
 ```json
@@ -69,8 +75,8 @@ values:
 {"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"start_coding_session","arguments":{"node":"local","profile":"codex","bypass_permissions":false,"task_ids":["task-0001"],"role":"editable-worker","kind":"codex","skills":["docs","mmux"],"workspace_path":"/mnt/Radni/mmux","objective":"Patch docs and report validation evidence.","generate_session_name":true}}}
 ```
 
-Use the returned session name for `coding_send`, wait tools, `coding_read`, and
-task updates.
+Use the returned session name for `coding_task_send`, follow-up `coding_send`,
+wait tools, `coding_read`, and task updates.
 
 ```json
 {"jsonrpc":"2.0","id":21,"method":"tools/call","params":{"name":"session_record","arguments":{"node_id":"local","session":"codex-docs-worker","profile":"codex","workspace_path":"/mnt/Radni/mmux","bypass_permissions":false,"task_ids":["task-0001"],"role":"editable-worker","kind":"codex","skills":["docs","mmux"],"objective":"Patch docs and report validation evidence."}}}
@@ -79,7 +85,14 @@ task updates.
 ## Send Work
 
 ```json
-{"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"coding_send","arguments":{"node":"local","profile":"codex","session":"mmux-docs-worker","prompt":"Role: editable-worker\nTask: task-0001 - Update orchestration docs\nObjective: Document the orchestration workflow.\nScope: include README.md and AGENTS.md; exclude target.\nImplement only this task. Run focused validation. Report: summary, changed_files, validations_run, blockers, unresolved_questions. Do not mutate mmux task state directly."}}}
+{"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"coding_task_send","arguments":{"node":"local","profile":"codex","session":"mmux-docs-worker","task_id_or_slug":"task-0001","template":"task","prompt":"Implement only this task. Run focused validation. Report: summary, changed_files, validations_run, blockers, unresolved_questions. Do not mutate mmux task state directly."}}}
+```
+
+Use `template:"quality-guard"` when the worker should check project/operator
+quality preferences rather than validate gates or perform a general review:
+
+```json
+{"jsonrpc":"2.0","id":30,"method":"tools/call","params":{"name":"coding_task_send","arguments":{"node":"local","profile":"codex","session":"mmux-docs-worker","task_id_or_slug":"task-0001","template":"quality-guard","prompt":"Check for over-generalization, hidden runtime assumptions, unclear ownership, compatibility fallbacks, and abstractions that do not reduce complexity. Report proceed|revise|escalate with evidence and recommended corrections."}}}
 ```
 
 ```json
@@ -135,7 +148,13 @@ Inspect state again after cleanup:
 ## Troubleshooting
 
 ```json
-{"jsonrpc":"2.0","id":60,"method":"tools/call","params":{"name":"list_sessions","arguments":{"node":"local"}}}
+{"jsonrpc":"2.0","id":60,"method":"tools/call","params":{"name":"list_sessions","arguments":{"node":"local","project_id":"project-1"}}}
+```
+
+Use raw node visibility only for admin/debug:
+
+```json
+{"jsonrpc":"2.0","id":60,"method":"tools/call","params":{"name":"admin_list_node_sessions","arguments":{"node":"local"}}}
 ```
 
 ```json

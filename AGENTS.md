@@ -35,10 +35,10 @@ Do you need to run a command in a terminal?
   └─ Use exec for one-shot commands, or start_coding_session / send_input / send_key → capture_output for interactive work
 
 Do you need to drive a coding CLI (codex, opencode, kimi, claude)?
-  └─ Use list_coder_profiles → start_coding_session → coding_send → wait_start(kind=coding-ready) → wait_status → coding_read → coding_action
+  └─ Use list_coder_profiles → start_coding_session → coding_send or coding_task_send → wait_start(kind=coding-ready) → wait_status → coding_read → coding_action
 
 Do you need to coordinate task work across coder sessions?
-  └─ Use tools/list → orchestration_status → project_create/project_list → task_create/task_update/task_assign/edges → start_coding_session or session_record → coding_send → task_status_update
+  └─ Use tools/list → orchestration_status → project_create/project_list → task_create/task_update/task_assign/edges → start_coding_session or session_record → coding_task_send → task_status_update
 
 Do you need to check what's happening without waiting?
   └─ Use check_state or capture_output
@@ -97,7 +97,8 @@ An old controller process cannot expose tools compiled into a newer binary.
 ### 1. Always check what is already running
 ```
 tools/list     → discover the current MCP surface
-list_sessions  → see what's running as JSON session objects
+list_sessions(project_id) → see recorded sessions for one project
+admin_list_node_sessions  → raw node/tmux session discovery for admin/debug
 session_info   → deep inspect a specific session
 check_state    → quick JSON check (has_prompt, promptable, busy, turn_idle)
 ```
@@ -150,8 +151,9 @@ can update task state unless the operator explicitly delegates that authority.
    `list_coder_profiles`.
 2. Inspect durable state with `orchestration_status`; use it for compact
    project, task, summary, blocker, owner/session, cleanup candidate, warning,
-   and runtime-state data. Pass `include_completed=true` when delivered,
-   canceled, or failed tasks matter.
+   task-agent, and runtime-state data. Task summaries include `agents`, so the
+   selected `TaskAgent.prompt` can be copied from status when needed. Pass
+   `include_completed=true` when delivered, canceled, or failed tasks matter.
 3. Create or select a project with `project_create`/`project_list`. Projects
    are required boundaries and do not own workspace paths, nodes, or profiles.
    Project summaries include total, active, and `task_status_counts` entries
@@ -177,15 +179,43 @@ can update task state unless the operator explicitly delegates that authority.
    `profile`, `workspace_path`, boolean `bypass_permissions`, `task_ids`,
    `role`, `kind`, `skills`, and `objective`; use `session` or
    `generate_session_name=true`.
+   If `task_ids` is present, do not rely on `TaskAgent` metadata for runtime
+   placement. Pass the selected node explicitly, for example `node="local"` for
+   the embedded local node. The controller intentionally errors with
+   `task-aware start_coding_session requires explicit node` when this is
+   omitted.
    For task-attached `session_record` calls, the controller validates that the
    selected node is reachable and the tmux session already exists before it
    writes durable state.
    Treat `workspace_path` as the backend-owned workspace/start directory for
    the selected node/backend. Pass the explicit string through without
    controller-side canonicalization.
-8. Fill a static role prompt example from the `mmux-operator` skill with the
-   task id, objective, scope, dependencies, gates, selected `TaskAgent` intent,
-   session hints, and expected report fields. Send it with `coding_send`.
+8. For initial task delegation, use `coding_task_send` with `task_id_or_slug`
+   and a concrete instruction. It builds deterministic task context from
+   orchestration state and sends it with profile-aware coding behavior. Use
+   `template="task"` for implementation/delegation, `template="validate"` for
+   gate validation, `template="review"` for bug/risk review, and
+   `template="quality-guard"` for maintainability, architecture fit, naming,
+   boundaries, lifecycle, API shape, and operator/project quality preferences.
+   Use `coding_send` only for follow-up prompts, steering, corrections, or
+   non-task sessions.
+   Never send a prompt that is empty or the literal placeholder text `null` or
+   `undefined`; mmux rejects these, and callers should treat that as a script
+   extraction/parsing bug.
+
+   Template selection answers different orchestration questions:
+   - `task`: "What work should this agent perform for this task?" Use for
+     initial implementation/delegation.
+   - `validate`: "Does the result satisfy the task gates and objective?" Use
+     for validator sessions.
+   - `review`: "Are there correctness risks, regressions, missing tests,
+     contract breaks, or scope drift?" Use for reviewer/auditor sessions.
+   - `quality-guard`: "Does the change conform to the project/operator quality
+     bar?" Use for maintainability and design-quality checks.
+
+   The template supplies the operating mode and task context. The prompt must
+   supply the concrete focus, such as scope, evidence to inspect, review angle,
+   or operator-specific guard points.
 9. Record accepted progress with `task_status_update`. Include a concise
    `summary`; include `blockers` when blocked. For gated moves to `Passed` or
    `Delivered`, the summary must include validation or review evidence.
@@ -228,12 +258,19 @@ wait_status(wait_id="<returned wait_id>")
 ```
 
 If the CLI shows startup noise or an update prompt, the profile's
-`startup_dismiss` config will automatically send its configured key sequence
-before proceeding.
+`startup_dismiss` config can handle it before proceeding. Codex update prompts
+use a policy: `skip-update` by default, or `update-now` when explicitly
+configured in profile TOML.
 
 ### Step 3: Send your prompt
 ```
 coding_send(session="codex", profile="codex", prompt="refactor auth module")
+```
+
+For initial orchestration task delegation, prefer:
+
+```
+coding_task_send(session="codex", profile="codex", task_id_or_slug="task-29", template="task", prompt="Implement this task. Report changed files, validation commands, blockers, and unresolved questions.")
 ```
 
 ### Step 4: Wait for it to finish processing
@@ -259,7 +296,7 @@ coding_action(session="codex", profile="codex", action="cancel")
 ```
 1. list_coder_profiles
 2. start_coding_session → profile="codex", session="codex"
-3. coding_send → prompt="implement fibonacci"
+3. coding_send or coding_task_send → prompt="implement fibonacci"
 4. wait_start → kind="coding-ready", profile="codex"
 5. wait_status → until completed, failed, or canceled
 6. coding_read → lines=40
@@ -297,7 +334,7 @@ Key fields:
 | `reject_keys` | Keys to send for rejection (e.g., `n Enter`) |
 | `cancel_keys` | Keys to send to cancel (e.g., `C-c`) |
 | `escape_keys` | Keys to send to escape/dismiss (e.g., `Escape`) |
-| `startup_dismiss` | Auto-dismiss startup noise if detected |
+| `startup_dismiss` | Auto-dismiss startup noise if detected; update prompts use `policy = "skip-update"` or `policy = "update-now"` |
 
 Use `list_coder_profiles` to inspect the loaded runtime profiles.
 
@@ -316,6 +353,12 @@ load_profile(path="/path/to/custom.toml")
 ### `send_input` vs `coding_send`
 - `send_input` — raw text, no profile logic. Use for generic shells, REPLs, scripts.
 - `coding_send` — profile-aware. Auto-dismisses startup noise and uses the profile's text/submit strategy. Use only for coding CLIs. Claude Code uses `text_mode = "literal-keys"` so `Enter` is sent as a real keypress rather than pasted text.
+- `coding_task_send` — task-aware initial delegation. It renders task context
+  from orchestration state and appends your instruction before using the same
+  profile-aware send behavior. Use `template="quality-guard"` when the worker
+  should check project/operator quality preferences rather than validate gates
+  or perform a general review. Use `template="validate"` for gate/objective
+  validation and `template="review"` for correctness/risk review.
 
 ### `capture_output` vs `coding_read`
 - `capture_output` — any session. Can capture scrollback.

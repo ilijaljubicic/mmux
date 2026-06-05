@@ -6,10 +6,10 @@ use connectrpc::{
 };
 use mmux_controller_core::{
     orchestration::{
-        CreateProject, CreateTask, CreateTaskEdge, NodeId, OrchestrationCounts,
+        CreateProject, CreateTask, CreateTaskEdge, NodeId, OrchestrationCounts, OrchestrationState,
         OrchestrationStatus, ProjectId, ProjectStatus, SessionCleanupCandidate, SessionId,
-        SessionRecord, TaskAgent, TaskEdgeKind, TaskId, TaskParticipant, TaskScope, TaskStatus,
-        UpdateTask, UpdateTaskScope,
+        SessionRecord, Task, TaskAgent, TaskEdge, TaskEdgeKind, TaskId, TaskParticipant, TaskScope,
+        TaskStatus, UpdateTask, UpdateTaskScope,
     },
     NodeRegistry, NodeWireAuthContext, NodeWireAuthMode, NodeWireAuthPolicy, NodeWireIdentity,
 };
@@ -74,6 +74,10 @@ const ORCHESTRATION_SESSION_PREFIX: &str = "mmux";
 const MAX_ORCHESTRATION_TASK_SLUG_LEN: usize = 40;
 const MAX_ORCHESTRATION_KIND_LEN: usize = 24;
 const MAX_ORCHESTRATION_SUFFIX_LEN: usize = 8;
+const CODING_TASK_SEND_PROMPT: &str = include_str!("prompts/coding_task_send.md");
+const CODING_VALIDATE_SEND_PROMPT: &str = include_str!("prompts/coding_validate_send.md");
+const CODING_REVIEW_SEND_PROMPT: &str = include_str!("prompts/coding_review_send.md");
+const CODING_QUALITY_GUARD_SEND_PROMPT: &str = include_str!("prompts/coding_quality_guard_send.md");
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  rmcp imports (MCP HTTP server)
@@ -248,10 +252,12 @@ pub(crate) enum EmbeddedNodeConfig {
 }
 
 impl EmbeddedNodeConfig {
-    fn display_name(&self) -> &'static str {
+    fn display_name(&self) -> String {
         match self {
-            Self::Local { .. } => "local tmux",
-            Self::Microsandbox { .. } => "Microsandbox",
+            Self::Local { .. } => "Local tmux node".into(),
+            Self::Microsandbox { sandbox_name } => {
+                format!("Microsandbox node '{}'", sandbox_name)
+            }
         }
     }
 }
@@ -301,8 +307,8 @@ impl ControllerPolicy {
 
 const SESSION_OBJECTIVE_OPTION: &str = "@mmux_objective";
 const SESSION_LIST_FORMAT: &str =
-    "#{session_name}\t#{session_windows}\t#{session_attached}\t#{session_created}\t#{@mmux_objective}";
-const SESSION_INFO_LIST_FORMAT: &str = "#{session_name}\t#{session_created}";
+    "#{session_name}|#{session_windows}|#{session_attached}|#{session_created}|#{@mmux_objective}";
+const SESSION_INFO_LIST_FORMAT: &str = "#{session_name}|#{session_created}";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 struct SessionListEntry {
@@ -728,14 +734,22 @@ fn profile_turn_idle(output: &str, profile: &CliProfile) -> bool {
     profile_has_prompt(output, profile) && !profile_is_busy(output, profile)
 }
 
-fn startup_dismiss_key<'a>(output: &str, profile: &'a CliProfile) -> Option<&'a str> {
+fn startup_dismiss_key(output: &str, profile: &CliProfile) -> Option<String> {
     let dismiss = profile.startup_dismiss.as_ref()?;
     let scan_region = readiness_scan_region(output, profile);
-    dismiss
+    if !dismiss
         .triggers
         .iter()
         .any(|trigger| !trigger.is_empty() && scan_region.contains(trigger))
-        .then_some(dismiss.key.as_str())
+    {
+        return None;
+    }
+    match dismiss.policy.as_str() {
+        "skip-update" => Some("Down Enter".into()),
+        "update-now" => Some("Enter".into()),
+        "custom-keys" => dismiss.key.clone(),
+        _ => None,
+    }
 }
 
 fn key_sequence_parts(keys: &str) -> Vec<&str> {
@@ -969,7 +983,7 @@ enum NodeRegistryMessage {
 impl Actor for NodeRegistryActor {
     type Msg = NodeRegistryMessage;
     type State = NodeRegistryState;
-    type Arguments = bool;
+    type Arguments = Option<String>;
 
     async fn pre_start(
         &self,
@@ -1199,7 +1213,7 @@ fn parse_session_list(node: &str, output: &str) -> Vec<SessionListEntry> {
             if line.trim().is_empty() || line.trim() == "No tmux sessions running" {
                 return None;
             }
-            let fields = line.splitn(5, '\t').collect::<Vec<_>>();
+            let fields = line.splitn(5, '|').collect::<Vec<_>>();
             let session = fields.first().copied().unwrap_or("").trim();
             if session.is_empty() {
                 return None;
@@ -1228,6 +1242,70 @@ fn parse_session_list(node: &str, output: &str) -> Vec<SessionListEntry> {
     sessions
 }
 
+fn project_scoped_session_entries(
+    state: &OrchestrationState,
+    project_id: &ProjectId,
+    node: &str,
+    live_sessions: &[SessionListEntry],
+) -> Result<Vec<ProjectSessionListEntry>, String> {
+    if !state.projects.contains_key(project_id) {
+        return Err(format!("project '{}' not found", project_id.0));
+    }
+
+    let project_task_ids = state
+        .tasks
+        .values()
+        .filter(|task| &task.project_id == project_id)
+        .map(|task| task.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+    let live_by_session = live_sessions
+        .iter()
+        .map(|session| (session.session.as_str(), session))
+        .collect::<std::collections::HashMap<_, _>>();
+
+    let mut entries = state
+        .sessions
+        .values()
+        .filter(|record| record.node_id.0 == node)
+        .filter(|record| {
+            record
+                .task_ids
+                .iter()
+                .any(|task_id| project_task_ids.contains(task_id))
+        })
+        .map(|record| {
+            let live = live_by_session.get(record.session.0.as_str()).copied();
+            ProjectSessionListEntry {
+                node: record.node_id.0.clone(),
+                session: record.session.0.clone(),
+                profile: record.profile.clone(),
+                workspace_path: record.workspace_path.clone(),
+                bypass_permissions: record.bypass_permissions,
+                task_ids: record.task_ids.clone(),
+                role: record.role.clone(),
+                kind: record.kind.clone(),
+                objective: record.objective.clone(),
+                last_seen_ms: record.last_seen_ms,
+                runtime_state: if live.is_some() {
+                    "running".into()
+                } else {
+                    "missing".into()
+                },
+                windows: live.and_then(|session| session.windows),
+                attached: live.and_then(|session| session.attached),
+                created_at_seconds: live.and_then(|session| session.created_at_seconds),
+                live_objective: live.and_then(|session| session.objective.clone()),
+            }
+        })
+        .collect::<Vec<_>>();
+    entries.sort_by(|left, right| {
+        left.node
+            .cmp(&right.node)
+            .then_with(|| left.session.cmp(&right.session))
+    });
+    Ok(entries)
+}
+
 fn is_no_tmux_sessions_error(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     error.contains("no server running")
@@ -1252,7 +1330,7 @@ fn parse_local_session_info_list(output: &str) -> Vec<LocalSessionInfo> {
             if line.is_empty() || line == "No tmux sessions running" {
                 return None;
             }
-            let (session, created_at_seconds) = line.split_once('\t').unwrap_or((line, ""));
+            let (session, created_at_seconds) = line.split_once('|').unwrap_or((line, ""));
             let session = session.trim();
             if session.is_empty() {
                 return None;
@@ -1328,6 +1406,34 @@ struct RuntimeWaitSnapshot {
     error: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ListSessionsArgs {
+    #[serde(default = "default_wait_node")]
+    node: String,
+    project_id: String,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProjectSessionListEntry {
+    node: String,
+    session: String,
+    profile: String,
+    workspace_path: Option<String>,
+    bypass_permissions: bool,
+    task_ids: Vec<TaskId>,
+    role: String,
+    kind: String,
+    objective: Option<String>,
+    last_seen_ms: u64,
+    runtime_state: String,
+    windows: Option<u64>,
+    attached: Option<u64>,
+    created_at_seconds: Option<u64>,
+    live_objective: Option<String>,
+}
+
 struct RuntimeWaitJob {
     snapshot: RuntimeWaitSnapshot,
     handle: Option<JoinHandle<()>>,
@@ -1372,6 +1478,33 @@ struct RuntimeWaitRunner {
     timeout_seconds: f64,
     poll_seconds: f64,
     stability_seconds: f64,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CodingTaskSendArgs {
+    #[serde(default = "default_wait_node")]
+    node: String,
+    #[serde(default = "default_coding_session")]
+    session: String,
+    #[serde(default = "default_coding_profile")]
+    profile: String,
+    task_id_or_slug: String,
+    prompt: String,
+    template: Option<CodingTaskSendTemplate>,
+    include_dependencies: Option<bool>,
+    include_gates: Option<bool>,
+    include_scope: Option<bool>,
+    extra_context: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
+#[serde(rename_all = "kebab-case")]
+enum CodingTaskSendTemplate {
+    Task,
+    Validate,
+    Review,
+    QualityGuard,
 }
 
 #[derive(Clone)]
@@ -2196,6 +2329,63 @@ impl TmuxMcpServer {
         Self::json_result(status)
     }
 
+    async fn list_sessions_tool(
+        &self,
+        args: Map<String, Value>,
+    ) -> Result<CallToolResult, McpError> {
+        let args: ListSessionsArgs = parse_tool_args("list_sessions", args)?;
+        let live_sessions = match self
+            .node_tmux(
+                &args.node,
+                vec![
+                    "list-sessions".into(),
+                    "-F".into(),
+                    SESSION_LIST_FORMAT.into(),
+                ],
+                Duration::from_secs(20),
+            )
+            .await
+        {
+            Ok(output) => parse_session_list(&args.node, &output),
+            Err(error) if is_no_tmux_sessions_error(&error) => Vec::new(),
+            Err(error) => return Ok(Self::error_result(error)),
+        };
+        let state = self.orchestration.snapshot().map_err(mcp_invalid_request)?;
+        let entries = project_scoped_session_entries(
+            &state,
+            &ProjectId(args.project_id),
+            &args.node,
+            &live_sessions,
+        )
+        .map_err(mcp_invalid_request)?;
+        Self::json_result(entries)
+    }
+
+    async fn admin_list_node_sessions_tool(
+        &self,
+        args: Map<String, Value>,
+    ) -> Result<CallToolResult, McpError> {
+        let node = args.get("node").and_then(|v| v.as_str()).unwrap_or("local");
+        match self
+            .node_tmux(
+                node,
+                vec![
+                    "list-sessions".into(),
+                    "-F".into(),
+                    SESSION_LIST_FORMAT.into(),
+                ],
+                Duration::from_secs(20),
+            )
+            .await
+        {
+            Ok(output) => Self::json_result(parse_session_list(node, &output)),
+            Err(error) if is_no_tmux_sessions_error(&error) => {
+                Self::json_result(Vec::<SessionListEntry>::new())
+            }
+            Err(error) => Ok(Self::error_result(error)),
+        }
+    }
+
     async fn orchestration_cleanup_zombies_tool(
         &self,
         args: Map<String, Value>,
@@ -2945,6 +3135,105 @@ impl TmuxMcpServer {
         .filter(|value| !value.is_empty())
     }
 
+    async fn send_coding_prompt(
+        &self,
+        node: &str,
+        session: &str,
+        profile_name: Option<&str>,
+        prompt: &str,
+    ) -> Result<CallToolResult, McpError> {
+        validate_coding_prompt(prompt)?;
+        let profile = self
+            .resolve_profile(profile_name)
+            .ok_or_else(|| McpError::invalid_request("unknown profile", None))?;
+        let pane = match self.node_session_first_pane(node, session).await {
+            Ok(pane) => pane,
+            Err(error) => return Ok(Self::error_result(error)),
+        };
+        let buf = self
+            .node_tmux(
+                node,
+                vec![
+                    "capture-pane".into(),
+                    "-t".into(),
+                    pane.clone(),
+                    "-p".into(),
+                ],
+                Duration::from_secs(20),
+            )
+            .await
+            .unwrap_or_default();
+        if let Some(key) = startup_dismiss_key(&buf, &profile) {
+            let _ = self
+                .node_tmux(
+                    node,
+                    node_send_key_args(&pane, &key),
+                    Duration::from_secs(20),
+                )
+                .await;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+        }
+        let text_mode = match profile_text_mode(&profile) {
+            Ok(text_mode) => text_mode,
+            Err(error) => return Ok(Self::error_result(error)),
+        };
+        match text_mode {
+            "paste-buffer" => {
+                let buffer = tmux_buffer_name("mmux-coding-prompt", &pane);
+                if let Err(error) = self
+                    .node_tmux(
+                        node,
+                        tmux_set_buffer_args(&buffer, prompt),
+                        Duration::from_secs(20),
+                    )
+                    .await
+                {
+                    return Ok(Self::error_result(error));
+                }
+                if let Err(error) = self
+                    .node_tmux(
+                        node,
+                        tmux_paste_buffer_args(&pane, &buffer),
+                        Duration::from_secs(20),
+                    )
+                    .await
+                {
+                    return Ok(Self::error_result(error));
+                }
+            }
+            "literal-keys" => {
+                if let Err(error) = self
+                    .node_tmux(
+                        node,
+                        tmux_literal_text_args(&pane, prompt),
+                        Duration::from_secs(20),
+                    )
+                    .await
+                {
+                    return Ok(Self::error_result(error));
+                }
+            }
+            _ => unreachable!("profile_text_mode validates supported values"),
+        }
+        tokio::time::sleep(coding_prompt_submit_delay(prompt)).await;
+        if profile.submit_after_text && !profile.submit_keys.trim().is_empty() {
+            if let Err(error) = self
+                .node_tmux(
+                    node,
+                    tmux_submit_keys_args(&pane, &profile.submit_keys),
+                    Duration::from_secs(20),
+                )
+                .await
+            {
+                return Ok(Self::error_result(error));
+            }
+        }
+        Ok(Self::text_result(format!(
+            "Sent to {} on node {} (profile: {}, text_mode: {}, submit_after_text: {}): {}",
+            session, node, profile.name, text_mode, profile.submit_after_text, prompt
+        )))
+    }
+
     async fn node_wait_for(
         &self,
         node_id: &str,
@@ -3021,6 +3310,14 @@ impl TmuxMcpServer {
 
 fn default_wait_node() -> String {
     "local".into()
+}
+
+fn default_coding_session() -> String {
+    "kimi_codex".into()
+}
+
+fn default_coding_profile() -> String {
+    "opencode".into()
 }
 
 fn runtime_wait_id() -> String {
@@ -3183,7 +3480,7 @@ async fn runtime_wait_loop(runner: &RuntimeWaitRunner) -> Result<RuntimeWaitDeta
             while Instant::now() <= deadline {
                 let output = runner.target.capture(&runner.session).await?;
                 if let Some(key) = startup_dismiss_key(&output, profile) {
-                    let _ = runner.target.send_key(&runner.session, key).await;
+                    let _ = runner.target.send_key(&runner.session, &key).await;
                     idle_since = None;
                     tokio::time::sleep(Duration::from_millis(300)).await;
                     continue;
@@ -3296,6 +3593,245 @@ fn validate_task_agent_arguments(args: &Map<String, Value>) -> Result<(), McpErr
         }
     }
     Ok(())
+}
+
+fn validate_prompt_text_value(field: &str, prompt: &str) -> Result<(), String> {
+    let trimmed = prompt.trim();
+    if trimmed.is_empty() {
+        return Err(format!("{field} must not be empty"));
+    }
+    if matches!(trimmed, "null" | "undefined") {
+        return Err(format!(
+            "{field} must not be the placeholder string '{trimmed}'"
+        ));
+    }
+    Ok(())
+}
+
+fn validate_coding_prompt(prompt: &str) -> Result<(), McpError> {
+    validate_prompt_text_value("coding_send prompt", prompt).map_err(mcp_invalid_request)
+}
+
+fn build_coding_task_prompt(
+    state: &OrchestrationState,
+    args: &CodingTaskSendArgs,
+) -> Result<String, String> {
+    validate_prompt_text_value("task_id_or_slug", &args.task_id_or_slug)?;
+    validate_prompt_text_value("coding_task_send prompt", &args.prompt)?;
+    if let Some(extra_context) = args.extra_context.as_deref() {
+        validate_prompt_text_value("extra_context", extra_context)?;
+    }
+
+    let task = resolve_task_by_id_or_slug(state, &args.task_id_or_slug)?;
+    let project = state.projects.get(&task.project_id);
+    let project_text = project
+        .map(|project| format!("{} / {}", project.id.0, project.slug))
+        .unwrap_or_else(|| format!("{} / <missing>", task.project_id.0));
+
+    let template = args.template.unwrap_or(CodingTaskSendTemplate::Task);
+    let mut rendered = coding_task_send_template_text(template).to_owned();
+    for (placeholder, value) in [
+        ("{{task_id}}", task.id.0.as_str()),
+        ("{{task_slug}}", task.slug.as_str()),
+        ("{{task_title}}", task.title.as_str()),
+        ("{{task_status}}", task_status_name(task.status)),
+        ("{{project}}", project_text.as_str()),
+        ("{{objective}}", task.objective.as_str()),
+    ] {
+        rendered = rendered.replace(placeholder, value);
+    }
+
+    rendered = rendered
+        .replace(
+            "{{scope_section}}",
+            &optional_section(
+                args.include_scope.unwrap_or(true),
+                build_scope_section(&task.scope),
+            ),
+        )
+        .replace(
+            "{{gates_section}}",
+            &optional_section(
+                args.include_gates.unwrap_or(true),
+                build_gates_section(&task.gates),
+            ),
+        )
+        .replace(
+            "{{dependencies_section}}",
+            &optional_section(
+                args.include_dependencies.unwrap_or(true),
+                build_dependencies_section(state, task),
+            ),
+        )
+        .replace(
+            "{{blockers_section}}",
+            &build_blockers_section(&task.blockers),
+        )
+        .replace(
+            "{{extra_context_section}}",
+            &args
+                .extra_context
+                .as_deref()
+                .map(build_extra_context_section)
+                .unwrap_or_default(),
+        )
+        .replace("{{instruction}}", args.prompt.trim());
+
+    Ok(rendered)
+}
+
+fn coding_task_send_template_text(template: CodingTaskSendTemplate) -> &'static str {
+    match template {
+        CodingTaskSendTemplate::Task => CODING_TASK_SEND_PROMPT,
+        CodingTaskSendTemplate::Validate => CODING_VALIDATE_SEND_PROMPT,
+        CodingTaskSendTemplate::Review => CODING_REVIEW_SEND_PROMPT,
+        CodingTaskSendTemplate::QualityGuard => CODING_QUALITY_GUARD_SEND_PROMPT,
+    }
+}
+
+fn optional_section(include: bool, section: String) -> String {
+    if include {
+        section
+    } else {
+        String::new()
+    }
+}
+
+fn resolve_task_by_id_or_slug<'a>(
+    state: &'a OrchestrationState,
+    task_id_or_slug: &str,
+) -> Result<&'a Task, String> {
+    let selector = task_id_or_slug.trim();
+    let task_id = TaskId(selector.to_owned());
+    if let Some(task) = state.tasks.get(&task_id) {
+        return Ok(task);
+    }
+
+    let mut matches = state
+        .tasks
+        .values()
+        .filter(|task| task.slug == selector)
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+    match matches.as_slice() {
+        [task] => Ok(task),
+        [] => Err(format!("task '{}' not found", selector)),
+        tasks => {
+            let matches = tasks
+                .iter()
+                .map(|task| format!("{} in project {}", task.id.0, task.project_id.0))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(format!(
+                "task slug '{}' is ambiguous; matches: {}",
+                selector, matches
+            ))
+        }
+    }
+}
+
+fn build_scope_section(scope: &TaskScope) -> String {
+    format!(
+        "Scope:\nInclude paths:\n{}Exclude paths:\n{}Notes:\n{}\n\n",
+        format_string_list(&scope.include_paths),
+        format_string_list(&scope.exclude_paths),
+        scope.notes.as_deref().unwrap_or("- none")
+    )
+}
+
+fn build_gates_section(gates: &[String]) -> String {
+    format!("Gates:\n{}\n", format_string_list(gates))
+}
+
+fn build_dependencies_section(state: &OrchestrationState, task: &Task) -> String {
+    let parents = state
+        .task_edges
+        .iter()
+        .filter(|edge| edge.kind == TaskEdgeKind::ParentOf && edge.to == task.id)
+        .collect::<Vec<_>>();
+    let dependencies = state
+        .task_edges
+        .iter()
+        .filter(|edge| edge.kind == TaskEdgeKind::DependsOn && edge.from == task.id)
+        .collect::<Vec<_>>();
+    let blocking_tasks = state
+        .task_edges
+        .iter()
+        .filter(|edge| edge.kind == TaskEdgeKind::Blocks && edge.to == task.id)
+        .collect::<Vec<_>>();
+
+    format!(
+        "Dependencies:\nParent:\n{}Depends on:\n{}Blocked by task edges:\n{}\n",
+        format_task_edge_list(state, &parents, |edge| &edge.from),
+        format_task_edge_list(state, &dependencies, |edge| &edge.to),
+        format_task_edge_list(state, &blocking_tasks, |edge| &edge.from),
+    )
+}
+
+fn build_blockers_section(blockers: &[String]) -> String {
+    format!("Blockers:\n{}\n", format_string_list(blockers))
+}
+
+fn build_extra_context_section(extra_context: &str) -> String {
+    format!("Extra Context:\n{}\n\n", extra_context.trim())
+}
+
+fn format_string_list(values: &[String]) -> String {
+    if values.is_empty() {
+        return "- none\n".into();
+    }
+    values
+        .iter()
+        .map(|value| format!("- {}\n", value))
+        .collect::<String>()
+}
+
+fn format_task_edge_list<'a>(
+    state: &OrchestrationState,
+    edges: &[&'a TaskEdge],
+    task_id: impl Fn(&'a TaskEdge) -> &'a TaskId,
+) -> String {
+    if edges.is_empty() {
+        return "- none\n".into();
+    }
+    let mut labels = edges
+        .iter()
+        .map(|edge| task_label(state, task_id(edge)))
+        .collect::<Vec<_>>();
+    labels.sort();
+    labels
+        .into_iter()
+        .map(|label| format!("- {}\n", label))
+        .collect()
+}
+
+fn task_label(state: &OrchestrationState, task_id: &TaskId) -> String {
+    state.tasks.get(task_id).map_or_else(
+        || format!("{} / <missing>", task_id.0),
+        |task| {
+            format!(
+                "{} / {} / {} [{}]",
+                task.id.0,
+                task.slug,
+                task.title,
+                task_status_name(task.status)
+            )
+        },
+    )
+}
+
+fn task_status_name(status: TaskStatus) -> &'static str {
+    match status {
+        TaskStatus::Backlog => "Backlog",
+        TaskStatus::Planned => "Planned",
+        TaskStatus::Running => "Running",
+        TaskStatus::WaitingForValidation => "WaitingForValidation",
+        TaskStatus::Blocked => "Blocked",
+        TaskStatus::Failed => "Failed",
+        TaskStatus::Passed => "Passed",
+        TaskStatus::Delivered => "Delivered",
+        TaskStatus::Canceled => "Canceled",
+    }
 }
 
 fn filter_orchestration_status(
@@ -3450,7 +3986,18 @@ impl ServerHandler for TmuxMcpServer {
                 ),
                 Tool::new(
                     "list_sessions",
-                    "List all tmux sessions as a JSON array of session objects",
+                    "List durable sessions attached to tasks in a project",
+                    Arc::new(tool_schema(
+                        json!({
+                            "node": { "type": "string", "description": "Execution node id (default: local)" },
+                            "project_id": { "type": "string", "description": "Project id whose recorded task sessions should be listed" }
+                        }),
+                        Some(vec!["project_id"]),
+                    )),
+                ),
+                Tool::new(
+                    "admin_list_node_sessions",
+                    "Admin/debug: list raw live tmux sessions on a node, including unrecorded sessions",
                     Arc::new(tool_schema(json!({
                         "node": { "type": "string", "description": "Execution node id (default: local)" }
                     }), None)),
@@ -3641,6 +4188,22 @@ impl ServerHandler for TmuxMcpServer {
                     }), Some(vec!["prompt"]))),
                 ),
                 Tool::new(
+                    "coding_task_send",
+                    "Send an initial task-scoped prompt to a coding CLI. Builds deterministic task context from orchestration state, appends the provided instruction, then sends it with coding_send behavior.",
+                    Arc::new(tool_schema(json!({
+                        "node": { "type": "string", "description": "Execution node id (default: local)" },
+                        "session": { "type": "string" },
+                        "profile": { "type": "string", "description": "CLI profile name (default: opencode)" },
+                        "task_id_or_slug": { "type": "string", "description": "Task id or unique task slug" },
+                        "prompt": { "type": "string", "description": "Instruction appended below generated task context" },
+                        "template": { "type": "string", "enum": ["task", "validate", "review", "quality-guard"], "description": "Task prompt template to render (default: task)" },
+                        "include_dependencies": { "type": "boolean", "description": "Include parent/dependency/blocking task context (default: true)" },
+                        "include_gates": { "type": "boolean", "description": "Include task gates (default: true)" },
+                        "include_scope": { "type": "boolean", "description": "Include task scope paths and notes (default: true)" },
+                        "extra_context": { "type": "string", "description": "Optional extra operator context appended before Instruction" }
+                    }), Some(vec!["task_id_or_slug", "prompt"]))),
+                ),
+                Tool::new(
                     "coding_read",
                     "Capture the last N lines from a coding CLI pane",
                     Arc::new(tool_schema(json!({
@@ -3728,24 +4291,10 @@ impl ServerHandler for TmuxMcpServer {
                 }
             }
             "list_sessions" => {
-                match self
-                    .node_tmux(
-                        node,
-                        vec![
-                            "list-sessions".into(),
-                            "-F".into(),
-                            SESSION_LIST_FORMAT.into(),
-                        ],
-                        Duration::from_secs(20),
-                    )
-                    .await
-                {
-                    Ok(output) => Self::json_result(parse_session_list(node, &output)),
-                    Err(error) if is_no_tmux_sessions_error(&error) => {
-                        Self::json_result(Vec::<SessionListEntry>::new())
-                    }
-                    Err(error) => Ok(Self::error_result(error)),
-                }
+                self.list_sessions_tool(args).await
+            }
+            "admin_list_node_sessions" => {
+                self.admin_list_node_sessions_tool(args).await
             }
             "list_nodes" => match self
                 .registry_call(|reply| NodeRegistryMessage::ListNodes { reply }, None)
@@ -4207,97 +4756,23 @@ impl ServerHandler for TmuxMcpServer {
                     .get("prompt")
                     .and_then(|v| v.as_str())
                     .ok_or_else(|| McpError::invalid_request("missing prompt", None))?;
-                let profile = self
-                    .resolve_profile(args.get("profile").and_then(|v| v.as_str()))
-                    .ok_or_else(|| McpError::invalid_request("unknown profile", None))?;
-                let pane = match self.node_session_first_pane(node, session).await {
-                    Ok(pane) => pane,
-                    Err(error) => return Ok(Self::error_result(error)),
-                };
-                if let Some(dismiss) = profile.startup_dismiss.as_ref() {
-                    let buf = self
-                        .node_tmux(
-                            node,
-                            vec![
-                                "capture-pane".into(),
-                                "-t".into(),
-                                pane.clone(),
-                                "-p".into(),
-                            ],
-                            Duration::from_secs(20),
-                        )
-                        .await
-                        .unwrap_or_default();
-                    if dismiss.triggers.iter().any(|trigger| buf.contains(trigger)) {
-                        let _ = self
-                            .node_tmux(
-                                node,
-                                node_send_key_args(&pane, &dismiss.key),
-                                Duration::from_secs(20),
-                            )
-                            .await;
-                        tokio::time::sleep(Duration::from_millis(300)).await;
-                    }
-                }
-                let text_mode = match profile_text_mode(&profile) {
-                    Ok(text_mode) => text_mode,
-                    Err(error) => return Ok(Self::error_result(error)),
-                };
-                match text_mode {
-                    "paste-buffer" => {
-                        let buffer = tmux_buffer_name("mmux-coding-prompt", &pane);
-                        if let Err(error) = self
-                            .node_tmux(
-                                node,
-                                tmux_set_buffer_args(&buffer, prompt),
-                                Duration::from_secs(20),
-                            )
-                            .await
-                        {
-                            return Ok(Self::error_result(error));
-                        }
-                        if let Err(error) = self
-                            .node_tmux(
-                                node,
-                                tmux_paste_buffer_args(&pane, &buffer),
-                                Duration::from_secs(20),
-                            )
-                            .await
-                        {
-                            return Ok(Self::error_result(error));
-                        }
-                    }
-                    "literal-keys" => {
-                        if let Err(error) = self
-                            .node_tmux(
-                                node,
-                                tmux_literal_text_args(&pane, prompt),
-                                Duration::from_secs(20),
-                            )
-                            .await
-                        {
-                            return Ok(Self::error_result(error));
-                        }
-                    }
-                    _ => unreachable!("profile_text_mode validates supported values"),
-                }
-                tokio::time::sleep(coding_prompt_submit_delay(prompt)).await;
-                if profile.submit_after_text && !profile.submit_keys.trim().is_empty() {
-                    if let Err(error) = self
-                        .node_tmux(
-                            node,
-                            tmux_submit_keys_args(&pane, &profile.submit_keys),
-                            Duration::from_secs(20),
-                        )
-                        .await
-                    {
-                        return Ok(Self::error_result(error));
-                    }
-                }
-                Ok(Self::text_result(format!(
-                    "Sent to {} on node {} (profile: {}, text_mode: {}, submit_after_text: {}): {}",
-                    session, node, profile.name, text_mode, profile.submit_after_text, prompt
-                )))
+                self.send_coding_prompt(
+                    node,
+                    session,
+                    args.get("profile").and_then(|v| v.as_str()),
+                    prompt,
+                )
+                .await
+            }
+            "coding_task_send" => {
+                let args: CodingTaskSendArgs = parse_tool_args("coding_task_send", args)?;
+                let prompt = build_coding_task_prompt(
+                    &self.orchestration.snapshot().map_err(mcp_invalid_request)?,
+                    &args,
+                )
+                .map_err(mcp_invalid_request)?;
+                self.send_coding_prompt(&args.node, &args.session, Some(&args.profile), &prompt)
+                    .await
             }
             "start_coding_session" => self.start_coding_session_tool(args).await,
             "coding_read" => {
@@ -4738,7 +5213,7 @@ impl ServerHandler for TmuxMcpServer {
                             PromptMessageRole::User,
                             PromptMessageContent::Text {
                                 text: format!(
-                                    "You are driving a coding CLI via mmux.\n\nProfile: {}\nSession: {}\n\nWorkflow:\n1. Start the session with start_coding_session using the profile-defined command\n2. Use coding_send to submit a prompt\n3. Start a coding-ready wait with wait_start kind=coding-ready and this profile\n4. Poll wait_status until completed, failed, or canceled\n5. Use coding_read to capture the output\n6. Use coding_action (approve/reject/cancel/escape) to interact\n\nTips:\n- check_state is a quick non-blocking way to inspect has_prompt, promptable, busy, and turn_idle\n- promptable means the CLI can accept text; turn_idle means foreground work has settled\n- resize_pane can help if the TUI layout is broken\n- capture_output with scrollback:true gets full history\n- Use wait_start with sentinel or prompt kind to detect specific output strings",
+                                    "You are driving a coding CLI via mmux.\n\nProfile: {}\nSession: {}\n\nWorkflow:\n1. Start the session with start_coding_session using the profile-defined command\n2. For initial task delegation, use coding_task_send with task_id_or_slug, template, and a concrete instruction; for follow-up or non-task prompts, use coding_send\n3. Start a coding-ready wait with wait_start kind=coding-ready and this profile\n4. Poll wait_status until completed, failed, or canceled\n5. Use coding_read to capture the output\n6. Use coding_action (approve/reject/cancel/escape) to interact\n\ncoding_task_send templates:\n- task: initial implementation/delegation\n- validate: task gates and objective validation\n- review: correctness, regression, risk, missing-test, and scope-drift review\n- quality-guard: maintainability, architecture fit, naming, boundaries, lifecycle, API shape, and operator/project quality preferences\n\nTips:\n- check_state is a quick non-blocking way to inspect has_prompt, promptable, busy, and turn_idle\n- promptable means the CLI can accept text; turn_idle means foreground work has settled\n- resize_pane can help if the TUI layout is broken\n- capture_output with scrollback:true gets full history\n- Use wait_start with sentinel or prompt kind to detect specific output strings",
                                     profile, session
                                 ),
                             },
@@ -5272,10 +5747,10 @@ pub(crate) async fn run_mcp_http_server(
     } else {
         None
     };
-    let has_embedded_node = embedded_backend.is_some();
-    let (registry, _registry_handle) = Actor::spawn(None, NodeRegistryActor, has_embedded_node)
-        .await
-        .map_err(|error| format!("failed to start node registry actor: {}", error))?;
+    let (registry, _registry_handle) =
+        Actor::spawn(None, NodeRegistryActor, embedded_node_label.clone())
+            .await
+            .map_err(|error| format!("failed to start node registry actor: {}", error))?;
     let (node_executor, _node_executor_handle) = Actor::spawn(
         None,
         NodeExecutionActor,
@@ -6018,7 +6493,7 @@ mod tests {
     }
 
     async fn test_orchestration_server(store_path: &Path) -> TmuxMcpServer {
-        let (registry, _registry_handle) = Actor::spawn(None, NodeRegistryActor, false)
+        let (registry, _registry_handle) = Actor::spawn(None, NodeRegistryActor, None)
             .await
             .expect("registry actor");
         let (node_executor, _node_executor_handle) = Actor::spawn(
@@ -6046,7 +6521,7 @@ mod tests {
         store_path: &Path,
         profiles: ProfileRegistry,
     ) -> TmuxMcpServer {
-        let (registry, _registry_handle) = Actor::spawn(None, NodeRegistryActor, false)
+        let (registry, _registry_handle) = Actor::spawn(None, NodeRegistryActor, None)
             .await
             .expect("registry actor");
         let (node_executor, _node_executor_handle) = Actor::spawn(
@@ -6078,9 +6553,10 @@ mod tests {
         let backend = mmux_node::EmbeddedNodeBackend::local(Some(local_store_path), None)
             .await
             .expect("local backend");
-        let (registry, _registry_handle) = Actor::spawn(None, NodeRegistryActor, true)
-            .await
-            .expect("registry actor");
+        let (registry, _registry_handle) =
+            Actor::spawn(None, NodeRegistryActor, Some("Local tmux node".into()))
+                .await
+                .expect("registry actor");
         let (node_executor, _node_executor_handle) = Actor::spawn(
             None,
             NodeExecutionActor,
@@ -6148,7 +6624,8 @@ mod tests {
             name: "dismisscoder".into(),
             prompt_indicator: "READY".into(),
             startup_dismiss: Some(mmux_shared::StartupDismiss {
-                key: "Down Enter".into(),
+                policy: "custom-keys".into(),
+                key: Some("Down Enter".into()),
                 triggers: vec!["Update available!".into()],
             }),
             ..CliProfile::default()
@@ -6174,6 +6651,37 @@ mod tests {
         args: Value,
     ) -> Result<CallToolResult, McpError> {
         server.session_record_tool(object_args(args)).await
+    }
+
+    async fn create_test_project(server: &TmuxMcpServer, title: &str) -> Project {
+        let result = call_orchestration(
+            server,
+            "project_create",
+            json!({
+                "title": title,
+                "description": format!("Project for {title}")
+            }),
+        )
+        .unwrap();
+        result_json(&result)
+    }
+
+    async fn create_test_task_in_project(
+        server: &TmuxMcpServer,
+        project: &Project,
+        title: &str,
+    ) -> Task {
+        let result = call_orchestration(
+            server,
+            "task_create",
+            json!({
+                "project_id": project.id.0,
+                "title": title,
+                "objective": format!("Objective for {title}")
+            }),
+        )
+        .unwrap();
+        result_json(&result)
     }
 
     fn result_text(result: &CallToolResult) -> &str {
@@ -6212,17 +6720,25 @@ mod tests {
 
     async fn create_test_task(server: &TmuxMcpServer, title: &str) -> Task {
         let project = ensure_test_project(server).await;
-        let result = call_orchestration(
-            server,
-            "task_create",
-            json!({
-                "project_id": project.id.0,
-                "title": title,
-                "objective": format!("Objective for {title}")
-            }),
-        )
-        .unwrap();
-        result_json(&result)
+        create_test_task_in_project(server, &project, title).await
+    }
+
+    fn coding_task_send_args(
+        task_id_or_slug: impl Into<String>,
+        prompt: impl Into<String>,
+    ) -> CodingTaskSendArgs {
+        CodingTaskSendArgs {
+            node: "local".into(),
+            session: "worker".into(),
+            profile: "codex".into(),
+            task_id_or_slug: task_id_or_slug.into(),
+            prompt: prompt.into(),
+            template: None,
+            include_dependencies: None,
+            include_gates: None,
+            include_scope: None,
+            extra_context: None,
+        }
     }
 
     async fn wait_for_runtime_status(
@@ -7030,6 +7546,125 @@ mod tests {
         assert_eq!(record.task_ids, vec![task.id]);
         assert!(record.bypass_permissions);
         test_kill_session(&server, "worker-a").await;
+        let _ = fs::remove_dir_all(local_dir);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn test_list_sessions_requires_project_id() {
+        let dir = unique_temp_dir("mmux-mcp-list-sessions-project-required");
+        let local_dir = unique_temp_dir("mmux-mcp-list-sessions-project-required-local");
+        let server = test_coding_server(&dir, &local_dir, profile_registry(ready_profile())).await;
+
+        let error = server
+            .list_sessions_tool(object_args(json!({})))
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("project_id"), "{error}");
+
+        let _ = fs::remove_dir_all(local_dir);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn test_list_sessions_filters_by_project_and_admin_lists_raw_sessions() {
+        let dir = unique_temp_dir("mmux-mcp-list-sessions-project-filter");
+        let local_dir = unique_temp_dir("mmux-mcp-list-sessions-project-filter-local");
+        let server = test_coding_server(&dir, &local_dir, profile_registry(ready_profile())).await;
+        let first_project = create_test_project(&server, "First Project").await;
+        let second_project = create_test_project(&server, "Second Project").await;
+        let first_task = create_test_task_in_project(&server, &first_project, "First Task").await;
+        let second_task =
+            create_test_task_in_project(&server, &second_project, "Second Task").await;
+
+        for session in [
+            "project-first-worker",
+            "project-second-worker",
+            "project-cross-worker",
+            "raw-unrecorded-worker",
+        ] {
+            test_create_session(&server, session, "sleep 30").await;
+        }
+
+        server
+            .orchestration
+            .record_session(recorded_session(
+                "project-first-worker",
+                vec![first_task.id.clone()],
+            ))
+            .unwrap();
+        server
+            .orchestration
+            .record_session(recorded_session(
+                "project-second-worker",
+                vec![second_task.id.clone()],
+            ))
+            .unwrap();
+        server
+            .orchestration
+            .record_session(recorded_session(
+                "project-cross-worker",
+                vec![first_task.id.clone(), second_task.id.clone()],
+            ))
+            .unwrap();
+
+        let first_result = server
+            .list_sessions_tool(object_args(json!({
+                "project_id": first_project.id.0
+            })))
+            .await
+            .unwrap();
+        let first_sessions: Vec<ProjectSessionListEntry> = result_json(&first_result);
+        let first_names = first_sessions
+            .iter()
+            .map(|session| session.session.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            first_names,
+            vec!["project-cross-worker", "project-first-worker"]
+        );
+        assert!(first_sessions
+            .iter()
+            .all(|session| session.runtime_state == "running"));
+
+        let second_result = server
+            .list_sessions_tool(object_args(json!({
+                "project_id": second_project.id.0
+            })))
+            .await
+            .unwrap();
+        let second_sessions: Vec<ProjectSessionListEntry> = result_json(&second_result);
+        let second_names = second_sessions
+            .iter()
+            .map(|session| session.session.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            second_names,
+            vec!["project-cross-worker", "project-second-worker"]
+        );
+
+        let admin_result = server
+            .admin_list_node_sessions_tool(object_args(json!({})))
+            .await
+            .unwrap();
+        let raw_sessions: Vec<SessionListEntry> = result_json(&admin_result);
+        let raw_names = raw_sessions
+            .iter()
+            .map(|session| session.session.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        assert!(raw_names.contains("raw-unrecorded-worker"));
+        assert!(raw_names.contains("project-first-worker"));
+        assert!(raw_names.contains("project-second-worker"));
+        assert!(raw_names.contains("project-cross-worker"));
+
+        for session in [
+            "project-first-worker",
+            "project-second-worker",
+            "project-cross-worker",
+            "raw-unrecorded-worker",
+        ] {
+            test_kill_session(&server, session).await;
+        }
         let _ = fs::remove_dir_all(local_dir);
         let _ = fs::remove_dir_all(dir);
     }
@@ -8189,6 +8824,243 @@ mod tests {
         let _ = fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn test_coding_task_prompt_builds_context_by_id() {
+        let mut state = OrchestrationState::new();
+        let project = state
+            .create_project(
+                CreateProject {
+                    title: "MMUX".into(),
+                    description: None,
+                    slug: None,
+                },
+                100,
+            )
+            .unwrap();
+        let dependency = state
+            .create_task(
+                CreateTask {
+                    project_id: project.id.clone(),
+                    title: "Dependency".into(),
+                    objective: "Finish dependency".into(),
+                    scope: TaskScope::default(),
+                    agents: Vec::new(),
+                    gates: Vec::new(),
+                    slug: None,
+                },
+                110,
+            )
+            .unwrap();
+        let task = state
+            .create_task(
+                CreateTask {
+                    project_id: project.id.clone(),
+                    title: "Prompt Context".into(),
+                    objective: "Build deterministic context".into(),
+                    scope: TaskScope {
+                        include_paths: vec!["crates/mmux-controller/src/lib.rs".into()],
+                        exclude_paths: vec!["target".into()],
+                        notes: Some("Controller-only change.".into()),
+                    },
+                    agents: Vec::new(),
+                    gates: vec!["Context includes task identity".into()],
+                    slug: None,
+                },
+                120,
+            )
+            .unwrap();
+        state
+            .add_task_edge(
+                CreateTaskEdge {
+                    from: task.id.clone(),
+                    to: dependency.id.clone(),
+                    kind: TaskEdgeKind::DependsOn,
+                    note: None,
+                },
+                130,
+            )
+            .unwrap();
+
+        let mut args = coding_task_send_args(task.id.0.clone(), "Implement now.");
+        args.extra_context = Some("Use focused tests.".into());
+        let prompt = build_coding_task_prompt(&state, &args).unwrap();
+
+        assert!(prompt.contains("Task: task-2"));
+        assert!(prompt.contains("Slug: prompt-context"));
+        assert!(prompt.contains("Project: project-1 / mmux"));
+        assert!(prompt.contains("Objective:\nBuild deterministic context"));
+        assert!(prompt.contains("Include paths:\n- crates/mmux-controller/src/lib.rs"));
+        assert!(prompt.contains("Gates:\n- Context includes task identity"));
+        assert!(prompt.contains("Depends on:\n- task-1 / dependency / Dependency [Backlog]"));
+        assert!(prompt.contains("Extra Context:\nUse focused tests."));
+        assert!(prompt.contains("Instruction:\nImplement now."));
+    }
+
+    #[test]
+    fn test_coding_task_prompt_resolves_slug_and_honors_include_flags() {
+        let mut state = OrchestrationState::new();
+        let project = state
+            .create_project(
+                CreateProject {
+                    title: "MMUX".into(),
+                    description: None,
+                    slug: None,
+                },
+                100,
+            )
+            .unwrap();
+        let task = state
+            .create_task(
+                CreateTask {
+                    project_id: project.id,
+                    title: "Prompt Context".into(),
+                    objective: "Build deterministic context".into(),
+                    scope: TaskScope {
+                        include_paths: vec!["README.md".into()],
+                        exclude_paths: Vec::new(),
+                        notes: None,
+                    },
+                    agents: Vec::new(),
+                    gates: vec!["Review docs".into()],
+                    slug: None,
+                },
+                120,
+            )
+            .unwrap();
+
+        let mut args = coding_task_send_args(task.slug, "Implement now.");
+        args.include_dependencies = Some(false);
+        args.include_gates = Some(false);
+        args.include_scope = Some(false);
+        let prompt = build_coding_task_prompt(&state, &args).unwrap();
+
+        assert!(prompt.contains("Task: task-1"));
+        assert!(!prompt.contains("Scope:"));
+        assert!(!prompt.contains("Gates:"));
+        assert!(!prompt.contains("Dependencies:"));
+    }
+
+    #[test]
+    fn test_coding_task_prompt_supports_validate_review_and_quality_guard_templates() {
+        let mut state = OrchestrationState::new();
+        let project = state
+            .create_project(
+                CreateProject {
+                    title: "MMUX".into(),
+                    description: None,
+                    slug: None,
+                },
+                100,
+            )
+            .unwrap();
+        let task = state
+            .create_task(
+                CreateTask {
+                    project_id: project.id,
+                    title: "Prompt Context".into(),
+                    objective: "Build deterministic context".into(),
+                    scope: TaskScope::default(),
+                    agents: Vec::new(),
+                    gates: vec!["Review docs".into()],
+                    slug: None,
+                },
+                120,
+            )
+            .unwrap();
+
+        let mut validate_args = coding_task_send_args(task.id.0.clone(), "Check every gate.");
+        validate_args.template = Some(CodingTaskSendTemplate::Validate);
+        let validate_prompt = build_coding_task_prompt(&state, &validate_args).unwrap();
+        assert!(validate_prompt.starts_with("Validation Context"));
+        assert!(validate_prompt.contains("Validation Rules:"));
+        assert!(validate_prompt.contains("Validation Instruction:\nCheck every gate."));
+
+        let mut review_args = coding_task_send_args(task.id.0.clone(), "Review for regressions.");
+        review_args.template = Some(CodingTaskSendTemplate::Review);
+        let review_prompt = build_coding_task_prompt(&state, &review_args).unwrap();
+        assert!(review_prompt.starts_with("Review Context"));
+        assert!(review_prompt.contains("Review Rules:"));
+        assert!(review_prompt.contains("Review Instruction:\nReview for regressions."));
+
+        let mut quality_guard_args =
+            coding_task_send_args(task.id.0, "Check for hidden runtime assumptions.");
+        quality_guard_args.template = Some(CodingTaskSendTemplate::QualityGuard);
+        let quality_guard_prompt = build_coding_task_prompt(&state, &quality_guard_args).unwrap();
+        assert!(quality_guard_prompt.starts_with("Quality Guard Context"));
+        assert!(quality_guard_prompt.contains("Built-In Quality Heuristics:"));
+        assert!(quality_guard_prompt.contains("operator_supplied_guard_point_results"));
+        assert!(quality_guard_prompt
+            .contains("Quality Guard Instruction:\nCheck for hidden runtime assumptions."));
+    }
+
+    #[test]
+    fn test_coding_task_send_rejects_unknown_template() {
+        let error = parse_tool_args::<CodingTaskSendArgs>(
+            "coding_task_send",
+            object_args(json!({
+                "task_id_or_slug": "task-1",
+                "prompt": "Implement now.",
+                "template": "unknown"
+            })),
+        )
+        .unwrap_err();
+
+        assert!(error.message.contains("unknown"), "{error}");
+    }
+
+    #[test]
+    fn test_coding_task_prompt_rejects_ambiguous_slug_and_bad_context() {
+        let mut state = OrchestrationState::new();
+        let first_project = state
+            .create_project(
+                CreateProject {
+                    title: "First".into(),
+                    description: None,
+                    slug: None,
+                },
+                100,
+            )
+            .unwrap();
+        let second_project = state
+            .create_project(
+                CreateProject {
+                    title: "Second".into(),
+                    description: None,
+                    slug: None,
+                },
+                101,
+            )
+            .unwrap();
+        for project_id in [first_project.id, second_project.id] {
+            state
+                .create_task(
+                    CreateTask {
+                        project_id,
+                        title: "Same Slug".into(),
+                        objective: "Create ambiguity".into(),
+                        scope: TaskScope::default(),
+                        agents: Vec::new(),
+                        gates: Vec::new(),
+                        slug: None,
+                    },
+                    110,
+                )
+                .unwrap();
+        }
+
+        let error = build_coding_task_prompt(
+            &state,
+            &coding_task_send_args("same-slug", "Implement now."),
+        )
+        .unwrap_err();
+        assert!(error.contains("ambiguous"), "{error}");
+
+        let mut args = coding_task_send_args("task-1", "Implement now.");
+        args.extra_context = Some("null".into());
+        let error = build_coding_task_prompt(&state, &args).unwrap_err();
+        assert!(error.contains("extra_context"), "{error}");
+    }
+
     #[tokio::test]
     async fn test_orchestration_status_filters_tasks() {
         let dir = unique_temp_dir("mmux-mcp-status-filter");
@@ -8238,6 +9110,7 @@ mod tests {
                 status: TaskStatus::Backlog,
                 summary: None,
                 owner: None,
+                agents: Vec::new(),
                 parent: None,
                 child_count: 0,
                 dependency_count: 0,
@@ -8425,14 +9298,103 @@ cancel_keys = "C-c"
 escape_keys = "Escape"
 
 [startup_dismiss]
+policy = "custom-keys"
 key = "Escape"
 triggers = ["Starting MCP servers"]
 "#;
         let profile = load_profile_from_toml(toml).unwrap();
         assert!(profile.startup_dismiss.is_some());
         let dismiss = profile.startup_dismiss.unwrap();
-        assert_eq!(dismiss.key, "Escape");
+        assert_eq!(dismiss.policy, "custom-keys");
+        assert_eq!(dismiss.key.as_deref(), Some("Escape"));
         assert_eq!(dismiss.triggers, vec!["Starting MCP servers"]);
+    }
+
+    #[test]
+    fn test_load_profile_with_update_policy_override() {
+        let toml = r#"
+name = "codex"
+prompt_indicator = "›"
+busy_indicators = ["• Working"]
+approve_keys = "y Enter"
+reject_keys = "n Enter"
+cancel_keys = "C-c"
+escape_keys = "Escape"
+
+[startup_dismiss]
+policy = "update-now"
+triggers = ["Update now"]
+"#;
+        let profile = load_profile_from_toml(toml).unwrap();
+        let output = "✨ Update available!\n› 1. Update now\n  2. Skip\nPress enter to continue";
+
+        assert_eq!(startup_dismiss_key(output, &profile), Some("Enter".into()));
+    }
+
+    #[test]
+    fn test_load_profile_update_policy_defaults_to_skip_update() {
+        let toml = r#"
+name = "codex"
+prompt_indicator = "›"
+busy_indicators = ["• Working"]
+approve_keys = "y Enter"
+reject_keys = "n Enter"
+cancel_keys = "C-c"
+escape_keys = "Escape"
+
+[startup_dismiss]
+triggers = ["Update now"]
+"#;
+        let profile = load_profile_from_toml(toml).unwrap();
+        let output = "✨ Update available!\n› 1. Update now\n  2. Skip\nPress enter to continue";
+
+        assert_eq!(
+            startup_dismiss_key(output, &profile),
+            Some("Down Enter".into())
+        );
+    }
+
+    #[test]
+    fn test_load_profile_rejects_unknown_update_policy() {
+        let toml = r#"
+name = "codex"
+prompt_indicator = "›"
+busy_indicators = []
+approve_keys = "y"
+reject_keys = "n"
+cancel_keys = "C-c"
+escape_keys = "Escape"
+
+[startup_dismiss]
+policy = "maybe-update"
+triggers = ["Update now"]
+"#;
+        let error = load_profile_from_toml(toml).unwrap_err();
+
+        assert!(
+            error.contains("unsupported startup_dismiss policy"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn test_load_profile_rejects_key_without_custom_keys_policy() {
+        let toml = r#"
+name = "codex"
+prompt_indicator = "›"
+busy_indicators = []
+approve_keys = "y"
+reject_keys = "n"
+cancel_keys = "C-c"
+escape_keys = "Escape"
+
+[startup_dismiss]
+key = "Down Enter"
+triggers = ["Update now"]
+"#;
+        let error = load_profile_from_toml(toml).unwrap_err();
+
+        assert!(error.contains("does not accept key"), "{error}");
     }
 
     #[test]
@@ -8773,7 +9735,7 @@ triggers = ["Starting MCP servers"]
     fn test_parse_session_list_returns_structured_entries() {
         let sessions = parse_session_list(
             "local",
-            "codex\t1\t0\t1780500000\twork on docs\nempty\t2\t1\t1780500010\t\n",
+            "codex|1|0|1780500000|work on docs\nempty|2|1|1780500010|\n",
         );
         assert_eq!(
             sessions,
@@ -8890,19 +9852,51 @@ triggers = ["Starting MCP servers"]
             name: "codex".into(),
             prompt_indicator: "›".into(),
             startup_dismiss: Some(mmux_shared::StartupDismiss {
-                key: "Down Enter".into(),
-                triggers: vec!["Update available!".into(), "Press enter to continue".into()],
+                policy: "skip-update".into(),
+                key: None,
+                triggers: vec!["Update now".into()],
             }),
             ..CliProfile::default()
         };
         let output = "✨ Update available!\n› 1. Update now\n  2. Skip\nPress enter to continue";
 
         assert!(profile_is_busy(output, &profile));
-        assert_eq!(startup_dismiss_key(output, &profile), Some("Down Enter"));
+        assert_eq!(
+            startup_dismiss_key(output, &profile),
+            Some("Down Enter".into())
+        );
         assert_eq!(
             node_send_key_args("%1", "Down Enter"),
             vec!["send-keys", "-t", "%1", "Down", "Enter"]
         );
+    }
+
+    #[test]
+    fn test_codex_trust_prompt_is_not_startup_dismissed() {
+        let profile = CliProfile {
+            name: "codex".into(),
+            prompt_indicator: "›".into(),
+            startup_dismiss: Some(mmux_shared::StartupDismiss {
+                policy: "skip-update".into(),
+                key: None,
+                triggers: vec!["Update now".into()],
+            }),
+            ..CliProfile::default()
+        };
+        let output = "\
+> You are in /tmp
+
+  Do you trust the contents of this directory? Working with untrusted contents
+  comes with higher risk of prompt injection. Trusting the directory allows
+  project-local config, hooks, and exec policies to load.
+
+› 1. Yes, continue
+  2. No, quit
+
+  Press enter to continue";
+
+        assert!(!profile_is_busy(output, &profile));
+        assert_eq!(startup_dismiss_key(output, &profile), None);
     }
 
     #[test]
@@ -8911,8 +9905,9 @@ triggers = ["Starting MCP servers"]
             name: "codex".into(),
             prompt_indicator: "›".into(),
             startup_dismiss: Some(mmux_shared::StartupDismiss {
-                key: "Down Enter".into(),
-                triggers: vec!["Update available!".into()],
+                policy: "skip-update".into(),
+                key: None,
+                triggers: vec!["Update now".into()],
             }),
             ..CliProfile::default()
         };
@@ -8936,8 +9931,9 @@ triggers = ["Starting MCP servers"]
             prompt_indicator: "›".into(),
             busy_indicators: vec!["• Working".into()],
             startup_dismiss: Some(mmux_shared::StartupDismiss {
-                key: "Down Enter".into(),
-                triggers: vec!["Update available!".into(), "Press enter to continue".into()],
+                policy: "skip-update".into(),
+                key: None,
+                triggers: vec!["Update now".into()],
             }),
             ..CliProfile::default()
         };
@@ -8965,8 +9961,9 @@ triggers = ["Starting MCP servers"]
             prompt_indicator: "›".into(),
             busy_indicators: vec!["• Working".into()],
             startup_dismiss: Some(mmux_shared::StartupDismiss {
-                key: "Down Enter".into(),
-                triggers: vec!["Update available!".into(), "Press enter to continue".into()],
+                policy: "skip-update".into(),
+                key: None,
+                triggers: vec!["Update now".into()],
             }),
             ..CliProfile::default()
         };
@@ -9032,5 +10029,17 @@ triggers = ["Starting MCP servers"]
             tmux_submit_keys_args("%7", "C-x Enter"),
             vec!["send-keys", "-t", "%7", "C-x", "Enter"]
         );
+    }
+
+    #[test]
+    fn test_coding_send_rejects_empty_or_placeholder_prompts() {
+        for prompt in ["", "   ", "null", " undefined "] {
+            let error = validate_coding_prompt(prompt).unwrap_err();
+            assert!(
+                error.message.contains("prompt"),
+                "expected prompt validation error for {prompt:?}, got {error}"
+            );
+        }
+        validate_coding_prompt("Explain how null is represented in JSON.").unwrap();
     }
 }

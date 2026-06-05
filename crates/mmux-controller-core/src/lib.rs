@@ -38,16 +38,16 @@ pub struct NodeRegistry {
     nodes: HashMap<String, RegisteredNode>,
     queues: HashMap<String, VecDeque<NodeCommand>>,
     next_command_id: u64,
-    local_enabled: bool,
+    local_display_name: Option<String>,
 }
 
 impl NodeRegistry {
-    pub fn new(local_enabled: bool) -> Self {
+    pub fn new(local_display_name: Option<String>) -> Self {
         Self {
             nodes: HashMap::new(),
             queues: HashMap::new(),
             next_command_id: 1,
-            local_enabled,
+            local_display_name,
         }
     }
 
@@ -132,10 +132,10 @@ impl NodeRegistry {
 
     pub fn list_nodes(&self, now_ms: u64) -> Vec<NodeSummary> {
         let mut nodes = Vec::new();
-        if self.local_enabled {
+        if let Some(display_name) = self.local_display_name.as_ref() {
             nodes.push(NodeSummary {
                 node_id: "local".into(),
-                display_name: "Local tmux node".into(),
+                display_name: display_name.clone(),
                 status: "ready".into(),
                 last_seen_ms_ago: 0,
             });
@@ -148,8 +148,11 @@ impl NodeRegistry {
         if node_id == "local" {
             return Ok(NodeSummary {
                 node_id: "local".into(),
-                display_name: "Local tmux node".into(),
-                status: if self.local_enabled {
+                display_name: self
+                    .local_display_name
+                    .clone()
+                    .unwrap_or_else(|| "Local tmux node".into()),
+                status: if self.local_display_name.is_some() {
                     "ready"
                 } else {
                     "disabled"
@@ -187,7 +190,7 @@ mod tests {
 
     #[test]
     fn registry_registers_and_lists_nodes() {
-        let mut registry = NodeRegistry::new(true);
+        let mut registry = NodeRegistry::new(Some("Local tmux node".into()));
 
         registry.register(descriptor("n1"), 100).unwrap();
         let nodes = registry.list_nodes(250);
@@ -201,7 +204,7 @@ mod tests {
 
     #[test]
     fn registry_queues_commands_until_pull() {
-        let mut registry = NodeRegistry::new(false);
+        let mut registry = NodeRegistry::new(None);
         registry.register(descriptor("n1"), 0).unwrap();
 
         let command = registry
@@ -220,7 +223,7 @@ mod tests {
 
     #[test]
     fn registry_rejects_unknown_nodes() {
-        let mut registry = NodeRegistry::new(false);
+        let mut registry = NodeRegistry::new(None);
 
         assert!(registry.pull_commands("missing", 0).is_err());
         assert!(registry

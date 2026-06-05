@@ -29,6 +29,14 @@
 # [coder_profile.codex]
 # cmd = "codex --model gpt-5"
 
+# Example: choose how Codex update prompts are handled. The built-in default is
+# skip-update. Set update-now only when this node should self-update Codex during
+# readiness handling.
+#
+# [coder_profile.codex.startup_dismiss]
+# policy = "update-now"
+# triggers = ["Update now"]
+
 # Example: override prompt submission behavior. Claude Code should receive
 # prompt text literally, then receive Enter as a real keypress.
 #

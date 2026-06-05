@@ -490,9 +490,8 @@ impl MicrosandboxNodeBackend {
     async fn execute(&self, command: NodeCommand) -> NodeCommandResult {
         match command.kind {
             NodeCommandKind::Tmux { args } => {
-                let command = shell_command("tmux", &args);
                 match self
-                    .run_shell(&command, MICROSANDBOX_TMUX_TIMEOUT, "msb tmux")
+                    .run_command("tmux", &args, MICROSANDBOX_TMUX_TIMEOUT, "msb tmux")
                     .await
                 {
                     Ok(output) => NodeCommandResult::TmuxOutput(output),
@@ -571,6 +570,16 @@ impl MicrosandboxNodeBackend {
     ) -> Result<String, String> {
         run_microsandbox_shell(&self.sandbox_name, command, timeout, description).await
     }
+
+    async fn run_command(
+        &self,
+        program: &str,
+        args: &[String],
+        timeout: Duration,
+        description: &'static str,
+    ) -> Result<String, String> {
+        run_microsandbox_command(&self.sandbox_name, program, args, timeout, description).await
+    }
 }
 
 fn execute_local_node_command(local: &LocalNode, command: NodeCommand) -> NodeCommandResult {
@@ -609,15 +618,50 @@ fn execute_local_node_command(local: &LocalNode, command: NodeCommand) -> NodeCo
     }
 }
 
-fn shell_command(program: &str, args: &[String]) -> String {
-    std::iter::once(shell_quote(program))
-        .chain(args.iter().map(|arg| shell_quote(arg)))
-        .collect::<Vec<_>>()
-        .join(" ")
-}
-
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+async fn run_microsandbox_command(
+    sandbox_name: &str,
+    program: &str,
+    args: &[String],
+    timeout: Duration,
+    description: &'static str,
+) -> Result<String, String> {
+    let sandbox_name = sandbox_name.to_owned();
+    let program = program.to_owned();
+    let args = args.to_vec();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut command_runner = Command::new("msb");
+        command_runner
+            .arg("exec")
+            .arg("-q")
+            .arg(&sandbox_name)
+            .arg("--")
+            .arg(&program)
+            .args(&args);
+        run_output_command_with_timeout(
+            command_runner,
+            &format!("{} for {}", description, sandbox_name),
+            timeout,
+        )
+    })
+    .await
+    .map_err(|error| format!("msb exec task failed: {}", error))?
+    .map_err(|error| format!("msb failed to execute: {}", error))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    if output.status.success() {
+        return Ok(stdout);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    Err(format!(
+        "msb exec exited with code {}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code().unwrap_or(-1),
+        stdout,
+        stderr
+    ))
 }
 
 async fn run_microsandbox_shell(
@@ -1120,6 +1164,7 @@ pub fn default_profile_config_in_cwd() -> Option<String> {
 pub fn load_profile_from_toml(text: &str) -> Result<CliProfile, String> {
     let profile: CliProfile =
         toml::from_str(text).map_err(|e| format!("toml parse error: {}", e))?;
+    validate_profile(&profile)?;
     Ok(profile)
 }
 
@@ -1193,7 +1238,8 @@ fn default_profile_map() -> HashMap<String, CliProfile> {
                 "to edit".into(),
             ],
             startup_dismiss: Some(StartupDismiss {
-                key: "Escape".into(),
+                policy: "custom-keys".into(),
+                key: Some("Escape".into()),
                 triggers: vec!["Kimi Code Update Available".into()],
             }),
             approve_keys: "y Enter".into(),
@@ -1216,8 +1262,9 @@ fn default_profile_map() -> HashMap<String, CliProfile> {
             prompt_indicator: "›".into(),
             busy_indicators: vec!["• Working".into()],
             startup_dismiss: Some(StartupDismiss {
-                key: "Down Enter".into(),
-                triggers: vec!["Update available!".into(), "Press enter to continue".into()],
+                policy: "skip-update".into(),
+                key: None,
+                triggers: vec!["Update now".into()],
             }),
             approve_keys: "y Enter".into(),
             reject_keys: "n Enter".into(),
@@ -1239,7 +1286,8 @@ fn default_profile_map() -> HashMap<String, CliProfile> {
             prompt_indicator: "❯".into(),
             busy_indicators: vec!["Thinking".into(), "Working".into(), "Running".into()],
             startup_dismiss: Some(StartupDismiss {
-                key: "Escape".into(),
+                policy: "custom-keys".into(),
+                key: Some("Escape".into()),
                 triggers: vec![
                     "Update available".into(),
                     "Claude Code Update Available".into(),
@@ -1279,7 +1327,44 @@ fn load_profile_overlay(
     if profile.name.is_empty() {
         profile.name = name.to_owned();
     }
+    validate_profile(&profile)?;
     Ok(profile)
+}
+
+fn validate_profile(profile: &CliProfile) -> Result<(), String> {
+    if let Some(dismiss) = profile.startup_dismiss.as_ref() {
+        match dismiss.policy.as_str() {
+            "skip-update" | "update-now" => {
+                if dismiss.key.is_some() {
+                    return Err(format!(
+                        "profile '{}' startup_dismiss policy '{}' does not accept key; use policy 'custom-keys' for literal key sequences",
+                        profile.name, dismiss.policy
+                    ));
+                }
+            }
+            "custom-keys" => {
+                if dismiss
+                    .key
+                    .as_deref()
+                    .map(str::trim)
+                    .unwrap_or_default()
+                    .is_empty()
+                {
+                    return Err(format!(
+                        "profile '{}' startup_dismiss policy 'custom-keys' requires key",
+                        profile.name
+                    ));
+                }
+            }
+            other => {
+                return Err(format!(
+                    "profile '{}' uses unsupported startup_dismiss policy '{}'",
+                    profile.name, other
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
 fn merge_toml_value(base: &mut toml::Value, overlay: toml::Value) {
@@ -1671,11 +1756,12 @@ prompt_indicator = "codex ready"
             Some("codex --dangerously-bypass-approvals-and-sandbox")
         );
         let codex_dismiss = codex.startup_dismiss.expect("codex startup dismiss");
-        assert_eq!(codex_dismiss.key, "Down Enter");
+        assert_eq!(codex_dismiss.policy, "skip-update");
+        assert_eq!(codex_dismiss.key, None);
         assert!(codex_dismiss
             .triggers
             .iter()
-            .any(|trigger| trigger == "Update available!"));
+            .any(|trigger| trigger == "Update now"));
 
         let claude = get_profile(&profiles, "claude").expect("claude profile");
         assert_eq!(claude.cmd.as_deref(), Some("claude"));

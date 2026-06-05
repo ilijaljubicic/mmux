@@ -2,7 +2,10 @@ use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct StartupDismiss {
-    pub key: String,
+    #[serde(default = "default_startup_dismiss_policy")]
+    pub policy: String,
+    #[serde(default)]
+    pub key: Option<String>,
     pub triggers: Vec<String>,
 }
 
@@ -39,6 +42,10 @@ pub fn default_submit_keys() -> String {
 
 pub fn default_submit_after_text() -> bool {
     true
+}
+
+pub fn default_startup_dismiss_policy() -> String {
+    "skip-update".into()
 }
 
 impl Default for CliProfile {
