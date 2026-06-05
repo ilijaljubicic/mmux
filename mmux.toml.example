@@ -29,6 +29,14 @@
 # [coder_profile.codex]
 # cmd = "codex --model gpt-5"
 
+# Example: override prompt submission behavior. Claude Code should receive
+# prompt text literally, then receive Enter as a real keypress.
+#
+# [coder_profile.claude]
+# text_mode = "literal-keys"
+# submit_keys = "Enter"
+# submit_after_text = true
+
 # Example: launch a TUI from an interactive shell instead of making it the
 # direct detached tmux command.
 #
@@ -42,6 +50,9 @@
 # name = "custom"
 # cmd = "custom-code"
 # launch_strategy = "direct"
+# text_mode = "paste-buffer"
+# submit_keys = "Enter"
+# submit_after_text = true
 # prompt_indicator = ">"
 # busy_indicators = ["Working"]
 # approve_keys = "y Enter"

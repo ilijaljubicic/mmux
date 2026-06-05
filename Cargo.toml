@@ -10,7 +10,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.1.2"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 
@@ -27,6 +27,7 @@ mime = "0.3.17"
 rmcp = { version = "1.7", features = ["server", "transport-streamable-http-server"] }
 ractor = "0.15"
 ractor_actors = { version = "0.4.9", default-features = false, features = ["time"] }
+rusqlite = { version = "0.32", features = ["bundled"] }
 rustls-pemfile = "2"
 rustls = "0.23"
 serde = { version = "1.0", features = ["derive"] }
@@ -46,9 +47,4 @@ license.workspace = true
 
 [dependencies]
 mmux-controller = { path = "crates/mmux-controller" }
-
-[target.'cfg(target_os = "linux")'.dependencies]
-mmux-node = { path = "crates/mmux-node", features = ["microsandbox"] }
-
-[target.'cfg(not(target_os = "linux"))'.dependencies]
 mmux-node = { path = "crates/mmux-node" }

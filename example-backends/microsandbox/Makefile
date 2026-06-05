@@ -18,7 +18,7 @@ MMUX_DEV = cargo run --manifest-path ../../Cargo.toml --
 help:
 	@printf 'Microsandbox mmux connector example\n'
 	@printf '\n'
-	@printf '  make sandbox-prepare  Create/start sandbox and run setup assets\n'
+	@printf '  make sandbox-prepare  Create running sandbox and run setup assets\n'
 	@printf '  make launch      Run host-side mmux node connector for an existing sandbox\n'
 	@printf '  make dev-launch  Run connector through cargo for local development\n'
 	@printf '\n'

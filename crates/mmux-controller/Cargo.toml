@@ -17,6 +17,7 @@ mmux-shared = { path = "../mmux-shared" }
 mmux-wire = { path = "../mmux-wire" }
 ractor = { workspace = true }
 rmcp = { workspace = true }
+rusqlite = { workspace = true }
 rustls = { workspace = true }
 rustls-pemfile = { workspace = true }
 serde = { workspace = true }

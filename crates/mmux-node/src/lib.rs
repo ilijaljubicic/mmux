@@ -18,11 +18,20 @@ use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
+use std::thread;
+use std::time::{Duration, Instant};
 
 pub const DEFAULT_NODE_PROFILE_CONFIG_NAME: &str = "mmux.toml";
+pub const DEFAULT_STORE_DIR_NAME: &str = ".mmux";
+pub const LOCAL_TMUX_SOCKET_NAME: &str = "tmux-local.sock";
+const LOCAL_TMUX_QUICK_TIMEOUT: Duration = Duration::from_secs(5);
+const LOCAL_TMUX_CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
+const MICROSANDBOX_HEALTH_TIMEOUT: Duration = Duration::from_secs(20);
+const MICROSANDBOX_TMUX_TIMEOUT: Duration = Duration::from_secs(20);
+const MICROSANDBOX_FILE_TIMEOUT: Duration = Duration::from_secs(60);
+const BACKEND_PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 pub type ProfileRegistry = Arc<RwLock<HashMap<String, CliProfile>>>;
 
@@ -117,7 +126,17 @@ pub struct NodeCli {
     pub node_config: Option<String>,
     #[arg(
         long,
-        help = "Microsandbox sandbox name used with --backend microsandbox"
+        help = "Directory for local node runtime state. The local tmux socket is <store-path>/tmux-local.sock."
+    )]
+    pub store_path: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Path to tmux.conf used by the local backend tmux server. Only valid with --backend local."
+    )]
+    pub tmux_config: Option<PathBuf>,
+    #[arg(
+        long,
+        help = "Existing running Microsandbox sandbox name used with --backend microsandbox"
     )]
     pub sandbox_name: Option<String>,
 }
@@ -138,6 +157,10 @@ where
     T: Into<OsString> + Clone,
 {
     let cli = NodeCli::parse_from(args);
+    if let Err(error) = validate_node_backend_flags(&cli) {
+        eprintln!("Node backend config error: {}", error);
+        std::process::exit(1);
+    }
     if let Some(path) = cli.node_config.as_deref() {
         if let Err(error) = load_profiles_from_config(path) {
             eprintln!("Node profile config error: {}", error);
@@ -174,6 +197,13 @@ where
     } else {
         println!("  No controller URL provided; node is idle.");
     }
+}
+
+fn validate_node_backend_flags(cli: &NodeCli) -> Result<(), String> {
+    if cli.backend != NodeBackendKind::Local && cli.tmux_config.is_some() {
+        return Err("--tmux-config is only valid with --backend local".to_owned());
+    }
+    Ok(())
 }
 
 async fn run_registered_node(
@@ -359,66 +389,62 @@ fn next_reconnect_delay(current: Duration) -> Duration {
     next.min(Duration::from_secs(30))
 }
 
+#[derive(Clone)]
 enum NodeExecutionBackend {
-    Local,
-    #[cfg(feature = "microsandbox")]
+    Local(LocalNode),
     Microsandbox(MicrosandboxNodeBackend),
 }
 
 impl NodeExecutionBackend {
     async fn from_cli(cli: &NodeCli) -> Result<Self, String> {
         match cli.backend {
-            NodeBackendKind::Local => Ok(Self::Local),
+            NodeBackendKind::Local => Ok(Self::Local(LocalNode::new(
+                cli.store_path.as_deref(),
+                cli.tmux_config.as_deref(),
+            )?)),
             NodeBackendKind::Microsandbox => {
-                #[cfg(feature = "microsandbox")]
-                {
-                    let sandbox_name = cli.sandbox_name.as_deref().ok_or_else(|| {
-                        "--sandbox-name is required with --backend microsandbox".to_owned()
-                    })?;
-                    let sandbox = connect_existing_microsandbox(sandbox_name).await?;
-                    Ok(Self::Microsandbox(MicrosandboxNodeBackend { sandbox }))
-                }
-                #[cfg(not(feature = "microsandbox"))]
-                {
-                    Err("mmux node was not built with Microsandbox backend support".into())
-                }
+                validate_node_backend_flags(cli)?;
+                let sandbox_name = cli.sandbox_name.clone().ok_or_else(|| {
+                    "--sandbox-name is required with --backend microsandbox".to_owned()
+                })?;
+                ensure_existing_microsandbox(&sandbox_name).await?;
+                Ok(Self::Microsandbox(MicrosandboxNodeBackend { sandbox_name }))
             }
         }
     }
 
     async fn execute(&mut self, command: NodeCommand) -> NodeCommandResult {
         match self {
-            Self::Local => execute_local_node_command(command),
-            #[cfg(feature = "microsandbox")]
+            Self::Local(local) => execute_local_node_command(local, command),
             Self::Microsandbox(backend) => backend.execute(command).await,
         }
     }
 }
 
+#[derive(Clone)]
 pub struct EmbeddedNodeBackend {
     backend: NodeExecutionBackend,
 }
 
 impl EmbeddedNodeBackend {
-    pub async fn local() -> Result<Self, String> {
+    pub async fn local(
+        store_path: Option<&Path>,
+        tmux_config: Option<&Path>,
+    ) -> Result<Self, String> {
+        let local = LocalNode::new(store_path, tmux_config)?;
+        ensure_local_tmux_backend_available(&local)?;
         Ok(Self {
-            backend: NodeExecutionBackend::Local,
+            backend: NodeExecutionBackend::Local(local),
         })
     }
 
     pub async fn microsandbox(sandbox_name: &str) -> Result<Self, String> {
-        #[cfg(feature = "microsandbox")]
-        {
-            let sandbox = connect_existing_microsandbox(sandbox_name).await?;
-            Ok(Self {
-                backend: NodeExecutionBackend::Microsandbox(MicrosandboxNodeBackend { sandbox }),
-            })
-        }
-        #[cfg(not(feature = "microsandbox"))]
-        {
-            let _ = sandbox_name;
-            Err("mmux was not built with Microsandbox backend support".into())
-        }
+        ensure_existing_microsandbox(sandbox_name).await?;
+        Ok(Self {
+            backend: NodeExecutionBackend::Microsandbox(MicrosandboxNodeBackend {
+                sandbox_name: sandbox_name.to_owned(),
+            }),
+        })
     }
 
     pub async fn execute(&mut self, kind: NodeCommandKind) -> NodeCommandResult {
@@ -431,38 +457,44 @@ impl EmbeddedNodeBackend {
     }
 }
 
-#[cfg(feature = "microsandbox")]
+fn ensure_local_tmux_backend_available(local: &LocalNode) -> Result<(), String> {
+    local
+        .tmux(&["start-server"])
+        .map(|_| ())
+        .map_err(|error| format!("failed to start local tmux backend: {error}"))
+}
+
+#[derive(Clone)]
 struct MicrosandboxNodeBackend {
-    sandbox: microsandbox::Sandbox,
+    sandbox_name: String,
 }
 
-#[cfg(feature = "microsandbox")]
-async fn connect_existing_microsandbox(
-    sandbox_name: &str,
-) -> Result<microsandbox::Sandbox, String> {
-    let handle = microsandbox::Sandbox::get(sandbox_name)
-        .await
-        .map_err(|error| format!("Microsandbox '{}' does not exist: {}", sandbox_name, error))?;
-    match handle.connect().await {
-        Ok(sandbox) => Ok(sandbox),
-        Err(connect_error) => microsandbox::Sandbox::start_detached(sandbox_name)
-            .await
-            .map_err(|start_error| {
-                format!(
-                    "failed to attach to existing Microsandbox '{}': {}; resume failed: {}",
-                    sandbox_name, connect_error, start_error
-                )
-            }),
-    }
+async fn ensure_existing_microsandbox(sandbox_name: &str) -> Result<(), String> {
+    run_microsandbox_shell(
+        sandbox_name,
+        "true",
+        MICROSANDBOX_HEALTH_TIMEOUT,
+        "msb health check",
+    )
+    .await
+    .map(|_| ())
+    .map_err(|error| {
+        format!(
+            "failed to use existing running Microsandbox '{}' via 'msb exec': {}",
+            sandbox_name, error
+        )
+    })
 }
 
-#[cfg(feature = "microsandbox")]
 impl MicrosandboxNodeBackend {
     async fn execute(&self, command: NodeCommand) -> NodeCommandResult {
         match command.kind {
             NodeCommandKind::Tmux { args } => {
                 let command = shell_command("tmux", &args);
-                match self.run_shell(&command).await {
+                match self
+                    .run_shell(&command, MICROSANDBOX_TMUX_TIMEOUT, "msb tmux")
+                    .await
+                {
                     Ok(output) => NodeCommandResult::TmuxOutput(output),
                     Err(message) => NodeCommandResult::Error { message },
                 }
@@ -500,7 +532,8 @@ impl MicrosandboxNodeBackend {
             skip,
             limit
         );
-        self.run_shell(&command).await
+        self.run_shell(&command, MICROSANDBOX_FILE_TIMEOUT, "msb file read")
+            .await
     }
 
     async fn write_file(
@@ -522,41 +555,29 @@ impl MicrosandboxNodeBackend {
             operator,
             shell_quote(path)
         );
-        self.run_shell(&command).await?;
+        self.run_shell(&command, MICROSANDBOX_FILE_TIMEOUT, "msb file write")
+            .await?;
         BASE64
             .decode(content_base64.as_bytes())
             .map(|bytes| bytes.len())
             .map_err(|error| format!("base64 decode error: {}", error))
     }
 
-    async fn run_shell(&self, command: &str) -> Result<String, String> {
-        let output = self
-            .sandbox
-            .shell(command)
-            .await
-            .map_err(|error| format!("microsandbox shell failed to run: {}", error))?;
-        let status = output.status();
-        let stdout = output
-            .stdout()
-            .unwrap_or_else(|_| String::from_utf8_lossy(output.stdout_bytes()).into_owned());
-        if status.success {
-            return Ok(stdout);
-        }
-        let stderr = output
-            .stderr()
-            .unwrap_or_else(|_| String::from_utf8_lossy(output.stderr_bytes()).into_owned());
-        Err(format!(
-            "microsandbox shell exited with code {}\nstdout:\n{}\nstderr:\n{}",
-            status.code, stdout, stderr
-        ))
+    async fn run_shell(
+        &self,
+        command: &str,
+        timeout: Duration,
+        description: &'static str,
+    ) -> Result<String, String> {
+        run_microsandbox_shell(&self.sandbox_name, command, timeout, description).await
     }
 }
 
-fn execute_local_node_command(command: NodeCommand) -> NodeCommandResult {
+fn execute_local_node_command(local: &LocalNode, command: NodeCommand) -> NodeCommandResult {
     match command.kind {
         NodeCommandKind::Tmux { args } => {
             let refs: Vec<&str> = args.iter().map(String::as_str).collect();
-            match tmux(&refs) {
+            match local.tmux(&refs) {
                 Ok(output) => NodeCommandResult::TmuxOutput(output),
                 Err(message) => NodeCommandResult::Error { message },
             }
@@ -588,7 +609,6 @@ fn execute_local_node_command(command: NodeCommand) -> NodeCommandResult {
     }
 }
 
-#[cfg(feature = "microsandbox")]
 fn shell_command(program: &str, args: &[String]) -> String {
     std::iter::once(shell_quote(program))
         .chain(args.iter().map(|arg| shell_quote(arg)))
@@ -596,9 +616,49 @@ fn shell_command(program: &str, args: &[String]) -> String {
         .join(" ")
 }
 
-#[cfg(feature = "microsandbox")]
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+async fn run_microsandbox_shell(
+    sandbox_name: &str,
+    command: &str,
+    timeout: Duration,
+    description: &'static str,
+) -> Result<String, String> {
+    let sandbox_name = sandbox_name.to_owned();
+    let command = command.to_owned();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut command_runner = Command::new("msb");
+        command_runner
+            .arg("exec")
+            .arg("-q")
+            .arg(&sandbox_name)
+            .arg("--")
+            .arg("bash")
+            .arg("-lc")
+            .arg(&command);
+        run_output_command_with_timeout(
+            command_runner,
+            &format!("{} for {}", description, sandbox_name),
+            timeout,
+        )
+    })
+    .await
+    .map_err(|error| format!("msb exec task failed: {}", error))?
+    .map_err(|error| format!("msb failed to execute: {}", error))?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).into_owned();
+    if output.status.success() {
+        return Ok(stdout);
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    Err(format!(
+        "msb exec exited with code {}\nstdout:\n{}\nstderr:\n{}",
+        output.status.code().unwrap_or(-1),
+        stdout,
+        stderr
+    ))
 }
 
 fn read_file_bytes(path: &str, offset: Option<u64>, limit: usize) -> Result<Vec<u8>, String> {
@@ -778,16 +838,43 @@ fn load_private_key_from_bytes(
         .ok_or_else(|| format!("{} contains no private key", description))
 }
 
-#[derive(Clone, Debug, Default)]
-pub struct LocalNode;
+#[derive(Clone, Debug)]
+pub struct LocalNode {
+    tmux_socket: PathBuf,
+    tmux_config: Option<PathBuf>,
+}
 
 impl LocalNode {
+    pub fn new(store_path: Option<&Path>, tmux_config: Option<&Path>) -> Result<Self, String> {
+        let store_path = resolve_store_path(store_path)?;
+        ensure_store_dir(&store_path)?;
+        let tmux_config = tmux_config
+            .map(|path| canonicalize_required_path("--tmux-config", path))
+            .transpose()?;
+        Ok(Self {
+            tmux_socket: local_tmux_socket_path(&store_path),
+            tmux_config,
+        })
+    }
+
+    pub fn socket_path(&self) -> &Path {
+        &self.tmux_socket
+    }
+
+    pub fn tmux_config_path(&self) -> Option<&Path> {
+        self.tmux_config.as_deref()
+    }
+
     pub fn tmux(&self, args: &[&str]) -> Result<String, String> {
-        tmux(args)
+        tmux_with_socket(Some(&self.tmux_socket), self.tmux_config.as_deref(), args)
     }
 
     pub fn session_exists(&self, session: &str) -> bool {
-        session_exists(session)
+        session_exists_with_socket(
+            Some(&self.tmux_socket),
+            self.tmux_config.as_deref(),
+            session,
+        )
     }
 
     pub fn read_file(
@@ -811,11 +898,90 @@ impl LocalNode {
     }
 }
 
-pub fn tmux(args: &[&str]) -> Result<String, String> {
-    let out = Command::new("tmux")
-        .args(args)
-        .output()
-        .map_err(|e| format!("tmux failed to execute: {}", e))?;
+pub fn default_store_path() -> Result<PathBuf, String> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+        .ok_or_else(|| "HOME is not set; pass --store-path explicitly".to_owned())?;
+    Ok(home.join(DEFAULT_STORE_DIR_NAME))
+}
+
+pub fn resolve_store_path(path: Option<&Path>) -> Result<PathBuf, String> {
+    match path {
+        Some(path) => expand_tilde_path(path),
+        None => default_store_path(),
+    }
+}
+
+fn expand_tilde_path(path: &Path) -> Result<PathBuf, String> {
+    let text = path.to_string_lossy();
+    if text == "~" {
+        return std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| "HOME is not set; cannot expand '~'".to_owned());
+    }
+    if let Some(rest) = text.strip_prefix("~/") {
+        let home = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .ok_or_else(|| "HOME is not set; cannot expand '~/'".to_owned())?;
+        return Ok(home.join(rest));
+    }
+    Ok(path.to_path_buf())
+}
+
+pub fn ensure_store_dir(path: &Path) -> Result<(), String> {
+    std::fs::create_dir_all(path).map_err(|error| {
+        format!(
+            "failed to create store path '{}': {}",
+            path.display(),
+            error
+        )
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o700)).map_err(
+            |error| {
+                format!(
+                    "failed to set store path permissions '{}': {}",
+                    path.display(),
+                    error
+                )
+            },
+        )?;
+    }
+    Ok(())
+}
+
+pub fn local_tmux_socket_path(store_path: &Path) -> PathBuf {
+    store_path.join(LOCAL_TMUX_SOCKET_NAME)
+}
+
+pub fn tmux_with_socket(
+    socket: Option<&Path>,
+    config: Option<&Path>,
+    args: &[&str],
+) -> Result<String, String> {
+    let command = build_tmux_command(socket, config, args);
+    if is_tmux_control_command(args) {
+        let status = run_status_command_with_timeout(
+            command,
+            "tmux control command",
+            local_tmux_timeout_for_args(args),
+        )
+        .map_err(|error| format!("tmux failed to execute: {}", error))?;
+        if !status.success() {
+            return Err(format!(
+                "tmux error: control command exited with code {}",
+                status.code().unwrap_or(-1)
+            ));
+        }
+        return Ok(String::new());
+    }
+
+    let out =
+        run_output_command_with_timeout(command, "tmux command", local_tmux_timeout_for_args(args))
+            .map_err(|error| format!("tmux failed to execute: {}", error))?;
     let stdout = String::from_utf8_lossy(&out.stdout).into_owned();
     let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
     if !out.status.success() {
@@ -824,12 +990,122 @@ pub fn tmux(args: &[&str]) -> Result<String, String> {
     Ok(stdout)
 }
 
+pub fn tmux(args: &[&str]) -> Result<String, String> {
+    tmux_with_socket(None, None, args)
+}
+
+pub fn session_exists_with_socket(
+    socket: Option<&Path>,
+    config: Option<&Path>,
+    session: &str,
+) -> bool {
+    tmux_with_socket(socket, config, &["has-session", "-t", session]).is_ok()
+}
+
 pub fn session_exists(session: &str) -> bool {
-    Command::new("tmux")
-        .args(["has-session", "-t", session])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
+    session_exists_with_socket(None, None, session)
+}
+
+fn build_tmux_command(socket: Option<&Path>, config: Option<&Path>, args: &[&str]) -> Command {
+    let mut command = Command::new("tmux");
+    if let Some(socket) = socket {
+        command.arg("-S").arg(socket);
+    }
+    if let Some(config) = config {
+        command.arg("-f").arg(config);
+    }
+    command.args(args);
+    command
+}
+
+fn is_tmux_control_command(args: &[&str]) -> bool {
+    matches!(
+        args.first().copied(),
+        Some(
+            "start-server"
+                | "new-session"
+                | "kill-session"
+                | "send-keys"
+                | "set-buffer"
+                | "paste-buffer"
+                | "resize-pane"
+                | "set-option"
+                | "rename-session"
+                | "detach-client"
+        )
+    )
+}
+
+fn local_tmux_timeout_for_args(args: &[&str]) -> Duration {
+    if is_tmux_control_command(args) {
+        LOCAL_TMUX_CONTROL_TIMEOUT
+    } else {
+        LOCAL_TMUX_QUICK_TIMEOUT
+    }
+}
+
+fn run_output_command_with_timeout(
+    mut command: Command,
+    description: &str,
+    timeout: Duration,
+) -> Result<Output, String> {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("spawn failed: {}", error))?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(_status)) => {
+                return child
+                    .wait_with_output()
+                    .map_err(|error| format!("wait failed: {}", error));
+            }
+            Ok(None) if started.elapsed() >= timeout => {
+                let pid = child.id();
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "{} timed out after {}s (pid {})",
+                    description,
+                    timeout.as_secs(),
+                    pid
+                ));
+            }
+            Ok(None) => thread::sleep(BACKEND_PROCESS_POLL_INTERVAL),
+            Err(error) => return Err(format!("wait failed: {}", error)),
+        }
+    }
+}
+
+fn run_status_command_with_timeout(
+    mut command: Command,
+    description: &str,
+    timeout: Duration,
+) -> Result<ExitStatus, String> {
+    command.stdout(Stdio::null()).stderr(Stdio::null());
+    let mut child = command
+        .spawn()
+        .map_err(|error| format!("spawn failed: {}", error))?;
+    let started = Instant::now();
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return Ok(status),
+            Ok(None) if started.elapsed() >= timeout => {
+                let pid = child.id();
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(format!(
+                    "{} timed out after {}s (pid {})",
+                    description,
+                    timeout.as_secs(),
+                    pid
+                ));
+            }
+            Ok(None) => thread::sleep(BACKEND_PROCESS_POLL_INTERVAL),
+            Err(error) => return Err(format!("wait failed: {}", error)),
+        }
+    }
 }
 
 pub fn default_profile_config_in_cwd() -> Option<String> {
@@ -879,6 +1155,9 @@ fn default_profile_map() -> HashMap<String, CliProfile> {
             cmd: Some("opencode".into()),
             permission_bypass_cmd: None,
             launch_strategy: Some("shell_send".into()),
+            text_mode: "paste-buffer".into(),
+            submit_keys: "Enter".into(),
+            submit_after_text: true,
             prompt_indicator: "ctrl+p commands".into(),
             busy_indicators: vec![
                 "Thinking".into(),
@@ -888,7 +1167,6 @@ fn default_profile_map() -> HashMap<String, CliProfile> {
                 "Generating".into(),
             ],
             startup_dismiss: None,
-            launch: None,
             approve_keys: "y Enter".into(),
             reject_keys: "n Enter".into(),
             cancel_keys: "C-c".into(),
@@ -903,6 +1181,9 @@ fn default_profile_map() -> HashMap<String, CliProfile> {
             cmd: Some("kimi".into()),
             permission_bypass_cmd: Some("kimi --yolo".into()),
             launch_strategy: None,
+            text_mode: "paste-buffer".into(),
+            submit_keys: "Enter".into(),
+            submit_after_text: true,
             prompt_indicator: ">".into(),
             busy_indicators: vec![
                 "Working".into(),
@@ -915,7 +1196,6 @@ fn default_profile_map() -> HashMap<String, CliProfile> {
                 key: "Escape".into(),
                 triggers: vec!["Kimi Code Update Available".into()],
             }),
-            launch: None,
             approve_keys: "y Enter".into(),
             reject_keys: "n Enter".into(),
             cancel_keys: "C-c".into(),
@@ -930,13 +1210,15 @@ fn default_profile_map() -> HashMap<String, CliProfile> {
             cmd: Some("codex".into()),
             permission_bypass_cmd: Some("codex --dangerously-bypass-approvals-and-sandbox".into()),
             launch_strategy: None,
+            text_mode: "paste-buffer".into(),
+            submit_keys: "Enter".into(),
+            submit_after_text: true,
             prompt_indicator: "›".into(),
-            busy_indicators: vec!["• Working".into(), "Starting MCP servers".into()],
+            busy_indicators: vec!["• Working".into()],
             startup_dismiss: Some(StartupDismiss {
                 key: "Down Enter".into(),
                 triggers: vec!["Update available!".into(), "Press enter to continue".into()],
             }),
-            launch: None,
             approve_keys: "y Enter".into(),
             reject_keys: "n Enter".into(),
             cancel_keys: "C-c".into(),
@@ -951,6 +1233,9 @@ fn default_profile_map() -> HashMap<String, CliProfile> {
             cmd: Some("claude".into()),
             permission_bypass_cmd: Some("claude --dangerously-skip-permissions".into()),
             launch_strategy: None,
+            text_mode: "literal-keys".into(),
+            submit_keys: "Enter".into(),
+            submit_after_text: true,
             prompt_indicator: "❯".into(),
             busy_indicators: vec!["Thinking".into(), "Working".into(), "Running".into()],
             startup_dismiss: Some(StartupDismiss {
@@ -961,7 +1246,6 @@ fn default_profile_map() -> HashMap<String, CliProfile> {
                     "A new version of Claude Code is available".into(),
                 ],
             }),
-            launch: None,
             approve_keys: "y Enter".into(),
             reject_keys: "n Enter".into(),
             cancel_keys: "C-c".into(),
@@ -1212,6 +1496,111 @@ mod tests {
         ))
     }
 
+    fn unique_temp_dir(name: &str) -> std::path::PathBuf {
+        unique_temp_file(name)
+    }
+
+    #[test]
+    fn local_node_uses_store_path_socket() {
+        let store = unique_temp_dir("mmux-node-store");
+        let local = LocalNode::new(Some(&store), None).unwrap();
+
+        assert_eq!(local.socket_path(), store.join(LOCAL_TMUX_SOCKET_NAME));
+        assert!(store.exists());
+
+        let _ = std::fs::remove_dir_all(store);
+    }
+
+    #[test]
+    fn local_node_accepts_tmux_config_path() {
+        let store = unique_temp_dir("mmux-node-store");
+        let config = unique_temp_file("mmux-node-tmux-conf");
+        std::fs::write(&config, "set -g mouse on\n").unwrap();
+        let canonical_config = std::fs::canonicalize(&config).unwrap();
+        let local = LocalNode::new(Some(&store), Some(&config)).unwrap();
+
+        assert_eq!(local.tmux_config_path(), Some(canonical_config.as_path()));
+
+        let _ = std::fs::remove_dir_all(store);
+        let _ = std::fs::remove_file(config);
+    }
+
+    #[test]
+    fn tmux_config_is_local_backend_only() {
+        let cli = NodeCli {
+            backend: NodeBackendKind::Microsandbox,
+            node_id: "msb-1".into(),
+            controller_url: None,
+            node_name: None,
+            wire_token: None,
+            controller_ca: None,
+            client_cert: None,
+            client_key: None,
+            poll_interval_ms: 500,
+            node_config: None,
+            store_path: None,
+            tmux_config: Some(PathBuf::from("tmux.local.conf")),
+            sandbox_name: Some("mmux-node".into()),
+        };
+
+        assert!(validate_node_backend_flags(&cli)
+            .unwrap_err()
+            .contains("--tmux-config is only valid with --backend local"));
+    }
+
+    #[test]
+    fn tmux_server_control_commands_do_not_capture_output() {
+        assert!(is_tmux_control_command(&["start-server"]));
+        assert!(is_tmux_control_command(&["new-session", "-d"]));
+        assert!(is_tmux_control_command(&["send-keys", "-t", "s", "Enter"]));
+        assert!(!is_tmux_control_command(&["list-sessions"]));
+        assert!(!is_tmux_control_command(&["capture-pane", "-p"]));
+        assert!(!is_tmux_control_command(&["has-session", "-t", "s"]));
+    }
+
+    #[test]
+    fn local_tmux_timeout_classification_matches_command_kind() {
+        assert_eq!(
+            local_tmux_timeout_for_args(&["new-session", "-d"]),
+            LOCAL_TMUX_CONTROL_TIMEOUT
+        );
+        assert_eq!(
+            local_tmux_timeout_for_args(&["start-server"]),
+            LOCAL_TMUX_CONTROL_TIMEOUT
+        );
+        assert_eq!(
+            local_tmux_timeout_for_args(&["list-sessions"]),
+            LOCAL_TMUX_QUICK_TIMEOUT
+        );
+        assert_eq!(
+            local_tmux_timeout_for_args(&["capture-pane", "-p"]),
+            LOCAL_TMUX_QUICK_TIMEOUT
+        );
+    }
+
+    #[test]
+    fn local_node_private_socket_new_session_returns() {
+        let store = unique_temp_dir("mmux-node-store");
+        let local = LocalNode::new(Some(&store), None).unwrap();
+        let session = format!("mmux-test-{}", std::process::id());
+
+        local
+            .tmux(&["new-session", "-d", "-s", &session, "sh -c 'sleep 30'"])
+            .unwrap();
+        assert!(local.session_exists(&session));
+
+        let _ = local.tmux(&["kill-session", "-t", &session]);
+        let _ = std::fs::remove_dir_all(store);
+    }
+
+    #[test]
+    fn resolve_store_path_expands_tilde() {
+        let home = std::env::var_os("HOME").expect("HOME set for test");
+        let resolved = resolve_store_path(Some(Path::new("~/mmux-test-store"))).unwrap();
+
+        assert_eq!(resolved, PathBuf::from(home).join("mmux-test-store"));
+    }
+
     #[test]
     fn load_profiles_from_config_overlays_built_in_profiles() {
         let dir = std::env::temp_dir();
@@ -1274,6 +1663,9 @@ prompt_indicator = "codex ready"
 
         let codex = get_profile(&profiles, "codex").expect("codex profile");
         assert_eq!(codex.prompt_indicator, "›");
+        assert_eq!(codex.text_mode, "paste-buffer");
+        assert_eq!(codex.submit_keys, "Enter");
+        assert!(codex.submit_after_text);
         assert_eq!(
             codex.permission_bypass_cmd.as_deref(),
             Some("codex --dangerously-bypass-approvals-and-sandbox")
@@ -1292,6 +1684,9 @@ prompt_indicator = "codex ready"
             Some("claude --dangerously-skip-permissions")
         );
         assert_eq!(claude.prompt_indicator, "❯");
+        assert_eq!(claude.text_mode, "literal-keys");
+        assert_eq!(claude.submit_keys, "Enter");
+        assert!(claude.submit_after_text);
         assert!(claude
             .busy_indicators
             .iter()

@@ -6,11 +6,11 @@ This directory contains a small Makefile for running:
 mmux node --backend microsandbox
 ```
 
-against an existing Microsandbox runtime.
+against an existing running Microsandbox runtime.
 
 mmux does not manage Microsandbox lifecycle. Use `msb` directly to create,
 start, stop, snapshot, import, and export sandboxes. The mmux connector runs on
-the host, attaches to an existing sandbox by name, and keeps controller
+the host, attaches to an existing running sandbox by name, and keeps controller
 credentials on the host.
 
 ## Run
@@ -24,7 +24,7 @@ make
 That target uses `msb create` and then runs the optional scripts in
 `mmux_sources/scripts/` inside the sandbox. The repo-local `workspace/`
 directory is mounted read-write at `/workspace`; the setup assets are mounted
-at `/mmux-setup`. Once the sandbox exists, run the connector:
+at `/mmux-setup`. Once the sandbox exists and is running, run the connector:
 
 ```bash
 export MMUX_WIRE_TOKEN="...node wire bearer token..."

@@ -6,6 +6,7 @@
 //! filesystem access.
 
 mod auth;
+pub mod orchestration;
 
 pub use auth::{
     NodeWireAuthContext, NodeWireAuthMethod, NodeWireAuthMode, NodeWireAuthPolicy,

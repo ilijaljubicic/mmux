@@ -10,7 +10,6 @@ buffa = { workspace = true }
 clap = { workspace = true }
 connectrpc = { workspace = true }
 http = { workspace = true }
-microsandbox = { version = "0.5.3", optional = true }
 mmux-shared = { path = "../mmux-shared" }
 mmux-wire = { path = "../mmux-wire" }
 rustls-pemfile = { workspace = true }
@@ -22,4 +21,3 @@ webpki-roots = { workspace = true }
 
 [features]
 default = []
-microsandbox = ["dep:microsandbox"]

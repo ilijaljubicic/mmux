@@ -35,13 +35,16 @@ Do you need to run a command in a terminal?
   └─ Use exec for one-shot commands, or start_coding_session / send_input / send_key → capture_output for interactive work
 
 Do you need to drive a coding CLI (codex, opencode, kimi, claude)?
-  └─ Use list_coder_profiles → start_coding_session → coding_send → coding_wait_ready → coding_read → coding_action
+  └─ Use list_coder_profiles → start_coding_session → coding_send → wait_start(kind=coding-ready) → wait_status → coding_read → coding_action
+
+Do you need to coordinate task work across coder sessions?
+  └─ Use tools/list → orchestration_status → project_create/project_list → task_create/task_update/task_assign/edges → start_coding_session or session_record → coding_send → task_status_update
 
 Do you need to check what's happening without waiting?
   └─ Use check_state or capture_output
 
-Do you need to read or write a file?
-  └─ Use read_file or save_file (no session needed)
+Do you need to transfer a file to or from a backend node?
+  └─ Use read_file or save_file with the selected node (no session needed)
 ```
 
 ## Session Lifecycle Best Practices
@@ -51,11 +54,52 @@ session is still a tmux session; it is identified by `node`, `session`, the
 `profile` used by coding tools, and an optional `objective` describing what the
 session is about.
 
+For the built-in local backend, mmux uses its own tmux server socket under the
+store path (`~/.mmux/tmux-local.sock` by default). Do not use plain `tmux` to
+inspect local mmux sessions. Use MCP tools, or use the CLI proxy:
+
+```
+mmux list-projects
+mmux prune-store --dry-run
+mmux prune-store --sessions-only --older-than-days 7
+mmux tmux -- list-sessions
+mmux tmux -- list-sessions --project <project-id-or-slug>
+mmux tmux -- capture-pane -t codex -p
+mmux attach codex
+```
+
+Pass `--tmux-config <path>` with `--enable-local-node` to make the embedded
+local backend start tmux with an explicit config file such as
+`./tmux.local.conf`. For a distributed local node, pass `--tmux-config` to
+`mmux node --backend local`. Do not use this flag with Microsandbox; sandboxed
+backends own tmux config inside their runtime.
+
+If the controller was started with a custom store path, use the same path with
+the proxy:
+
+```
+mmux --store-path /tmp/mmux-dev list-projects
+mmux --store-path /tmp/mmux-dev prune-store --dry-run
+mmux --store-path /tmp/mmux-dev tmux -- list-sessions
+mmux --store-path /tmp/mmux-dev attach codex
+```
+
+Plain `tmux` talks to the user's default tmux server, not mmux's local-node
+tmux server.
+For orchestration work, use `mmux list-projects` to discover project ids/slugs,
+then `mmux tmux -- list-sessions --project <project-id-or-slug>` to filter live
+local sessions recorded against tasks in that project.
+
+If a running controller was upgraded in place and new orchestration tools are
+missing from discovery, restart `mmux controller` and run `tools/list` again.
+An old controller process cannot expose tools compiled into a newer binary.
+
 ### 1. Always check what is already running
 ```
-list_sessions  → see what's running
+tools/list     → discover the current MCP surface
+list_sessions  → see what's running as JSON session objects
 session_info   → deep inspect a specific session
-check_state    → quick JSON check (has_prompt, busy)
+check_state    → quick JSON check (has_prompt, promptable, busy, turn_idle)
 ```
 
 ### 2. Start profile-driven sessions explicitly
@@ -70,7 +114,8 @@ creates its shell session if needed.
 ### 3. Capture output after every significant action
 ```
 send_input(session="myapp", text="cargo test")
-wait_for(session="myapp", mode="stable", timeout_seconds=60)
+wait_start(session="myapp", kind="stable", timeout_seconds=60)
+wait_status(wait_id="<returned wait_id>")
 capture_output(session="myapp", lines=40)
 ```
 
@@ -91,17 +136,95 @@ This is useful when you want to leave a coding CLI running and come back to it l
 kill_session(session="myapp")
 ```
 
+For orchestration-owned cleanup, prefer `orchestration_cleanup_zombies` first
+with its default dry-run behavior. Only pass `dry_run=false` when the reported
+candidates are correct.
+
+## Orchestration Workflow
+
+Operators mutate orchestration state; worker sessions report findings,
+blockers, evidence, and proposed changes. Do not let worker prompts assume they
+can update task state unless the operator explicitly delegates that authority.
+
+1. Discover the loaded surface with `tools/list`, then call
+   `list_coder_profiles`.
+2. Inspect durable state with `orchestration_status`; use it for compact
+   project, task, summary, blocker, owner/session, cleanup candidate, warning,
+   and runtime-state data. Pass `include_completed=true` when delivered,
+   canceled, or failed tasks matter.
+3. Create or select a project with `project_create`/`project_list`. Projects
+   are required boundaries and do not own workspace paths, nodes, or profiles.
+   Project summaries include total, active, and `task_status_counts` entries
+   for every task status, including zero counts.
+4. Create tasks with `task_create` and required `project_id`. Each `TaskAgent`
+   may contain only `kind`, `role`, `skills`, `workspace_path`, `objective`, and
+   `prompt`; do not put `count`, `profile`, `node`, `node_id`, or
+   `bypass_permissions` there. `task_create` returns the created task object
+   directly; read its id from the top-level `id` field. Created tasks start in
+   `Backlog`; move them to `Planned` when scope/dependencies are ready.
+5. Correct mutable task metadata with `task_update`: `title`, `objective`,
+   scope fields (`include_paths`, `exclude_paths`, `notes`), `agents`,
+   and `gates`. Scalar and scope fields are partial updates; `agents` and
+   `gates` replace the whole list. Do not use `task_update` for project
+   membership, status, edges, session runtime metadata, task id, or completion
+   time.
+6. Assign owners with `task_assign` using actual runtime choices:
+   `task_id`, `node_id`, `session`, `profile`, `role`, `kind`, and `skills`.
+7. Add or remove relationships with `task_edge_add` and `task_edge_remove`
+   using `from_task_id`, `to_task_id`, `kind`, and optional `note` on add.
+8. Start a task-aware coder with `start_coding_session`, or adopt an existing
+   coder with `session_record`. Task-aware starts require explicit `node`,
+   `profile`, `workspace_path`, boolean `bypass_permissions`, `task_ids`,
+   `role`, `kind`, `skills`, and `objective`; use `session` or
+   `generate_session_name=true`.
+   For task-attached `session_record` calls, the controller validates that the
+   selected node is reachable and the tmux session already exists before it
+   writes durable state.
+   Treat `workspace_path` as the backend-owned workspace/start directory for
+   the selected node/backend. Pass the explicit string through without
+   controller-side canonicalization.
+8. Fill a static role prompt example from the `mmux-operator` skill with the
+   task id, objective, scope, dependencies, gates, selected `TaskAgent` intent,
+   session hints, and expected report fields. Send it with `coding_send`.
+9. Record accepted progress with `task_status_update`. Include a concise
+   `summary`; include `blockers` when blocked. For gated moves to `Passed` or
+   `Delivered`, the summary must include validation or review evidence.
+10. Before destructive cleanup, call `orchestration_cleanup_zombies` without
+   arguments. Explicit cleanup requires `dry_run=false` and can kill only live
+   local `mmux-*` sessions absent from durable session records.
+   Cleanup candidates report tmux creation time as `created_at_ms` when
+   available; this is distinct from durable `SessionRecord.last_seen_ms`.
+   Use `orchestration_prune_store` for online durable stale session records
+   through the running controller; use `mmux prune-store --dry-run` for offline
+   local SQLite maintenance. Pruning only removes missing local `SessionRecord`s
+   whose attached tasks are all finished; it does not remove projects, tasks,
+   active task sessions, remote sessions, or live local sessions.
+
+The `mmux-*` prefix is reserved for mmux-owned orchestration sessions generated
+from task slug, agent kind, and a short suffix. Never treat arbitrary tmux
+sessions or non-`mmux-*` sessions as orchestration cleanup candidates.
+
+Startup reconciliation loads durable `SessionRecord`s and compares them with
+live local `mmux-*` sessions. It may recreate missing active stored sessions
+only from recorded runtime choices. Unrecorded task-agent metadata does not
+start sessions. Missing individual sessions can produce reconciliation
+warnings; missing `tmux` with `--enable-local-node` fails local backend startup
+early.
+
 ## Driving a Coding CLI (Profile-Aware Workflow)
 
 ### Step 1: Ensure the session exists
 ```
 list_coder_profiles
-start_coding_session(profile="codex", session="codex", node="msb-mmux-1", cwd="/path/to/project", objective="fix tests for project X")
+start_coding_session(profile="codex", session="codex", node="msb-mmux-1", workspace_path="/path/to/project", objective="fix tests for project X")
 ```
+`start_coding_session` creates or adopts the tmux session and returns without
+waiting for the coding CLI to become ready.
 
 ### Step 2: Wait for the CLI to be ready
 ```
-coding_wait_ready(session="codex", profile="codex", timeout_seconds=30)
+wait_start(session="codex", kind="coding-ready", profile="codex", timeout_seconds=120)
+wait_status(wait_id="<returned wait_id>")
 ```
 
 If the CLI shows startup noise or an update prompt, the profile's
@@ -115,7 +238,8 @@ coding_send(session="codex", profile="codex", prompt="refactor auth module")
 
 ### Step 4: Wait for it to finish processing
 ```
-coding_wait_ready(session="codex", profile="codex", timeout_seconds=120)
+wait_start(session="codex", kind="coding-ready", profile="codex", timeout_seconds=120)
+wait_status(wait_id="<returned wait_id>")
 ```
 
 ### Step 5: Read the output
@@ -135,9 +259,9 @@ coding_action(session="codex", profile="codex", action="cancel")
 ```
 1. list_coder_profiles
 2. start_coding_session → profile="codex", session="codex"
-3. coding_wait_ready → profile="codex"
-4. coding_send → prompt="implement fibonacci"
-5. coding_wait_ready → profile="codex"
+3. coding_send → prompt="implement fibonacci"
+4. wait_start → kind="coding-ready", profile="codex"
+5. wait_status → until completed, failed, or canceled
 6. coding_read → lines=40
 7. (if approval needed) coding_action → action="approve"
 8. (repeat 4-7 as needed)
@@ -164,6 +288,9 @@ Key fields:
 |-------|---------|
 | `cmd` | Command to launch the CLI session |
 | `launch_strategy` | Launch mode: omitted/`direct` starts `cmd` as the tmux command; `shell_send` starts `bash` and sends `cmd Enter` |
+| `text_mode` | Prompt text input mode for `coding_send`: `paste-buffer` or `literal-keys` |
+| `submit_keys` | Real tmux keys sent after prompt text when `submit_after_text` is true, e.g. `Enter` |
+| `submit_after_text` | Whether `coding_send` submits after inserting prompt text |
 | `prompt_indicator` | Substring that means "the CLI is ready for input" |
 | `busy_indicators` | Substrings that mean "the CLI is still processing" |
 | `approve_keys` | Keys to send for approval (e.g., `y Enter`) |
@@ -188,26 +315,39 @@ load_profile(path="/path/to/custom.toml")
 
 ### `send_input` vs `coding_send`
 - `send_input` — raw text, no profile logic. Use for generic shells, REPLs, scripts.
-- `coding_send` — profile-aware. Auto-dismisses startup noise, handles prompt formatting. Use only for coding CLIs.
+- `coding_send` — profile-aware. Auto-dismisses startup noise and uses the profile's text/submit strategy. Use only for coding CLIs. Claude Code uses `text_mode = "literal-keys"` so `Enter` is sent as a real keypress rather than pasted text.
 
 ### `capture_output` vs `coding_read`
 - `capture_output` — any session. Can capture scrollback.
 - `coding_read` — convenience wrapper around `capture_output` with default 40 lines. Use for coding CLIs.
 
-### `wait_for` vs `coding_wait_ready`
-- `wait_for` — generic. Supports `stable` (output stops changing), `sentinel` (text appears), `prompt` (marker appears).
-- `coding_wait_ready` — profile-aware. Combines "prompt visible + not busy" into one check. Use for coding CLIs.
+### `wait_start` / `wait_status` / `wait_cancel`
+- `wait_start` — starts a runtime-only wait job. Supports `stable`, `sentinel`, `prompt`, and `coding-ready`.
+- `wait_status` — reports `pending`, `completed`, `failed`, or `canceled` with result details.
+- `wait_cancel` — cancels a pending wait without killing or interrupting the tmux session.
+
+Use `kind="coding-ready"` with `profile` for profile-aware CLI readiness. Wait
+jobs are the canonical orchestration wait API. Wait jobs can target any
+reachable execution node that supports mmux tmux command primitives.
+Omitted/default `node` targets the embedded `local` node, which may be local
+tmux or embedded Microsandbox.
+
+`check_state` returns `has_prompt`, `promptable`, `busy`, and `turn_idle`.
+`promptable=true` means the CLI can accept text, not that the current turn is
+finished. For Codex, a prompt can be visible while `busy=true` and
+`turn_idle=false`; use `turn_idle=true` or a completed `coding-ready` wait when
+you need foreground work to have settled.
 
 ### `interact` vs `exec` vs manual send + wait
 - `exec` — one-shot shell command. Creates session if needed, runs command, waits for completion, returns clean output (no prompt/command line). Best for ad-hoc commands.
 - `interact` — sends text then waits for stable output. One-shot convenience for already-running sessions.
 - Manual send + wait — gives you full control over the wait mode and parameters.
 
-## File Operations
+## Backend Node File Operations
 
 ### read_file
 ```
-read_file(path="./src/main.rs", limit=1000)
+read_file(node="local", path="./src/main.rs", limit=1000)
 ```
 Returns:
 - `content` — text or base64-encoded bytes
@@ -221,10 +361,11 @@ Always check `encoding` before interpreting `content`.
 
 ### save_file
 ```
-save_file(path="./output.txt", content="hello", encoding="utf-8")
-save_file(path="./image.png", content="<base64>", encoding="base64")
+save_file(node="local", path="./output.txt", content="hello", encoding="utf-8")
+save_file(node="local", path="./image.png", content="<base64>", encoding="base64")
 ```
-Creates parent directories automatically.
+Creates parent directories on the selected backend node. Paths are interpreted
+in that backend's filesystem namespace.
 
 ## Common Gotchas
 
@@ -275,16 +416,20 @@ Both accept optional `profile` and `session` arguments.
 
 ## Architecture Notes for Agents
 
-- mmux shells out to the system `tmux` binary. If tmux is not installed, all tools fail.
+- mmux shells out to the system `tmux` binary. With `--enable-local-node`,
+  startup fails early if the local tmux backend is unavailable.
 - The server is single-process but async-concurrent. Multiple agents can call tools simultaneously.
-- `thread::sleep` has been replaced with `tokio::time::sleep`. Long waits (e.g., `wait_for` with 60s timeout) do not block other requests.
+- `thread::sleep` has been replaced with `tokio::time::sleep`. Canonical wait jobs run outside the fast tmux actor path so pending waits do not block quick inspection requests.
 - The controller does not start an embedded execution backend by default. Use
   `--enable-local-node` for the built-in local tmux backend, or
-  `--enable-microsandbox-node --sandbox-name <name>` to embed the host-side
-  Microsandbox connector as node `local`.
+  `--enable-microsandbox-node --sandbox-name <name>` to attach the host-side
+  Microsandbox connector to an existing running sandbox as node `local`.
 - The local backend does not need a TOML file unless you want profile overlays.
+- The local backend uses a private tmux socket. Use `--tmux-config <path>` only
+  for local tmux backends when an explicit tmux config is needed. Use
+  `mmux tmux -- <args>` or `mmux attach <session>` for manual debugging.
 - Microsandbox lifecycle is managed by `msb`, not mmux. Use embedded
   Microsandbox mode for a single controller process, or use
   `mmux node --backend microsandbox --sandbox-name <name>` to attach an
-  existing sandbox to a distributed controller.
+  existing running sandbox to a distributed controller.
 - Pass `--node-config` to override the default profile config file if needed.
