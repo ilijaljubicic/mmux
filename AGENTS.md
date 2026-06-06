@@ -54,11 +54,10 @@ session is still a tmux session; it is identified by `node`, `session`, the
 `profile` used by coding tools, and an optional `objective` describing what the
 session is about.
 
-For the built-in local backend, mmux uses its own tmux server socket under the
-store path (`~/.mmux/tmux-local.sock` by default). If that socket path would be
-too long for the platform, mmux uses a deterministic short socket path under the
-system temp directory. Do not use plain `tmux` to inspect local mmux sessions.
-Use MCP tools, or use the CLI proxy:
+For the built-in local backend, mmux uses its own tmux server socket. The socket
+is a deterministic short runtime path derived from the store path, not a file
+inside the store directory. Do not use plain `tmux` to inspect local mmux
+sessions. Use MCP tools, or use the CLI proxy:
 
 ```
 mmux list-projects

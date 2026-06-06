@@ -25,8 +25,6 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_NODE_PROFILE_CONFIG_NAME: &str = "mmux.toml";
 pub const DEFAULT_STORE_DIR_NAME: &str = ".mmux";
-pub const LOCAL_TMUX_SOCKET_NAME: &str = "tmux-local.sock";
-const LOCAL_TMUX_SOCKET_MAX_BYTES: usize = 95;
 const LOCAL_TMUX_QUICK_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCAL_TMUX_CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 const MICROSANDBOX_HEALTH_TIMEOUT: Duration = Duration::from_secs(20);
@@ -127,7 +125,7 @@ pub struct NodeCli {
     pub node_config: Option<String>,
     #[arg(
         long,
-        help = "Directory for local node runtime state. The local tmux socket is normally <store-path>/tmux-local.sock; long paths use a deterministic short socket path."
+        help = "Directory for local node runtime state. The private tmux socket is a deterministic short runtime path derived from this store path."
     )]
     pub store_path: Option<PathBuf>,
     #[arg(
@@ -1015,11 +1013,6 @@ pub fn ensure_store_dir(path: &Path) -> Result<(), String> {
 }
 
 pub fn local_tmux_socket_path(store_path: &Path) -> PathBuf {
-    let preferred = store_path.join(LOCAL_TMUX_SOCKET_NAME);
-    if preferred.as_os_str().as_encoded_bytes().len() <= LOCAL_TMUX_SOCKET_MAX_BYTES {
-        return preferred;
-    }
-
     short_socket_dir().join(format!(
         "mmux-tmux-{:016x}.sock",
         stable_path_hash(store_path)
@@ -1607,29 +1600,35 @@ mod tests {
     }
 
     #[test]
-    fn local_node_uses_store_path_socket() {
+    fn local_node_uses_deterministic_private_socket_for_store_path() {
         let store = unique_temp_dir("mmux-node-store");
         let local = LocalNode::new(Some(&store), None).unwrap();
 
-        assert_eq!(local.socket_path(), store.join(LOCAL_TMUX_SOCKET_NAME));
+        assert_eq!(local.socket_path(), local_tmux_socket_path(&store));
+        assert_ne!(local.socket_path().parent(), Some(store.as_path()));
+        assert!(local
+            .socket_path()
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap()
+            .starts_with("mmux-tmux-"));
         assert!(store.exists());
 
         let _ = std::fs::remove_dir_all(store);
     }
 
     #[test]
-    fn local_node_uses_short_socket_when_store_path_is_too_long() {
+    fn local_node_socket_path_stays_short_for_long_store_path() {
         let long_component = "a".repeat(120);
         let store = std::env::temp_dir().join(long_component);
         let socket = local_tmux_socket_path(&store);
 
-        assert_ne!(socket, store.join(LOCAL_TMUX_SOCKET_NAME));
         assert!(socket
             .file_name()
             .and_then(|name| name.to_str())
             .unwrap()
             .starts_with("mmux-tmux-"));
-        assert!(socket.as_os_str().as_encoded_bytes().len() <= LOCAL_TMUX_SOCKET_MAX_BYTES);
+        assert!(socket.as_os_str().as_encoded_bytes().len() < 95);
         assert_eq!(socket, local_tmux_socket_path(&store));
     }
 
