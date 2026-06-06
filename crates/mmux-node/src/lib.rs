@@ -18,7 +18,7 @@ use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus, Output, Stdio};
+use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, RwLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -26,6 +26,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 pub const DEFAULT_NODE_PROFILE_CONFIG_NAME: &str = "mmux.toml";
 pub const DEFAULT_STORE_DIR_NAME: &str = ".mmux";
 pub const LOCAL_TMUX_SOCKET_NAME: &str = "tmux-local.sock";
+const LOCAL_TMUX_SOCKET_MAX_BYTES: usize = 95;
 const LOCAL_TMUX_QUICK_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCAL_TMUX_CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
 const MICROSANDBOX_HEALTH_TIMEOUT: Duration = Duration::from_secs(20);
@@ -126,7 +127,7 @@ pub struct NodeCli {
     pub node_config: Option<String>,
     #[arg(
         long,
-        help = "Directory for local node runtime state. The local tmux socket is <store-path>/tmux-local.sock."
+        help = "Directory for local node runtime state. The local tmux socket is normally <store-path>/tmux-local.sock; long paths use a deterministic short socket path."
     )]
     pub store_path: Option<PathBuf>,
     #[arg(
@@ -463,10 +464,20 @@ fn ensure_local_tmux_backend_available(local: &LocalNode) -> Result<(), String> 
         .unwrap_or_default()
         .as_nanos();
     let session = format!("mmux-health-{}-{suffix}", std::process::id());
-    local
-        .tmux(&["new-session", "-d", "-s", &session, "sh -c 'sleep 30'"])
-        .map_err(|error| format!("failed to start local tmux backend: {error}"))?;
-    let _ = local.tmux(&["kill-session", "-t", &session]);
+    let probe_socket =
+        short_socket_dir().join(format!("mmux-health-{}-{suffix}.sock", std::process::id()));
+    tmux_with_socket(
+        Some(&probe_socket),
+        local.tmux_config_path(),
+        &["new-session", "-d", "-s", &session, "sleep 30"],
+    )
+    .map_err(|error| format!("failed to start local tmux backend: {error}"))?;
+    let _ = tmux_with_socket(
+        Some(&probe_socket),
+        local.tmux_config_path(),
+        &["kill-session", "-t", &session],
+    );
+    let _ = std::fs::remove_file(probe_socket);
     Ok(())
 }
 
@@ -1004,7 +1015,33 @@ pub fn ensure_store_dir(path: &Path) -> Result<(), String> {
 }
 
 pub fn local_tmux_socket_path(store_path: &Path) -> PathBuf {
-    store_path.join(LOCAL_TMUX_SOCKET_NAME)
+    let preferred = store_path.join(LOCAL_TMUX_SOCKET_NAME);
+    if preferred.as_os_str().as_encoded_bytes().len() <= LOCAL_TMUX_SOCKET_MAX_BYTES {
+        return preferred;
+    }
+
+    short_socket_dir().join(format!(
+        "mmux-tmux-{:016x}.sock",
+        stable_path_hash(store_path)
+    ))
+}
+
+fn short_socket_dir() -> PathBuf {
+    let tmp = Path::new("/tmp");
+    if tmp.is_dir() {
+        tmp.to_path_buf()
+    } else {
+        std::env::temp_dir()
+    }
+}
+
+fn stable_path_hash(path: &Path) -> u64 {
+    let mut hash = 0xcbf29ce484222325u64;
+    for byte in path.as_os_str().as_encoded_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    hash
 }
 
 pub fn tmux_with_socket(
@@ -1014,16 +1051,24 @@ pub fn tmux_with_socket(
 ) -> Result<String, String> {
     let command = build_tmux_command(socket, config, args);
     if is_tmux_control_command(args) {
-        let status = run_status_command_with_timeout(
+        let out = run_output_command_with_timeout(
             command,
             "tmux control command",
             local_tmux_timeout_for_args(args),
         )
         .map_err(|error| format!("tmux failed to execute: {}", error))?;
-        if !status.success() {
+        if !out.status.success() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let stderr = String::from_utf8_lossy(&out.stderr);
             return Err(format!(
-                "tmux error: control command exited with code {}",
-                status.code().unwrap_or(-1)
+                "tmux error: control command exited with code {}{}{}",
+                out.status.code().unwrap_or(-1),
+                if stdout.is_empty() && stderr.is_empty() {
+                    ""
+                } else {
+                    ": "
+                },
+                format!("{}{}", stdout, stderr).trim()
             ));
         }
         return Ok(String::new());
@@ -1111,36 +1156,6 @@ fn run_output_command_with_timeout(
                     .wait_with_output()
                     .map_err(|error| format!("wait failed: {}", error));
             }
-            Ok(None) if started.elapsed() >= timeout => {
-                let pid = child.id();
-                let _ = child.kill();
-                let _ = child.wait();
-                return Err(format!(
-                    "{} timed out after {}s (pid {})",
-                    description,
-                    timeout.as_secs(),
-                    pid
-                ));
-            }
-            Ok(None) => thread::sleep(BACKEND_PROCESS_POLL_INTERVAL),
-            Err(error) => return Err(format!("wait failed: {}", error)),
-        }
-    }
-}
-
-fn run_status_command_with_timeout(
-    mut command: Command,
-    description: &str,
-    timeout: Duration,
-) -> Result<ExitStatus, String> {
-    command.stdout(Stdio::null()).stderr(Stdio::null());
-    let mut child = command
-        .spawn()
-        .map_err(|error| format!("spawn failed: {}", error))?;
-    let started = Instant::now();
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => return Ok(status),
             Ok(None) if started.elapsed() >= timeout => {
                 let pid = child.id();
                 let _ = child.kill();
@@ -1600,6 +1615,22 @@ mod tests {
         assert!(store.exists());
 
         let _ = std::fs::remove_dir_all(store);
+    }
+
+    #[test]
+    fn local_node_uses_short_socket_when_store_path_is_too_long() {
+        let long_component = "a".repeat(120);
+        let store = std::env::temp_dir().join(long_component);
+        let socket = local_tmux_socket_path(&store);
+
+        assert_ne!(socket, store.join(LOCAL_TMUX_SOCKET_NAME));
+        assert!(socket
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap()
+            .starts_with("mmux-tmux-"));
+        assert!(socket.as_os_str().as_encoded_bytes().len() <= LOCAL_TMUX_SOCKET_MAX_BYTES);
+        assert_eq!(socket, local_tmux_socket_path(&store));
     }
 
     #[test]

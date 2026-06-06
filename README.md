@@ -163,7 +163,10 @@ store path:  ~/.mmux
 tmux socket: ~/.mmux/tmux-local.sock
 ```
 
-With `--store-path <path>`, the socket becomes `<path>/tmux-local.sock`.
+With `--store-path <path>`, the socket normally becomes
+`<path>/tmux-local.sock`.
+If that socket path would exceed the platform tmux/Unix socket path limit, mmux
+uses a deterministic short socket path under the system temp directory instead.
 
 By default tmux uses its normal config discovery for that private server. Pass
 `--tmux-config <path>` with `--enable-local-node` to use an explicit local
@@ -329,7 +332,7 @@ Important controller flags:
 | `--wire-token-file` | none | Reads the node wire bearer token from a file. |
 | `--wire-token-env` | `MMUX_WIRE_TOKEN` | Env var used when wire token flags are omitted. |
 | `--allow-unauthenticated-node-wire` | false | Allows node wire RPC without bearer auth and ignores `MMUX_WIRE_TOKEN`; mutually exclusive with explicit wire token flags. |
-| `--store-path` | `~/.mmux` | Local runtime state directory. The embedded local tmux socket is `<store-path>/tmux-local.sock`. |
+| `--store-path` | `~/.mmux` | Local runtime state directory. The embedded local tmux socket is normally `<store-path>/tmux-local.sock`; long paths use a deterministic short socket path. |
 | `--tmux-config` | tmux default discovery | Local tmux config file for `--enable-local-node`; invalid without the embedded local node. |
 | `--enable-local-node` | false | Starts the built-in local tmux node in-process. |
 | `--enable-microsandbox-node` | false | Attaches an embedded Microsandbox node in-process. Requires `--sandbox-name` for an existing running sandbox. |
@@ -350,7 +353,7 @@ Important node flags:
 | `--client-key` | none | PEM private key to present for node wire mTLS. |
 | `--poll-interval-ms` | `500` | Command polling interval. |
 | `--node-config` | none | Profile TOML loaded by the node process. |
-| `--store-path` | `~/.mmux` | Local backend runtime state directory. The local tmux socket is `<store-path>/tmux-local.sock`. |
+| `--store-path` | `~/.mmux` | Local backend runtime state directory. The local tmux socket is normally `<store-path>/tmux-local.sock`; long paths use a deterministic short socket path. |
 | `--tmux-config` | tmux default discovery | Local tmux config file for `--backend local`; invalid with `--backend microsandbox`. |
 
 ## Make Targets

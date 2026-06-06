@@ -191,7 +191,7 @@ struct Cli {
     wire_token_env: String,
     #[arg(
         long,
-        help = "Directory for local runtime state. The embedded local tmux socket is <store-path>/tmux-local.sock."
+        help = "Directory for local runtime state. The embedded local tmux socket is normally <store-path>/tmux-local.sock; long paths use a deterministic short socket path."
     )]
     store_path: Option<PathBuf>,
     #[arg(
