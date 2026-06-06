@@ -63,8 +63,9 @@ jobs:
           brew link tmux || true
           command -v tmux
           tmux -V
-          tmux -L mmux-ci-smoke start-server
-          tmux -L mmux-ci-smoke kill-server
+          tmux -L mmux-ci-smoke new-session -d -s mmux-ci-smoke-session 'sleep 30'
+          tmux -L mmux-ci-smoke has-session -t mmux-ci-smoke-session
+          tmux -L mmux-ci-smoke kill-session -t mmux-ci-smoke-session
 
       - name: Check
         run: cargo check --workspace --locked
