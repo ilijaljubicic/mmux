@@ -50,7 +50,7 @@ embedded local node.
 ## Tasks
 
 ```json
-{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"task_create","arguments":{"project_id":"project-1","title":"Update orchestration docs","objective":"Document the orchestration workflow.","include_paths":["README.md","AGENTS.md"],"exclude_paths":["target"],"notes":"Documentation-only task.","agents":[{"kind":"codex","role":"editable-worker","skills":["docs","mmux"],"workspace_path":"/mnt/Radni/mmux","objective":"Patch only scoped docs.","prompt":"Implement the docs update only. Report changed files, validation commands, blockers, and unresolved questions."}],"gates":["Docs updated","No unrelated files changed"]}}}
+{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"task_create","arguments":{"project_id":"mmux","title":"Update orchestration docs","objective":"Document the orchestration workflow.","include_paths":["README.md","AGENTS.md"],"exclude_paths":["target"],"notes":"Documentation-only task.","agents":[{"kind":"codex","role":"editable-worker","skills":["docs","mmux"],"workspace_path":"/mnt/Radni/mmux","objective":"Patch only scoped docs.","prompt":"Implement the docs update only. Report changed files, validation commands, blockers, and unresolved questions."}],"gates":["Docs updated","No unrelated files changed"]}}}
 ```
 
 ```json
@@ -148,7 +148,7 @@ Inspect state again after cleanup:
 ## Troubleshooting
 
 ```json
-{"jsonrpc":"2.0","id":60,"method":"tools/call","params":{"name":"list_sessions","arguments":{"node":"local","project_id":"project-1"}}}
+{"jsonrpc":"2.0","id":60,"method":"tools/call","params":{"name":"list_sessions","arguments":{"node":"local","project_id":"mmux"}}}
 ```
 
 Use raw node visibility only for admin/debug:

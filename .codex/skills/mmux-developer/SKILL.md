@@ -115,8 +115,9 @@ Then call `http://127.0.0.1:3197/mcp` with JSON-RPC. Include:
 For project-scoped session listing, verify:
 
 - `list_sessions` without `project_id` fails.
-- `list_sessions(project_id)` returns only durable recorded sessions attached
-  to tasks in that project.
+- `list_sessions(project_id)` accepts either project UUID id or globally unique
+  slug and returns only durable recorded sessions attached to tasks in that
+  project.
 - Cross-project recorded sessions appear for each relevant project.
 - `admin_list_node_sessions` shows raw live node sessions when admin/debug
   visibility is expected.

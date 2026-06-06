@@ -276,9 +276,9 @@ mod tests {
         std::env::temp_dir().join(format!("{prefix}-{}-{unique}", std::process::id()))
     }
 
-    fn create_task(title: &str) -> CreateTask {
+    fn create_task(project_id: ProjectId, title: &str) -> CreateTask {
         CreateTask {
-            project_id: ProjectId("project-1".into()),
+            project_id,
             title: title.into(),
             objective: format!("Objective for {title}"),
             scope: TaskScope::default(),
@@ -296,7 +296,7 @@ mod tests {
         }
     }
 
-    fn create_task_with_agent(title: &str) -> CreateTask {
+    fn create_task_with_agent(project_id: ProjectId, title: &str) -> CreateTask {
         CreateTask {
             agents: vec![TaskAgent {
                 kind: "codex".into(),
@@ -306,7 +306,7 @@ mod tests {
                 objective: Some("implement task".into()),
                 prompt: "work on this".into(),
             }],
-            ..create_task(title)
+            ..create_task(project_id, title)
         }
     }
 
@@ -347,8 +347,10 @@ mod tests {
         let dir = unique_temp_dir("mmux-orchestration-existing");
         let store = OrchestrationStore::open(dir.clone()).unwrap();
         let mut state = OrchestrationState::new();
-        state.create_project(create_project(), 99).unwrap();
-        let task = state.create_task(create_task("Persisted"), 100).unwrap();
+        let project = state.create_project(create_project(), 99).unwrap();
+        let task = state
+            .create_task(create_task(project.id, "Persisted"), 100)
+            .unwrap();
         state
             .record_session(session(vec![task.id.clone()]), 200)
             .unwrap();
@@ -369,8 +371,10 @@ mod tests {
         let dir = unique_temp_dir("mmux-orchestration-persist");
         let handle = OrchestrationHandle::open(Some(&dir)).unwrap();
 
-        handle.create_project(create_project()).unwrap();
-        let task = handle.create_task(create_task("Saved")).unwrap();
+        let project = handle.create_project(create_project()).unwrap();
+        let task = handle
+            .create_task(create_task(project.id, "Saved"))
+            .unwrap();
         let reloaded = OrchestrationHandle::open(Some(&dir)).unwrap();
         let state = reloaded.snapshot().unwrap();
 
@@ -383,9 +387,13 @@ mod tests {
     fn task_session_edge_and_status_mutations_persist() {
         let dir = unique_temp_dir("mmux-orchestration-mutations");
         let handle = OrchestrationHandle::open(Some(&dir)).unwrap();
-        handle.create_project(create_project()).unwrap();
-        let parent = handle.create_task(create_task("Parent")).unwrap();
-        let child = handle.create_task(create_task("Child")).unwrap();
+        let project = handle.create_project(create_project()).unwrap();
+        let parent = handle
+            .create_task(create_task(project.id.clone(), "Parent"))
+            .unwrap();
+        let child = handle
+            .create_task(create_task(project.id, "Child"))
+            .unwrap();
         let owner = TaskParticipant {
             node_id: NodeId("local".into()),
             session: SessionId("worker-a".into()),
@@ -429,8 +437,10 @@ mod tests {
     fn failed_mutation_leaves_previous_snapshot_intact() {
         let dir = unique_temp_dir("mmux-orchestration-failed");
         let handle = OrchestrationHandle::open(Some(&dir)).unwrap();
-        handle.create_project(create_project()).unwrap();
-        let task = handle.create_task(create_task("Only Task")).unwrap();
+        let project = handle.create_project(create_project()).unwrap();
+        let task = handle
+            .create_task(create_task(project.id, "Only Task"))
+            .unwrap();
 
         let error = handle
             .record_session(session(vec![TaskId("missing".into())]))
@@ -450,12 +460,17 @@ mod tests {
     fn concurrent_create_calls_serialize_task_ids_and_slugs() {
         let dir = unique_temp_dir("mmux-orchestration-concurrent");
         let handle = OrchestrationHandle::open(Some(&dir)).unwrap();
-        handle.create_project(create_project()).unwrap();
+        let project = handle.create_project(create_project()).unwrap();
 
         let threads = (0..12)
             .map(|_| {
                 let handle = handle.clone();
-                thread::spawn(move || handle.create_task(create_task("Same Title")).unwrap())
+                let project_id = project.id.clone();
+                thread::spawn(move || {
+                    handle
+                        .create_task(create_task(project_id, "Same Title"))
+                        .unwrap()
+                })
             })
             .collect::<Vec<_>>();
         let tasks = threads
@@ -485,9 +500,12 @@ mod tests {
         let dir = unique_temp_dir("mmux-orchestration-agents");
         let store = OrchestrationStore::open(dir.clone()).unwrap();
         let mut state = OrchestrationState::new();
-        state.create_project(create_project(), 99).unwrap();
+        let project = state.create_project(create_project(), 99).unwrap();
         let task = state
-            .create_task(create_task_with_agent("Task With Intended Agent"), 100)
+            .create_task(
+                create_task_with_agent(project.id, "Task With Intended Agent"),
+                100,
+            )
             .unwrap();
         store.save(&state, 200).unwrap();
 

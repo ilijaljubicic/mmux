@@ -47,8 +47,8 @@ when needed.
 
 1. Confirm the mmux server:
    `GET /health`, then `list_coder_profiles` and project-scoped
-   `list_sessions(project_id)`. Use `admin_list_node_sessions` only for raw
-   node/tmux admin debugging.
+   `list_sessions(project_id)` where `project_id` is a project UUID id or slug.
+   Use `admin_list_node_sessions` only for raw node/tmux admin debugging.
 2. Start or reuse the right coder session:
    `start_coding_session(profile, session, workspace_path, objective)`.
    This creates or adopts the tmux session and returns without waiting for the
@@ -81,11 +81,11 @@ Use this flow when coordinating tasks through the orchestration tools:
    Pass `include_completed=true` when delivered, canceled, or failed tasks
    matter.
 3. Create or select a project with `project_create`/`project_list`.
-4. Create tasks with `task_create`: required `project_id`, `title`,
-   `objective`, `agents`, `include_paths`, `exclude_paths`, `notes`, optional
-   `gates`. The response is the created task object directly; read `id` from
-   the top level. Created tasks start in `Backlog`; move them to `Planned` only
-   when dependencies and scope are ready.
+4. Create tasks with `task_create`: required `project_id` (project UUID id or
+   globally unique slug), `title`, `objective`, `agents`, `include_paths`,
+   `exclude_paths`, `notes`, optional `gates`. The response is the created task
+   object directly; read `id` from the top level. Created tasks start in
+   `Backlog`; move them to `Planned` only when dependencies and scope are ready.
 5. Correct mutable task metadata with `task_update`.
 7. Assign owners with `task_assign` using actual runtime choices: `task_id`,
    `node_id`, `session`, `profile`, `role`, `kind`, and `skills`.

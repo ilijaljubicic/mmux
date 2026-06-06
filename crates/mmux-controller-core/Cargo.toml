@@ -7,3 +7,4 @@ license.workspace = true
 [dependencies]
 mmux-wire = { path = "../mmux-wire", default-features = false }
 serde = { workspace = true }
+uuid = { workspace = true }

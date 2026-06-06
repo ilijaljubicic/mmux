@@ -1306,6 +1306,25 @@ fn project_scoped_session_entries(
     Ok(entries)
 }
 
+fn resolve_project_id_or_slug(
+    state: &OrchestrationState,
+    project_id_or_slug: &str,
+) -> Result<ProjectId, String> {
+    let selector = project_id_or_slug.trim();
+    if selector.is_empty() {
+        return Err("project_id must not be empty".into());
+    }
+    if state.projects.contains_key(&ProjectId(selector.to_owned())) {
+        return Ok(ProjectId(selector.to_owned()));
+    }
+    state
+        .projects
+        .values()
+        .find(|project| project.slug == selector)
+        .map(|project| project.id.clone())
+        .ok_or_else(|| format!("project '{selector}' not found"))
+}
+
 fn is_no_tmux_sessions_error(error: &str) -> bool {
     let error = error.to_ascii_lowercase();
     error.contains("no server running")
@@ -1904,7 +1923,7 @@ impl TmuxMcpServer {
                 "Update orchestration project status",
                 Arc::new(tool_schema(
                     json!({
-                        "project_id": { "type": "string" },
+                        "project_id": { "type": "string", "description": "Project UUID id or globally unique project slug" },
                         "status": { "type": "string", "enum": ["Active", "Archived"] }
                     }),
                     Some(vec!["project_id", "status"]),
@@ -1915,7 +1934,7 @@ impl TmuxMcpServer {
                 "Create an orchestration task and return the created Task object directly",
                 Arc::new(tool_schema(
                     json!({
-                        "project_id": { "type": "string" },
+                        "project_id": { "type": "string", "description": "Project UUID id or globally unique project slug" },
                         "title": { "type": "string" },
                         "objective": { "type": "string" },
                         "agents": {
@@ -2055,7 +2074,7 @@ impl TmuxMcpServer {
                 Arc::new(tool_schema(
                     json!({
                         "task_id": { "type": "string" },
-                        "project_id": { "type": "string" },
+                        "project_id": { "type": "string", "description": "Project UUID id or globally unique project slug" },
                         "include_completed": { "type": "boolean" }
                     }),
                     None,
@@ -2134,9 +2153,12 @@ impl TmuxMcpServer {
         args: Map<String, Value>,
     ) -> Result<CallToolResult, McpError> {
         let args: ProjectStatusUpdateArgs = parse_tool_args("project_status_update", args)?;
+        let state = self.orchestration.snapshot().map_err(mcp_invalid_request)?;
+        let project_id =
+            resolve_project_id_or_slug(&state, &args.project_id).map_err(mcp_invalid_request)?;
         let project = self
             .orchestration
-            .update_project_status(ProjectId(args.project_id), args.status)
+            .update_project_status(project_id, args.status)
             .map_err(mcp_invalid_request)?;
         Self::json_result(project)
     }
@@ -2144,10 +2166,13 @@ impl TmuxMcpServer {
     fn task_create_tool(&self, args: Map<String, Value>) -> Result<CallToolResult, McpError> {
         validate_task_agent_arguments(&args)?;
         let args: TaskCreateArgs = parse_tool_args("task_create", args)?;
+        let state = self.orchestration.snapshot().map_err(mcp_invalid_request)?;
+        let project_id =
+            resolve_project_id_or_slug(&state, &args.project_id).map_err(mcp_invalid_request)?;
         let task = self
             .orchestration
             .create_task(CreateTask {
-                project_id: ProjectId(args.project_id),
+                project_id,
                 title: args.title,
                 objective: args.objective,
                 scope: TaskScope {
@@ -2351,13 +2376,11 @@ impl TmuxMcpServer {
             Err(error) => return Ok(Self::error_result(error)),
         };
         let state = self.orchestration.snapshot().map_err(mcp_invalid_request)?;
-        let entries = project_scoped_session_entries(
-            &state,
-            &ProjectId(args.project_id),
-            &args.node,
-            &live_sessions,
-        )
-        .map_err(mcp_invalid_request)?;
+        let project_id =
+            resolve_project_id_or_slug(&state, &args.project_id).map_err(mcp_invalid_request)?;
+        let entries =
+            project_scoped_session_entries(&state, &project_id, &args.node, &live_sessions)
+                .map_err(mcp_invalid_request)?;
         Self::json_result(entries)
     }
 
@@ -3838,7 +3861,11 @@ fn filter_orchestration_status(
     mut status: OrchestrationStatus,
     args: OrchestrationStatusArgs,
 ) -> Result<OrchestrationStatus, String> {
-    let project_filter = args.project_id.map(ProjectId);
+    let project_filter = args
+        .project_id
+        .as_deref()
+        .map(|selector| resolve_project_id_or_slug_from_status(&status, selector))
+        .transpose()?;
     let task_filter = args.task_id.map(TaskId);
     if let Some(project_id) = project_filter.as_ref() {
         if !status
@@ -3903,6 +3930,22 @@ fn filter_orchestration_status(
     });
     status.counts = summarize_orchestration_counts(&status);
     Ok(status)
+}
+
+fn resolve_project_id_or_slug_from_status(
+    status: &OrchestrationStatus,
+    project_id_or_slug: &str,
+) -> Result<ProjectId, String> {
+    let selector = project_id_or_slug.trim();
+    if selector.is_empty() {
+        return Err("project_id must not be empty".into());
+    }
+    status
+        .projects
+        .iter()
+        .find(|project| project.id.0 == selector || project.slug == selector)
+        .map(|project| project.id.clone())
+        .ok_or_else(|| format!("project '{selector}' not found"))
 }
 
 fn summarize_orchestration_counts(status: &OrchestrationStatus) -> OrchestrationCounts {
@@ -3990,7 +4033,7 @@ impl ServerHandler for TmuxMcpServer {
                     Arc::new(tool_schema(
                         json!({
                             "node": { "type": "string", "description": "Execution node id (default: local)" },
-                            "project_id": { "type": "string", "description": "Project id whose recorded task sessions should be listed" }
+                            "project_id": { "type": "string", "description": "Project UUID id or globally unique project slug whose recorded task sessions should be listed" }
                         }),
                         Some(vec!["project_id"]),
                     )),
@@ -6339,9 +6382,7 @@ pub fn local_project_session_names(
     let project_id = state
         .projects
         .values()
-        .find(|candidate| {
-            candidate.id.0 == project || candidate.slug == project || candidate.title == project
-        })
+        .find(|candidate| candidate.id.0 == project || candidate.slug == project)
         .map(|candidate| candidate.id.clone())
         .ok_or_else(|| format!("project '{project}' not found"))?;
     let task_ids = state
@@ -7567,6 +7608,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_project_slug_is_accepted_where_project_id_is_required() {
+        let dir = unique_temp_dir("mmux-mcp-project-slug-selector");
+        let server = test_orchestration_server(&dir).await;
+        let project: Project = result_json(
+            &call_orchestration(
+                &server,
+                "project_create",
+                json!({
+                    "title": "Slug Selectable",
+                    "slug": "slug-selectable"
+                }),
+            )
+            .unwrap(),
+        );
+
+        let task: Task = result_json(
+            &call_orchestration(
+                &server,
+                "task_create",
+                json!({
+                    "project_id": "slug-selectable",
+                    "title": "Task via slug",
+                    "objective": "Use the project slug as selector"
+                }),
+            )
+            .unwrap(),
+        );
+        assert_eq!(task.project_id, project.id);
+
+        let archived: Project = result_json(
+            &call_orchestration(
+                &server,
+                "project_status_update",
+                json!({
+                    "project_id": "slug-selectable",
+                    "status": "Archived"
+                }),
+            )
+            .unwrap(),
+        );
+        assert_eq!(archived.id, project.id);
+        assert_eq!(archived.status, ProjectStatus::Archived);
+
+        let status: OrchestrationStatus = result_json(
+            &call_orchestration(
+                &server,
+                "orchestration_status",
+                json!({
+                    "project_id": "slug-selectable",
+                    "include_completed": true
+                }),
+            )
+            .unwrap(),
+        );
+        assert_eq!(status.projects.len(), 1);
+        assert_eq!(status.projects[0].id, project.id);
+        assert_eq!(status.tasks.len(), 1);
+        assert_eq!(status.tasks[0].id, task.id);
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn test_list_sessions_filters_by_project_and_admin_lists_raw_sessions() {
         let dir = unique_temp_dir("mmux-mcp-list-sessions-project-filter");
         let local_dir = unique_temp_dir("mmux-mcp-list-sessions-project-filter-local");
@@ -7626,6 +7730,21 @@ mod tests {
         assert!(first_sessions
             .iter()
             .all(|session| session.runtime_state == "running"));
+
+        let first_slug_result = server
+            .list_sessions_tool(object_args(json!({
+                "project_id": first_project.slug
+            })))
+            .await
+            .unwrap();
+        let first_slug_sessions: Vec<ProjectSessionListEntry> = result_json(&first_slug_result);
+        assert_eq!(
+            first_slug_sessions
+                .iter()
+                .map(|session| session.session.as_str())
+                .collect::<Vec<_>>(),
+            first_names
+        );
 
         let second_result = server
             .list_sessions_tool(object_args(json!({
@@ -8887,7 +9006,7 @@ mod tests {
 
         assert!(prompt.contains("Task: task-2"));
         assert!(prompt.contains("Slug: prompt-context"));
-        assert!(prompt.contains("Project: project-1 / mmux"));
+        assert!(prompt.contains(&format!("Project: {} / mmux", project.id.0)));
         assert!(prompt.contains("Objective:\nBuild deterministic context"));
         assert!(prompt.contains("Include paths:\n- crates/mmux-controller/src/lib.rs"));
         assert!(prompt.contains("Gates:\n- Context includes task identity"));

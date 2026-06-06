@@ -87,9 +87,10 @@ mmux --store-path /tmp/mmux-dev attach codex
 
 Plain `tmux` talks to the user's default tmux server, not mmux's local-node
 tmux server.
-For orchestration work, use `mmux list-projects` to discover project ids/slugs,
-then `mmux tmux -- list-sessions --project <project-id-or-slug>` to filter live
-local sessions recorded against tasks in that project.
+For orchestration work, project ids are UUIDs and project slugs are globally
+unique aliases. Use `mmux list-projects` to discover project ids/slugs, then
+`mmux tmux -- list-sessions --project <project-id-or-slug>` to filter live local
+sessions recorded against tasks in that project.
 
 If a running controller was upgraded in place and new orchestration tools are
 missing from discovery, restart `mmux controller` and run `tools/list` again.
@@ -98,7 +99,7 @@ An old controller process cannot expose tools compiled into a newer binary.
 ### 1. Always check what is already running
 ```
 tools/list     → discover the current MCP surface
-list_sessions(project_id) → see recorded sessions for one project
+list_sessions(project_id) → see recorded sessions for one project; accepts UUID id or slug
 admin_list_node_sessions  → raw node/tmux session discovery for admin/debug
 session_info   → deep inspect a specific session
 check_state    → quick JSON check (has_prompt, promptable, busy, turn_idle)
@@ -159,12 +160,13 @@ can update task state unless the operator explicitly delegates that authority.
    are required boundaries and do not own workspace paths, nodes, or profiles.
    Project summaries include total, active, and `task_status_counts` entries
    for every task status, including zero counts.
-4. Create tasks with `task_create` and required `project_id`. Each `TaskAgent`
-   may contain only `kind`, `role`, `skills`, `workspace_path`, `objective`, and
-   `prompt`; do not put `count`, `profile`, `node`, `node_id`, or
-   `bypass_permissions` there. `task_create` returns the created task object
-   directly; read its id from the top-level `id` field. Created tasks start in
-   `Backlog`; move them to `Planned` when scope/dependencies are ready.
+4. Create tasks with `task_create` and required `project_id`, which accepts the
+   project UUID id or globally unique slug. Each `TaskAgent` may contain only
+   `kind`, `role`, `skills`, `workspace_path`, `objective`, and `prompt`; do
+   not put `count`, `profile`, `node`, `node_id`, or `bypass_permissions` there.
+   `task_create` returns the created task object directly; read its id from the
+   top-level `id` field. Created tasks start in `Backlog`; move them to
+   `Planned` when scope/dependencies are ready.
 5. Correct mutable task metadata with `task_update`: `title`, `objective`,
    scope fields (`include_paths`, `exclude_paths`, `notes`), `agents`,
    and `gates`. Scalar and scope fields are partial updates; `agents` and

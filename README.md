@@ -189,7 +189,7 @@ Restart the local tmux server for config changes to take effect.
 Use MCP tools for normal operation:
 
 ```text
-list_sessions(project_id)
+list_sessions(project_id)   # project UUID id or slug
 start_coding_session
 coding_send
 coding_read
@@ -222,9 +222,11 @@ mmux --store-path /tmp/mmux-dev attach codex
 
 Plain `tmux` talks to your user's default tmux server and will not show mmux
 local-node sessions. Use `mmux tmux -- ...` when inspecting mmux local sessions.
-For orchestration work, MCP `list_sessions` requires `project_id` and returns
-durable sessions recorded against tasks in that project. Use
-`admin_list_node_sessions` only for raw node/tmux debugging. At the CLI layer,
+For orchestration work, project ids are UUIDs and project slugs are globally
+unique aliases. MCP tools that accept `project_id` accept either the UUID id or
+the slug. `list_sessions` requires `project_id` and returns durable sessions
+recorded against tasks in that project. Use `admin_list_node_sessions` only for
+raw node/tmux debugging. At the CLI layer,
 `mmux tmux -- list-sessions --project <project-id-or-slug>` provides a similar
 local-node filter for manual inspection.
 
@@ -614,8 +616,9 @@ durable `SessionRecord` containing the chosen `node_id`, `session`, `profile`,
 and optional `objective`. `TaskAgent.prompt` must be real prompt text; blank
 prompts and placeholder strings such as `null` or `undefined` are rejected.
 
-Operators create tasks with `task_create` using an explicit `project_id`, and
-correct mutable metadata with `task_update`: `title`, `objective`,
+Operators create tasks with `task_create` using `project_id` set to either the
+project UUID id or globally unique project slug, and correct mutable metadata
+with `task_update`: `title`, `objective`,
 `include_paths`, `exclude_paths`, `notes`, `agents`, and `gates`. Scalar and
 scope fields are partial updates; `agents` and `gates` replace the whole list
 when present. `task_update` does not change project membership, status, edges,
@@ -707,7 +710,7 @@ Session and node tools:
 | ---- | ------- |
 | `list_nodes` | List registered execution nodes. |
 | `node.info` | Describe one execution node. |
-| `list_sessions` | List durable session records attached to tasks in a required `project_id`, enriched with live node metadata when available. |
+| `list_sessions` | List durable session records attached to tasks in a required `project_id` selector (project UUID id or slug), enriched with live node metadata when available. |
 | `admin_list_node_sessions` | Admin/debug tool that lists raw live tmux sessions on a node, including unrecorded sessions. |
 | `kill_session` | Kill a tmux session. |
 | `session_info` | Show panes, windows, dimensions, and running commands. |
@@ -758,10 +761,10 @@ Orchestration tools:
 
 | Tool | Purpose |
 | ---- | ------- |
-| `project_create` | Create a durable orchestration project boundary. |
+| `project_create` | Create a durable orchestration project boundary with a UUID id and globally unique slug. |
 | `project_list` | List orchestration projects with total, active, and per-status task counts. |
-| `project_status_update` | Set project status to `Active` or `Archived`. |
-| `task_create` | Create a durable orchestration task inside a required `project_id` with intended agents, scope, notes, and gates; returns the created task object directly. |
+| `project_status_update` | Set project status to `Active` or `Archived`; `project_id` accepts UUID id or slug. |
+| `task_create` | Create a durable orchestration task inside a required `project_id` selector (project UUID id or slug) with intended agents, scope, notes, and gates; returns the created task object directly. |
 | `task_update` | Update mutable task metadata: title, objective, scope fields, intended agents, and gates. |
 | `task_assign` | Assign a task owner using actual runtime choices: node, session, profile, role, kind, and skills. |
 | `task_edge_add` | Add a task dependency or relationship edge. |

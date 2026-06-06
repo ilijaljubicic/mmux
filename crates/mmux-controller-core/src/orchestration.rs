@@ -1,6 +1,7 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
+use uuid::Uuid;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct ProjectId(pub String);
@@ -261,7 +262,6 @@ pub struct OrchestrationState {
     pub tasks: HashMap<TaskId, Task>,
     pub task_edges: Vec<TaskEdge>,
     pub sessions: HashMap<String, SessionRecord>,
-    pub next_project_id: u64,
     pub next_task_id: u64,
 }
 
@@ -352,7 +352,6 @@ impl OrchestrationState {
             tasks: HashMap::new(),
             task_edges: Vec::new(),
             sessions: HashMap::new(),
-            next_project_id: 1,
             next_task_id: 1,
         }
     }
@@ -694,8 +693,7 @@ impl OrchestrationState {
         if input.title.trim().is_empty() {
             return Err("project title must not be empty".into());
         }
-        let id = ProjectId(format!("project-{}", self.next_project_id));
-        self.next_project_id += 1;
+        let id = ProjectId(Uuid::new_v4().to_string());
         let base_slug = input.slug.as_deref().unwrap_or(&input.title);
         let slug = self.unique_project_slug(base_slug);
         let project = Project {
@@ -1185,9 +1183,13 @@ mod tests {
     };
     use std::{error::Error, fmt};
 
+    fn fixture_project_id() -> ProjectId {
+        ProjectId("fixture-project".into())
+    }
+
     fn create_task(title: &str) -> CreateTask {
         CreateTask {
-            project_id: ProjectId("project-1".into()),
+            project_id: fixture_project_id(),
             title: title.into(),
             objective: format!("Implement {title}"),
             scope: TaskScope::default(),
@@ -1199,16 +1201,19 @@ mod tests {
 
     fn state_with_project() -> OrchestrationState {
         let mut state = OrchestrationState::new();
-        state
-            .create_project(
-                CreateProject {
-                    title: "Project".into(),
-                    description: Some("Test project".into()),
-                    slug: None,
-                },
-                1,
-            )
-            .unwrap();
+        let project_id = fixture_project_id();
+        state.projects.insert(
+            project_id.clone(),
+            Project {
+                id: project_id,
+                slug: "project".into(),
+                title: "Project".into(),
+                description: Some("Test project".into()),
+                status: ProjectStatus::Active,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+            },
+        );
         state
     }
 
@@ -1217,6 +1222,38 @@ mod tests {
             agents: vec![agent],
             ..create_task(title)
         }
+    }
+
+    #[test]
+    fn project_creation_uses_uuid_ids_and_unique_slugs() {
+        let mut state = OrchestrationState::new();
+
+        let first = state
+            .create_project(
+                CreateProject {
+                    title: "Project".into(),
+                    description: None,
+                    slug: None,
+                },
+                100,
+            )
+            .unwrap();
+        let second = state
+            .create_project(
+                CreateProject {
+                    title: "Project".into(),
+                    description: None,
+                    slug: None,
+                },
+                101,
+            )
+            .unwrap();
+
+        assert!(Uuid::parse_str(&first.id.0).is_ok());
+        assert!(Uuid::parse_str(&second.id.0).is_ok());
+        assert_ne!(first.id, second.id);
+        assert_eq!(first.slug, "project");
+        assert_eq!(second.slug, "project-2");
     }
 
     fn agent() -> TaskAgent {

@@ -148,9 +148,9 @@ mod tests {
         std::env::temp_dir().join(format!("{prefix}-{}-{unique}", std::process::id()))
     }
 
-    fn create_task(title: &str) -> CreateTask {
+    fn create_task(project_id: ProjectId, title: &str) -> CreateTask {
         CreateTask {
-            project_id: ProjectId("project-1".into()),
+            project_id,
             title: title.into(),
             objective: format!("Objective for {title}"),
             scope: TaskScope {
@@ -192,9 +192,13 @@ mod tests {
 
     fn populated_state() -> OrchestrationState {
         let mut state = OrchestrationState::new();
-        state.create_project(create_project(), 99).unwrap();
-        let parent = state.create_task(create_task("Parent"), 100).unwrap();
-        let child = state.create_task(create_task("Child"), 101).unwrap();
+        let project = state.create_project(create_project(), 99).unwrap();
+        let parent = state
+            .create_task(create_task(project.id.clone(), "Parent"), 100)
+            .unwrap();
+        let child = state
+            .create_task(create_task(project.id.clone(), "Child"), 101)
+            .unwrap();
         state
             .add_task_edge(
                 CreateTaskEdge {
@@ -259,8 +263,10 @@ mod tests {
         let store = OrchestrationStore::open(dir.clone()).unwrap();
         let first = populated_state();
         let mut second = OrchestrationState::new();
-        second.create_project(create_project(), 499).unwrap();
-        second.create_task(create_task("Replacement"), 500).unwrap();
+        let project = second.create_project(create_project(), 499).unwrap();
+        second
+            .create_task(create_task(project.id, "Replacement"), 500)
+            .unwrap();
 
         store.save(&first, 400).unwrap();
         store.save(&second, 600).unwrap();
