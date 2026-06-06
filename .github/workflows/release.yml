@@ -33,6 +33,21 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libcap-ng-dev musl-tools pkg-config
 
+      - name: Cache Homebrew downloads
+        if: runner.os == 'macOS'
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/Library/Caches/Homebrew/downloads
+            ~/Library/Caches/Homebrew/api
+          key: ${{ runner.os }}-${{ runner.arch }}-homebrew-tmux-v1
+          restore-keys: |
+            ${{ runner.os }}-${{ runner.arch }}-homebrew-tmux-
+
+      - name: Install macOS test dependencies
+        if: runner.os == 'macOS'
+        run: brew install tmux
+
       - name: Test
         run: cargo test --workspace --locked
 
