@@ -46,7 +46,20 @@ jobs:
 
       - name: Install macOS test dependencies
         if: runner.os == 'macOS'
-        run: brew install tmux
+        shell: bash
+        run: |
+          set -euo pipefail
+          brew_bin="$(brew --prefix)/bin"
+          echo "$brew_bin" >> "$GITHUB_PATH"
+          export PATH="$brew_bin:$PATH"
+          if ! command -v tmux >/dev/null 2>&1; then
+            brew install tmux
+          fi
+          brew link tmux || true
+          command -v tmux
+          tmux -V
+          tmux -L mmux-ci-smoke start-server
+          tmux -L mmux-ci-smoke kill-server
 
       - name: Test
         run: cargo test --workspace --locked
