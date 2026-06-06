@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::{Arc, RwLock};
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 pub const DEFAULT_NODE_PROFILE_CONFIG_NAME: &str = "mmux.toml";
 pub const DEFAULT_STORE_DIR_NAME: &str = ".mmux";
@@ -458,10 +458,16 @@ impl EmbeddedNodeBackend {
 }
 
 fn ensure_local_tmux_backend_available(local: &LocalNode) -> Result<(), String> {
+    let suffix = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos();
+    let session = format!("mmux-health-{}-{suffix}", std::process::id());
     local
-        .tmux(&["start-server"])
-        .map(|_| ())
-        .map_err(|error| format!("failed to start local tmux backend: {error}"))
+        .tmux(&["new-session", "-d", "-s", &session, "sh -c 'sleep 30'"])
+        .map_err(|error| format!("failed to start local tmux backend: {error}"))?;
+    let _ = local.tmux(&["kill-session", "-t", &session]);
+    Ok(())
 }
 
 #[derive(Clone)]
