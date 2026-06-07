@@ -25,8 +25,8 @@ when needed.
 - Treat `coding_send` as submit-only. Coding prompts can run for minutes or
   hours; do not wait for completion inside `coding_send`. Track progress with
   `wait_start(kind = "coding-ready")`, poll `wait_status`, use `coding_read`
-  for output, and `wait_cancel`/`coding_action`/`send_key` only when steering is
-  needed.
+  for compact profile-aware output, and `wait_cancel`/`coding_action`/`send_key`
+  only when steering is needed.
 - Be patient with work that is already running under a wait job. Long-running
   coder work should be supervised by polling `wait_status` and reading the
   session, not abandoned just because it takes minutes. Since
@@ -157,6 +157,11 @@ Use cancellable runtime wait jobs as the canonical orchestration wait API:
 profile. If a wait job remains pending, inspect with `check_state` and
 `coding_read`; cancel the wait job with `wait_cancel` before interrupting the
 CLI.
+
+`coding_read` is compact by default. It strips common dashboard, startup,
+update, and status chrome from supported coder CLIs to reduce token waste. Use
+`raw = true` only when compact output is insufficient and you need the exact
+tmux pane text.
 
 Use `orchestration_cleanup_zombies` only when intentionally cleaning
 orchestration-owned sessions. Start with dry-run behavior.

@@ -365,7 +365,9 @@ load_profile(path="/path/to/custom.toml")
 
 ### `capture_output` vs `coding_read`
 - `capture_output` — any session. Can capture scrollback.
-- `coding_read` — convenience wrapper around `capture_output` with default 40 lines. Use for coding CLIs.
+- `coding_read` — profile-aware compact read for coding CLIs. It strips common
+  TUI dashboard, startup, update, and status chrome by default to reduce token
+  waste. Pass `raw: true` when you need the full tmux pane text.
 
 ### `wait_start` / `wait_status` / `wait_cancel`
 - `wait_start` — starts a runtime-only wait job. Supports `stable`, `sentinel`, `prompt`, and `coding-ready`.

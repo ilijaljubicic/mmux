@@ -1252,8 +1252,8 @@ fn default_profile_map() -> HashMap<String, CliProfile> {
                 "to edit".into(),
             ],
             startup_dismiss: Some(StartupDismiss {
-                policy: "custom-keys".into(),
-                key: Some("Escape".into()),
+                policy: "skip-update".into(),
+                key: None,
                 triggers: vec!["Kimi Code Update Available".into()],
             }),
             approve_keys: "y Enter".into(),
@@ -1777,6 +1777,9 @@ prompt_indicator = "codex ready"
 
         let kimi = get_profile(&profiles, "kimi").expect("kimi profile");
         assert_eq!(kimi.cmd.as_deref(), Some("kimi"));
+        let kimi_dismiss = kimi.startup_dismiss.expect("kimi startup dismiss");
+        assert_eq!(kimi_dismiss.policy, "skip-update");
+        assert_eq!(kimi_dismiss.key, None);
         assert!(kimi
             .busy_indicators
             .iter()

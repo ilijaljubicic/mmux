@@ -130,6 +130,10 @@ For coder prompt paths, verify:
   relevant;
 - `coding_send` returns quickly and long work is tracked with
   `wait_start(kind="coding-ready")`, `wait_status`, and `coding_read`.
+- `coding_read` compact output removes profile chrome while `raw=true` still
+  returns the full pane when needed.
+- blocking confirmation screens, such as Claude bypass-permissions prompts, are
+  not reported as promptable or turn-idle.
 
 Always stop the smoke controller and remove the temporary store afterwards.
 

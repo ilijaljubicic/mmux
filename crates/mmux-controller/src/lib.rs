@@ -706,6 +706,9 @@ fn readiness_scan_region(output: &str, profile: &CliProfile) -> String {
 
 fn profile_is_busy(output: &str, profile: &CliProfile) -> bool {
     let active_region = output_active_region(output);
+    if profile_has_blocking_confirmation(&active_region, profile) {
+        return true;
+    }
     let startup_dismiss_region = readiness_scan_region(output, profile);
     if profile
         .startup_dismiss
@@ -727,11 +730,167 @@ fn profile_is_busy(output: &str, profile: &CliProfile) -> bool {
 }
 
 fn profile_has_prompt(output: &str, profile: &CliProfile) -> bool {
+    if profile_has_blocking_confirmation(&output_active_region(output), profile) {
+        return false;
+    }
     !profile.prompt_indicator.is_empty() && output.contains(&profile.prompt_indicator)
 }
 
 fn profile_turn_idle(output: &str, profile: &CliProfile) -> bool {
     profile_has_prompt(output, profile) && !profile_is_busy(output, profile)
+}
+
+fn compact_coding_output(output: &str, profile: &CliProfile) -> String {
+    let mut compact = Vec::new();
+    let mut seen = HashSet::new();
+    for raw_line in output.lines() {
+        let line = normalize_coding_line(raw_line);
+        let trimmed = line.trim();
+        if trimmed.is_empty() || is_coding_noise_line(trimmed, profile) {
+            continue;
+        }
+        if !seen.insert(trimmed.to_owned()) {
+            continue;
+        }
+        compact.push(trimmed.to_owned());
+    }
+    if compact.is_empty() {
+        output
+            .lines()
+            .rev()
+            .map(normalize_coding_line)
+            .map(|line| line.trim().to_owned())
+            .find(|line| !line.is_empty())
+            .unwrap_or_default()
+    } else {
+        compact.join("\n")
+    }
+}
+
+fn normalize_coding_line(line: &str) -> String {
+    line.replace('\u{a0}', " ")
+}
+
+fn is_coding_noise_line(line: &str, profile: &CliProfile) -> bool {
+    let lower = line.to_ascii_lowercase();
+    is_box_drawing_line(line)
+        || is_dashboard_line(line, &lower)
+        || is_default_prompt_placeholder(line, profile)
+        || is_update_prompt_line(&lower)
+}
+
+fn is_box_drawing_line(line: &str) -> bool {
+    line.chars().all(|ch| {
+        ch.is_whitespace()
+            || matches!(
+                ch,
+                '─' | '━'
+                    | '▀'
+                    | '╹'
+                    | '│'
+                    | '┃'
+                    | '╭'
+                    | '╮'
+                    | '╰'
+                    | '╯'
+                    | '┌'
+                    | '┐'
+                    | '└'
+                    | '┘'
+                    | '├'
+                    | '┤'
+                    | '┬'
+                    | '┴'
+                    | '┼'
+                    | '═'
+                    | '║'
+                    | '╔'
+                    | '╗'
+                    | '╚'
+                    | '╝'
+            )
+    }) || (line.starts_with('│') && line.ends_with('│'))
+}
+
+fn is_dashboard_line(line: &str, lower: &str) -> bool {
+    lower.contains("openai codex")
+        || lower.contains("claude code v")
+        || lower.contains("welcome back")
+        || lower.contains("tips for getting")
+        || lower.contains("feature of the week")
+        || lower.contains("what's new")
+        || lower.contains("organization")
+        || lower.contains("/release-notes")
+        || lower.contains("use /skills to list available skills")
+        || lower.contains("for shortcuts")
+        || lower.contains("← for agents")
+        || lower.contains("/model to change")
+        || lower.starts_with("tip:")
+        || lower.contains("starting mcp servers")
+        || lower.contains("build · glm-")
+        || lower.contains("shift+enter: newline")
+        || lower.starts_with("context:")
+        || lower.starts_with("model:")
+        || lower.starts_with("directory:")
+        || lower.starts_with("opus ")
+        || lower.starts_with("kimi-")
+        || lower.starts_with("tmux extended-keys-format ")
+        || lower.contains("kimi code works best with csi-u")
+        || lower.contains("set -g extended-keys-format csi-u")
+        || (line.contains(" · /") && (lower.contains("gpt-") || lower.contains("opus")))
+        || line.contains("▝▜█████▛▘")
+        || line.contains("▘▘ ▝▝")
+}
+
+fn is_default_prompt_placeholder(line: &str, profile: &CliProfile) -> bool {
+    let prompt = profile.prompt_indicator.trim();
+    let after_prompt = if !prompt.is_empty() {
+        line.strip_prefix(prompt).map(str::trim).unwrap_or(line)
+    } else {
+        line
+    };
+    let lower = after_prompt.to_ascii_lowercase();
+    lower == "find and fix a bug in @filename"
+        || lower == "improve documentation in @filename"
+        || lower == "implement {feature}"
+        || lower == "summarize recent commits"
+        || lower == "interval"
+        || lower.starts_with("try \"edit <filepath>")
+        || lower.starts_with("try \"")
+        || lower.starts_with("ask claude to create")
+}
+
+fn is_update_prompt_line(lower: &str) -> bool {
+    lower.contains("code update available")
+        || lower.contains("update available")
+        || lower.contains("has a newer release ready")
+        || lower.contains("view changelog:")
+        || lower == "g.html"
+        || lower.starts_with("current  ")
+        || lower.starts_with("target   ")
+        || lower.starts_with("source   ")
+        || lower.starts_with("command  ")
+        || lower.contains("choose · enter confirm")
+        || lower.contains("install update now")
+        || lower.contains("continue with current version")
+        || lower.starts_with("==> detected target:")
+        || lower.starts_with("==> resolving latest version")
+        || lower.starts_with("==> latest version:")
+        || lower.starts_with("==> fetching manifest")
+        || lower.starts_with("==> downloading")
+        || lower.chars().filter(|ch| *ch == '#').count() >= 3
+}
+
+fn profile_has_blocking_confirmation(output: &str, profile: &CliProfile) -> bool {
+    let lower = output.to_ascii_lowercase();
+    match profile.name.as_str() {
+        "claude" => {
+            lower.contains("bypass permissions")
+                || (lower.contains("dangerously skip permissions")
+                    && (lower.contains("accept") || lower.contains("confirm")))
+        }
+        _ => false,
+    }
 }
 
 fn startup_dismiss_key(output: &str, profile: &CliProfile) -> Option<String> {
@@ -3196,6 +3355,25 @@ impl TmuxMcpServer {
                 .await;
             tokio::time::sleep(Duration::from_millis(300)).await;
         }
+        let buf = self
+            .node_tmux(
+                node,
+                vec![
+                    "capture-pane".into(),
+                    "-t".into(),
+                    pane.clone(),
+                    "-p".into(),
+                ],
+                Duration::from_secs(20),
+            )
+            .await
+            .unwrap_or_default();
+        if profile_has_blocking_confirmation(&buf, &profile) {
+            return Ok(Self::error_result(format!(
+                "session '{}' on node '{}' is showing a blocking {} confirmation; use coding_action or manual intervention before sending a prompt",
+                session, node, profile.name
+            )));
+        }
         let text_mode = match profile_text_mode(&profile) {
             Ok(text_mode) => text_mode,
             Err(error) => return Ok(Self::error_result(error)),
@@ -4248,11 +4426,13 @@ impl ServerHandler for TmuxMcpServer {
                 ),
                 Tool::new(
                     "coding_read",
-                    "Capture the last N lines from a coding CLI pane",
+                    "Read recent coding CLI output. Returns compact profile-aware output by default; pass raw=true for full pane text.",
                     Arc::new(tool_schema(json!({
                         "node": { "type": "string", "description": "Execution node id (default: local)" },
                         "session": { "type": "string" },
-                        "lines": { "type": "integer", "description": "Lines to capture (default: 40)" }
+                        "profile": { "type": "string", "description": "CLI profile name (default: opencode)" },
+                        "lines": { "type": "integer", "description": "Lines to capture before compaction (default: 40)" },
+                        "raw": { "type": "boolean", "description": "Return raw pane text instead of compact profile-aware output (default: false)" }
                     }), None)),
                 ),
                 Tool::new(
@@ -4820,11 +5000,22 @@ impl ServerHandler for TmuxMcpServer {
             "start_coding_session" => self.start_coding_session_tool(args).await,
             "coding_read" => {
                 let lines = args.get("lines").and_then(|v| v.as_u64()).unwrap_or(40) as usize;
+                let raw = args.get("raw").and_then(|v| v.as_bool()).unwrap_or(false);
+                let profile = self
+                    .resolve_profile(args.get("profile").and_then(|v| v.as_str()))
+                    .ok_or_else(|| McpError::invalid_request("unknown profile", None))?;
                 match self
                     .node_session_capture(node, session, Some(lines), false)
                     .await
                 {
-                    Ok(output) => Ok(Self::text_result(self.policy.limit_capture_output(output))),
+                    Ok(output) => {
+                        let output = if raw {
+                            output
+                        } else {
+                            compact_coding_output(&output, &profile)
+                        };
+                        Ok(Self::text_result(self.policy.limit_capture_output(output)))
+                    }
                     Err(e) => Ok(Self::error_result(e)),
                 }
             }
@@ -9907,6 +10098,126 @@ triggers = ["Update now"]
     }
 
     #[test]
+    fn test_compact_coding_output_strips_codex_startup_chrome() {
+        let profile = CliProfile {
+            name: "codex".into(),
+            prompt_indicator: "›".into(),
+            ..CliProfile::default()
+        };
+        let output = r#"
+╭───────────────────────────────────────╮
+│ >_ OpenAI Codex (v0.137.0)            │
+│ model:     loading   /model to change │
+│ directory: /tmp/mmux-coder-smoke      │
+╰───────────────────────────────────────╯
+
+› Find and fix a bug in @filename
+› Improve documentation in @filename
+› Implement {feature}
+› Summarize recent commits
+  gpt-5.5 default fast · /tmp/mmux-coder-smoke
+  Tip: Use /skills to list available skills or ask Codex to use one.
+⚠ The cormiloDev MCP server is not logged in. Run `codex mcp login cormiloDev`.
+
+› Reply exactly: MMUX_SMOKE_CODEX
+
+⚠ The cormiloDev MCP server is not logged in. Run `codex mcp login cormiloDev`.
+• Working (1m 14s • esc to interrupt)
+"#;
+
+        assert_eq!(
+            compact_coding_output(output, &profile),
+            "⚠ The cormiloDev MCP server is not logged in. Run `codex mcp login cormiloDev`.\n› Reply exactly: MMUX_SMOKE_CODEX\n• Working (1m 14s • esc to interrupt)"
+        );
+    }
+
+    #[test]
+    fn test_compact_coding_output_strips_kimi_update_prompt() {
+        let profile = CliProfile {
+            name: "kimi".into(),
+            prompt_indicator: ">".into(),
+            ..CliProfile::default()
+        };
+        let output = r#"
+Kimi Code Update Available
+Kimi Code has a newer release ready.
+View changelog: https://moonshotai.github.io/kimi-code/en/release-notes/changelo
+g.html
+tmux extended-keys-format is xterm. Kimi Code works best with csi-u. Add
+`set -g extended-keys-format csi-u` to ~/.tmux.conf and restart tmux.
+Current  0.6.0
+Target   0.10.0
+Source   native
+Command  curl -fsSL https://code.kimi.com/kimi-code/install.sh | bash
+↑↓ choose · Enter confirm · Esc continue
+ ❯ Install update now (0.10.0)
+   Continue with current version
+> Reply exactly: MMUX_SMOKE_KIMI
+MMUX_SMOKE_KIMI
+Kimi-k2.6 thinking  /tmp/mmux-coder-smoke                 shift+enter: newline
+context: 5.7% (14.8k/262.1k)
+"#;
+
+        assert_eq!(
+            compact_coding_output(output, &profile),
+            "> Reply exactly: MMUX_SMOKE_KIMI\nMMUX_SMOKE_KIMI"
+        );
+    }
+
+    #[test]
+    fn test_compact_coding_output_strips_claude_dashboard() {
+        let profile = CliProfile {
+            name: "claude".into(),
+            prompt_indicator: "❯".into(),
+            ..CliProfile::default()
+        };
+        let output = r#"
+╭─── Claude Code v2.1.165 ─────────────────────────────────────────────────────╮
+│              Welcome back Flatmaptech!             │ started                 │
+│  Opus 4.8 · Claude Pro · ilija@example.com's Organization                   │
+▝▜█████▛▘  Opus 4.8 · Claude Pro
+▘▘ ▝▝    /tmp/mmux-coder-smoke
+Feature of the week: /loop — run a prompt or slash command on a recurring interval
+interval
+╰──────────────────────────────────────────────────────────────────────────────╯
+────────────────────────────────────────────────────────────────────────────────
+❯ Try "edit <filepath> to..."
+? for shortcuts · ← for agents
+
+❯ Reply exactly: MMUX_SMOKE_CLAUDE
+● MMUX_SMOKE_CLAUDE
+✻ Brewed for 1s
+"#;
+
+        assert_eq!(
+            compact_coding_output(output, &profile),
+            "❯ Reply exactly: MMUX_SMOKE_CLAUDE\n● MMUX_SMOKE_CLAUDE\n✻ Brewed for 1s"
+        );
+    }
+
+    #[test]
+    fn test_compact_coding_output_strips_opencode_chrome() {
+        let profile = CliProfile {
+            name: "opencode".into(),
+            prompt_indicator: "ctrl+p commands".into(),
+            ..CliProfile::default()
+        };
+        let output = r#"
+┃  Reply exactly: MMUX_SMOKE_OPENCODE
+▣  Build · GLM-4.7
+┃  Build · GLM-4.7 Z.AI
+╹▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀▀
+■■■■⬝⬝Insufficient balance or no resource package. Please recharge. [retrying
+attempt #4]
+"#;
+
+        assert_eq!(
+            compact_coding_output(output, &profile),
+            "┃  Reply exactly: MMUX_SMOKE_OPENCODE\n■■■■⬝⬝Insufficient balance or no resource package. Please recharge. [retrying\nattempt #4]"
+        );
+    }
+
+    #[test]
     fn test_profile_is_busy_scans_active_trailing_region_only() {
         let profile = CliProfile {
             name: "kimi".into(),
@@ -9963,6 +10274,28 @@ triggers = ["Update now"]
                 "{name} marker not detected"
             );
         }
+    }
+
+    #[test]
+    fn test_claude_bypass_confirmation_is_not_promptable() {
+        let profile = CliProfile {
+            name: "claude".into(),
+            prompt_indicator: "❯".into(),
+            busy_indicators: vec!["Thinking".into()],
+            ..CliProfile::default()
+        };
+        let output = r#"
+╭──────────────────────────────────────────────────────────────────────────────╮
+│ Bypass Permissions                                                           │
+│ This mode can modify files and run commands without asking first.            │
+╰──────────────────────────────────────────────────────────────────────────────╯
+❯ Yes, I accept
+  No, go back
+"#;
+
+        assert!(profile_is_busy(output, &profile));
+        assert!(!profile_has_prompt(output, &profile));
+        assert!(!profile_turn_idle(output, &profile));
     }
 
     #[test]

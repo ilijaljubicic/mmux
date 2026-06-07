@@ -738,7 +738,7 @@ Profile-aware coding tools:
 | `start_coding_session` | Create or adopt a CLI session from its profile command, or from `permission_bypass_cmd` when `bypass_permissions = true`; returns without waiting for readiness. Optional task metadata records a `SessionRecord`. |
 | `coding_send` | Send a prompt to a coding CLI; rejects blank prompts and placeholder strings such as `null` or `undefined`. |
 | `coding_task_send` | Send an initial task-scoped prompt by rendering task context from orchestration state with template `task`, `validate`, `review`, or `quality-guard`, then appending the provided instruction. The template selects the operating mode; the instruction supplies the concrete focus. |
-| `coding_read` | Read recent CLI output. |
+| `coding_read` | Read recent CLI output through profile-aware compaction by default; pass `raw = true` for the full tmux pane text. |
 | `coding_action` | Send `approve`, `reject`, `cancel`, `escape`, or `dismiss`. |
 | `check_state` | Non-blocking JSON state check with `has_prompt`, `promptable`, `busy`, and `turn_idle`. |
 | `load_profile` | Load a profile from inline TOML or a file. |
