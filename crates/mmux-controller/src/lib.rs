@@ -132,8 +132,6 @@ use rmcp::{
     about = "Tmux remote control over MCP — operate terminals and coding harnesses with AI agents"
 )]
 struct Cli {
-    #[arg(long, help = "Path to node profile TOML file")]
-    node_config: Option<String>,
     #[arg(
         long,
         default_value = "127.0.0.1",
@@ -223,6 +221,18 @@ struct Cli {
     max_request_bytes: usize,
     #[arg(long, default_value_t = 2 * 1024 * 1024, help = "Maximum bytes returned by terminal capture tools.")]
     max_capture_bytes: usize,
+    #[arg(
+        long,
+        value_name = "PROFILE[,PROFILE...]",
+        help = "Comma-separated coder profiles enabled on the MCP surface. Defaults to all built-in profiles."
+    )]
+    enabled_coder_profiles: Option<String>,
+    #[arg(
+        long,
+        value_name = "PROFILE",
+        help = "Default coder profile for omitted profile arguments. Defaults to the first enabled built-in profile."
+    )]
+    default_coder_profile: Option<String>,
     #[arg(
         long,
         help = "Start the built-in local tmux node inside the controller process."
@@ -609,48 +619,83 @@ fn save_file_impl(
     mmux_node::save_file_impl(path, content, encoding, append, max_bytes)
 }
 
-// ═══════════════════════════════════════════════════════════════════════════════
-//  CLI Profiles — extensible behavior for different terminal applications
-// ═══════════════════════════════════════════════════════════════════════════════
-
-fn load_profile_from_toml(text: &str) -> Result<CliProfile, String> {
-    mmux_node::load_profile_from_toml(text)
-}
-
 fn profile_launch_command(profile: &CliProfile, bypass_permissions: bool) -> Result<&str, String> {
-    if bypass_permissions {
-        return profile.permission_bypass_cmd.as_deref().ok_or_else(|| {
-            format!(
-                "profile '{}' does not define permission_bypass_cmd; set one in the coder profile before using bypass_permissions=true",
-                profile.name
-            )
-        });
-    }
-    profile
-        .cmd
-        .as_deref()
-        .ok_or_else(|| format!("profile '{}' does not define a launch cmd", profile.name))
+    mmux_node::profiles::launch_command(profile, bypass_permissions)
 }
 
 fn profile_launch_strategy(profile: &CliProfile) -> Result<&str, String> {
-    let strategy = profile.launch_strategy.as_deref().unwrap_or("direct");
-    match strategy {
-        "direct" | "shell_send" => Ok(strategy),
-        other => Err(format!(
-            "profile '{}' uses unsupported launch_strategy '{}'",
-            profile.name, other
-        )),
-    }
+    mmux_node::profiles::launch_strategy(profile)
 }
 
 fn profile_text_mode(profile: &CliProfile) -> Result<&str, String> {
-    match profile.text_mode.as_str() {
-        "paste-buffer" | "literal-keys" => Ok(profile.text_mode.as_str()),
-        other => Err(format!(
-            "profile '{}' uses unsupported text_mode '{}'",
-            profile.name, other
-        )),
-    }
+    mmux_node::profiles::text_mode(profile)
+}
+
+#[derive(Debug)]
+struct ResolvedCoderProfiles {
+    profiles: ProfileRegistry,
+    default_profile: String,
+}
+
+fn first_enabled_builtin_profile(profiles: &ProfileRegistry) -> Option<String> {
+    mmux_node::profiles::BuiltinProfile::all()
+        .into_iter()
+        .map(|profile| profile.name())
+        .find(|name| profiles.contains_key(*name))
+        .map(str::to_owned)
+}
+
+fn resolve_coder_profiles(cli: &Cli) -> Result<ResolvedCoderProfiles, String> {
+    let profiles = mmux_node::default_profiles();
+    let profiles = if let Some(raw_enabled) = cli.enabled_coder_profiles.as_deref() {
+        let mut enabled = HashMap::new();
+        for raw_name in raw_enabled.split(',') {
+            let name = raw_name.trim();
+            if name.is_empty() {
+                return Err("--enabled-coder-profiles contains an empty profile name".into());
+            }
+            let profile = mmux_node::get_profile(&profiles, name).ok_or_else(|| {
+                let mut available = profiles.keys().cloned().collect::<Vec<_>>();
+                available.sort();
+                format!(
+                    "unknown coder profile '{}' in --enabled-coder-profiles; available profiles: {}",
+                    name,
+                    available.join(",")
+                )
+            })?;
+            enabled.insert(profile.name.clone(), profile);
+        }
+
+        if enabled.is_empty() {
+            return Err("--enabled-coder-profiles must enable at least one profile".into());
+        }
+
+        Arc::new(enabled)
+    } else {
+        profiles
+    };
+
+    let default_profile = if let Some(raw_name) = cli.default_coder_profile.as_deref() {
+        let name = raw_name.trim();
+        if name.is_empty() {
+            return Err("--default-coder-profile must not be empty".into());
+        }
+        let profile = mmux_node::get_profile(&profiles, name).ok_or_else(|| {
+            format!(
+                "--default-coder-profile '{}' is not enabled; enable it with --enabled-coder-profiles or choose an enabled profile",
+                name
+            )
+        })?;
+        profile.name
+    } else {
+        first_enabled_builtin_profile(&profiles)
+            .ok_or_else(|| "no enabled built-in coder profiles are available".to_string())?
+    };
+
+    Ok(ResolvedCoderProfiles {
+        profiles,
+        default_profile,
+    })
 }
 
 fn clean_exec_output(lines: Vec<&str>) -> String {
@@ -679,236 +724,24 @@ fn clean_exec_output(lines: Vec<&str>) -> String {
     trimmed.join("\n")
 }
 
-const BUSY_SCAN_TRAILING_LINES: usize = 30;
-
-fn output_active_region(output: &str) -> String {
-    output
-        .lines()
-        .rev()
-        .take(BUSY_SCAN_TRAILING_LINES)
-        .collect::<Vec<_>>()
-        .into_iter()
-        .rev()
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn readiness_scan_region(output: &str, profile: &CliProfile) -> String {
-    let active_region = output_active_region(output);
-    if profile.prompt_indicator.is_empty() {
-        return active_region;
-    }
-    active_region
-        .rfind(&profile.prompt_indicator)
-        .map(|index| active_region[index..].to_owned())
-        .unwrap_or(active_region)
-}
-
 fn profile_is_busy(output: &str, profile: &CliProfile) -> bool {
-    let active_region = output_active_region(output);
-    if profile_has_blocking_confirmation(&active_region, profile) {
-        return true;
-    }
-    let startup_dismiss_region = readiness_scan_region(output, profile);
-    if profile
-        .startup_dismiss
-        .as_ref()
-        .map(|dismiss| {
-            dismiss
-                .triggers
-                .iter()
-                .any(|trigger| !trigger.is_empty() && startup_dismiss_region.contains(trigger))
-        })
-        .unwrap_or(false)
-    {
-        return true;
-    }
-    profile
-        .busy_indicators
-        .iter()
-        .any(|marker| !marker.is_empty() && active_region.contains(marker))
+    mmux_node::profiles::is_busy(output, profile)
 }
 
 fn profile_has_prompt(output: &str, profile: &CliProfile) -> bool {
-    if profile_has_blocking_confirmation(&output_active_region(output), profile) {
-        return false;
-    }
-    !profile.prompt_indicator.is_empty() && output.contains(&profile.prompt_indicator)
+    mmux_node::profiles::has_prompt(output, profile)
 }
 
 fn profile_turn_idle(output: &str, profile: &CliProfile) -> bool {
-    profile_has_prompt(output, profile) && !profile_is_busy(output, profile)
+    mmux_node::profiles::turn_idle(output, profile)
 }
 
 fn compact_coding_output(output: &str, profile: &CliProfile) -> String {
-    let mut compact = Vec::new();
-    let mut seen = HashSet::new();
-    for raw_line in output.lines() {
-        let line = normalize_coding_line(raw_line);
-        let trimmed = line.trim();
-        if trimmed.is_empty() || is_coding_noise_line(trimmed, profile) {
-            continue;
-        }
-        if !seen.insert(trimmed.to_owned()) {
-            continue;
-        }
-        compact.push(trimmed.to_owned());
-    }
-    if compact.is_empty() {
-        output
-            .lines()
-            .rev()
-            .map(normalize_coding_line)
-            .map(|line| line.trim().to_owned())
-            .find(|line| !line.is_empty())
-            .unwrap_or_default()
-    } else {
-        compact.join("\n")
-    }
-}
-
-fn normalize_coding_line(line: &str) -> String {
-    line.replace('\u{a0}', " ")
-}
-
-fn is_coding_noise_line(line: &str, profile: &CliProfile) -> bool {
-    let lower = line.to_ascii_lowercase();
-    is_box_drawing_line(line)
-        || is_dashboard_line(line, &lower)
-        || is_default_prompt_placeholder(line, profile)
-        || is_update_prompt_line(&lower)
-}
-
-fn is_box_drawing_line(line: &str) -> bool {
-    line.chars().all(|ch| {
-        ch.is_whitespace()
-            || matches!(
-                ch,
-                '─' | '━'
-                    | '▀'
-                    | '╹'
-                    | '│'
-                    | '┃'
-                    | '╭'
-                    | '╮'
-                    | '╰'
-                    | '╯'
-                    | '┌'
-                    | '┐'
-                    | '└'
-                    | '┘'
-                    | '├'
-                    | '┤'
-                    | '┬'
-                    | '┴'
-                    | '┼'
-                    | '═'
-                    | '║'
-                    | '╔'
-                    | '╗'
-                    | '╚'
-                    | '╝'
-            )
-    }) || (line.starts_with('│') && line.ends_with('│'))
-}
-
-fn is_dashboard_line(line: &str, lower: &str) -> bool {
-    lower.contains("openai codex")
-        || lower.contains("claude code v")
-        || lower.contains("welcome back")
-        || lower.contains("tips for getting")
-        || lower.contains("feature of the week")
-        || lower.contains("what's new")
-        || lower.contains("organization")
-        || lower.contains("/release-notes")
-        || lower.contains("use /skills to list available skills")
-        || lower.contains("for shortcuts")
-        || lower.contains("← for agents")
-        || lower.contains("/model to change")
-        || lower.starts_with("tip:")
-        || lower.contains("starting mcp servers")
-        || lower.contains("build · glm-")
-        || lower.contains("shift+enter: newline")
-        || lower.starts_with("context:")
-        || lower.starts_with("model:")
-        || lower.starts_with("directory:")
-        || lower.starts_with("opus ")
-        || lower.starts_with("kimi-")
-        || lower.starts_with("tmux extended-keys-format ")
-        || lower.contains("kimi code works best with csi-u")
-        || lower.contains("set -g extended-keys-format csi-u")
-        || (line.contains(" · /") && (lower.contains("gpt-") || lower.contains("opus")))
-        || line.contains("▝▜█████▛▘")
-        || line.contains("▘▘ ▝▝")
-}
-
-fn is_default_prompt_placeholder(line: &str, profile: &CliProfile) -> bool {
-    let prompt = profile.prompt_indicator.trim();
-    let after_prompt = if !prompt.is_empty() {
-        line.strip_prefix(prompt).map(str::trim).unwrap_or(line)
-    } else {
-        line
-    };
-    let lower = after_prompt.to_ascii_lowercase();
-    lower == "find and fix a bug in @filename"
-        || lower == "improve documentation in @filename"
-        || lower == "implement {feature}"
-        || lower == "summarize recent commits"
-        || lower == "interval"
-        || lower.starts_with("try \"edit <filepath>")
-        || lower.starts_with("try \"")
-        || lower.starts_with("ask claude to create")
-}
-
-fn is_update_prompt_line(lower: &str) -> bool {
-    lower.contains("code update available")
-        || lower.contains("update available")
-        || lower.contains("has a newer release ready")
-        || lower.contains("view changelog:")
-        || lower == "g.html"
-        || lower.starts_with("current  ")
-        || lower.starts_with("target   ")
-        || lower.starts_with("source   ")
-        || lower.starts_with("command  ")
-        || lower.contains("choose · enter confirm")
-        || lower.contains("install update now")
-        || lower.contains("continue with current version")
-        || lower.starts_with("==> detected target:")
-        || lower.starts_with("==> resolving latest version")
-        || lower.starts_with("==> latest version:")
-        || lower.starts_with("==> fetching manifest")
-        || lower.starts_with("==> downloading")
-        || lower.chars().filter(|ch| *ch == '#').count() >= 3
-}
-
-fn profile_has_blocking_confirmation(output: &str, profile: &CliProfile) -> bool {
-    let lower = output.to_ascii_lowercase();
-    match profile.name.as_str() {
-        "claude" => {
-            lower.contains("bypass permissions")
-                || (lower.contains("dangerously skip permissions")
-                    && (lower.contains("accept") || lower.contains("confirm")))
-        }
-        _ => false,
-    }
+    mmux_node::profiles::compact_output(output, profile)
 }
 
 fn startup_dismiss_key(output: &str, profile: &CliProfile) -> Option<String> {
-    let dismiss = profile.startup_dismiss.as_ref()?;
-    let scan_region = readiness_scan_region(output, profile);
-    if !dismiss
-        .triggers
-        .iter()
-        .any(|trigger| !trigger.is_empty() && scan_region.contains(trigger))
-    {
-        return None;
-    }
-    match dismiss.policy.as_str() {
-        "skip-update" => Some("Down Enter".into()),
-        "update-now" => Some("Enter".into()),
-        "custom-keys" => dismiss.key.clone(),
-        _ => None,
-    }
+    mmux_node::profiles::startup_dismiss_key(output, profile)
 }
 
 fn key_sequence_parts(keys: &str) -> Vec<&str> {
@@ -1530,6 +1363,7 @@ fn parse_local_session_info_list(output: &str) -> Vec<LocalSessionInfo> {
 #[derive(Clone)]
 struct TmuxMcpServer {
     profiles: ProfileRegistry,
+    default_coder_profile: Option<String>,
     policy: ControllerPolicy,
     node_executor: ActorRef<NodeExecutionMessage>,
     registry: ActorRef<NodeRegistryMessage>,
@@ -1665,8 +1499,7 @@ struct CodingTaskSendArgs {
     node: String,
     #[serde(default = "default_coding_session")]
     session: String,
-    #[serde(default = "default_coding_profile")]
-    profile: String,
+    profile: Option<String>,
     task_id_or_slug: String,
     prompt: String,
     template: Option<CodingTaskSendTemplate>,
@@ -1832,6 +1665,7 @@ struct TaskAwareStart {
 impl TmuxMcpServer {
     fn new(
         profiles: ProfileRegistry,
+        default_coder_profile: Option<String>,
         policy: ControllerPolicy,
         node_executor: ActorRef<NodeExecutionMessage>,
         registry: ActorRef<NodeRegistryMessage>,
@@ -1841,6 +1675,7 @@ impl TmuxMcpServer {
     ) -> Self {
         Self {
             profiles,
+            default_coder_profile,
             policy,
             node_executor,
             registry,
@@ -2959,9 +2794,16 @@ impl TmuxMcpServer {
         }))
     }
 
+    fn default_profile_name(&self) -> Option<&str> {
+        self.default_coder_profile.as_deref()
+    }
+
     fn resolve_profile(&self, name: Option<&str>) -> Option<CliProfile> {
-        let name = name.unwrap_or("opencode");
-        mmux_node::get_profile(&self.profiles, name)
+        let profile_name = name
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .or_else(|| self.default_profile_name())?;
+        mmux_node::get_profile(&self.profiles, profile_name)
     }
 
     async fn start_coding_session_tool(
@@ -3368,7 +3210,7 @@ impl TmuxMcpServer {
             )
             .await
             .unwrap_or_default();
-        if profile_has_blocking_confirmation(&buf, &profile) {
+        if mmux_node::profiles::has_blocking_confirmation(&buf, &profile) {
             return Ok(Self::error_result(format!(
                 "session '{}' on node '{}' is showing a blocking {} confirmation; use coding_action or manual intervention before sending a prompt",
                 session, node, profile.name
@@ -3515,10 +3357,6 @@ fn default_wait_node() -> String {
 
 fn default_coding_session() -> String {
     "kimi_codex".into()
-}
-
-fn default_coding_profile() -> String {
-    "opencode".into()
 }
 
 fn runtime_wait_id() -> String {
@@ -4230,7 +4068,7 @@ impl ServerHandler for TmuxMcpServer {
                 ),
                 Tool::new(
                     "list_coder_profiles",
-                    "List loaded coder profiles",
+                    "List enabled built-in coder profiles",
                     Arc::new(tool_schema(json!({}), None)),
                 ),
                 Tool::new(
@@ -4325,7 +4163,7 @@ impl ServerHandler for TmuxMcpServer {
                     "start_coding_session",
                     "Create or adopt a coding CLI session from a profile-defined command. Does not wait for readiness; use wait_start kind=coding-ready.",
                     Arc::new(tool_schema(json!({
-                        "profile": { "type": "string", "description": "CLI profile name (default: opencode)" },
+                        "profile": { "type": "string", "description": "CLI profile name (default: controller default coder profile)" },
                         "session": { "type": "string", "description": "Session name (default: profile name)" },
                         "node": { "type": "string", "description": "Execution node id (default: local)" },
                         "workspace_path": { "type": "string", "description": "Backend-owned workspace/start directory for the selected node/backend. Used as the tmux start directory when creating the session." },
@@ -4361,7 +4199,7 @@ impl ServerHandler for TmuxMcpServer {
                     Arc::new(tool_schema(json!({
                         "node": { "type": "string", "description": "Execution node id (default: local)" },
                         "session": { "type": "string" },
-                        "profile": { "type": "string", "description": "CLI profile name (default: opencode)" }
+                        "profile": { "type": "string", "description": "CLI profile name (default: controller default coder profile)" }
                     }), None)),
                 ),
                 Tool::new(
@@ -4405,7 +4243,7 @@ impl ServerHandler for TmuxMcpServer {
                         "node": { "type": "string", "description": "Execution node id (default: local)" },
                         "session": { "type": "string" },
                         "prompt": { "type": "string" },
-                        "profile": { "type": "string", "description": "CLI profile name (default: opencode)" }
+                        "profile": { "type": "string", "description": "CLI profile name (default: controller default coder profile)" }
                     }), Some(vec!["prompt"]))),
                 ),
                 Tool::new(
@@ -4414,7 +4252,7 @@ impl ServerHandler for TmuxMcpServer {
                     Arc::new(tool_schema(json!({
                         "node": { "type": "string", "description": "Execution node id (default: local)" },
                         "session": { "type": "string" },
-                        "profile": { "type": "string", "description": "CLI profile name (default: opencode)" },
+                        "profile": { "type": "string", "description": "CLI profile name (default: controller default coder profile)" },
                         "task_id_or_slug": { "type": "string", "description": "Task id or unique task slug" },
                         "prompt": { "type": "string", "description": "Instruction appended below generated task context" },
                         "template": { "type": "string", "enum": ["task", "validate", "review", "quality-guard"], "description": "Task prompt template to render (default: task)" },
@@ -4430,7 +4268,7 @@ impl ServerHandler for TmuxMcpServer {
                     Arc::new(tool_schema(json!({
                         "node": { "type": "string", "description": "Execution node id (default: local)" },
                         "session": { "type": "string" },
-                        "profile": { "type": "string", "description": "CLI profile name (default: opencode)" },
+                        "profile": { "type": "string", "description": "CLI profile name (default: controller default coder profile)" },
                         "lines": { "type": "integer", "description": "Lines to capture before compaction (default: 40)" },
                         "raw": { "type": "boolean", "description": "Return raw pane text instead of compact profile-aware output (default: false)" }
                     }), None)),
@@ -4442,16 +4280,8 @@ impl ServerHandler for TmuxMcpServer {
                         "node": { "type": "string", "description": "Execution node id (default: local)" },
                         "session": { "type": "string" },
                         "action": { "type": "string", "enum": ["approve", "reject", "cancel", "escape", "dismiss"], "description": "Action to perform" },
-                        "profile": { "type": "string", "description": "CLI profile name (default: opencode)" }
+                        "profile": { "type": "string", "description": "CLI profile name (default: controller default coder profile)" }
                     }), Some(vec!["action"]))),
-                ),
-                Tool::new(
-                    "load_profile",
-                    "Load a new CLI profile from inline TOML or a file path. Adds it to the running server's profile registry.",
-                    Arc::new(tool_schema(json!({
-                        "toml": { "type": "string", "description": "Inline TOML profile definition" },
-                        "path": { "type": "string", "description": "Path to TOML file containing profile definition" }
-                    }), None)),
                 ),
             ];
         tools.extend(Self::orchestration_tool_definitions());
@@ -4527,8 +4357,7 @@ impl ServerHandler for TmuxMcpServer {
                 Err(e) => Ok(Self::error_result(e)),
             },
             "list_coder_profiles" => {
-                let mut profiles: Vec<_> =
-                    self.profiles.read().unwrap().values().cloned().collect();
+                let mut profiles: Vec<_> = self.profiles.values().cloned().collect();
                 profiles.sort_by(|a, b| a.name.cmp(&b.name));
                 let json = serde_json::to_string_pretty(
                     &profiles
@@ -4544,7 +4373,6 @@ impl ServerHandler for TmuxMcpServer {
                                 "submit_after_text": profile.submit_after_text,
                                 "prompt_indicator": profile.prompt_indicator,
                                 "busy_indicators": profile.busy_indicators,
-                                "startup_dismiss": profile.startup_dismiss,
                             })
                         })
                         .collect::<Vec<_>>(),
@@ -4994,7 +4822,7 @@ impl ServerHandler for TmuxMcpServer {
                     &args,
                 )
                 .map_err(mcp_invalid_request)?;
-                self.send_coding_prompt(&args.node, &args.session, Some(&args.profile), &prompt)
+                self.send_coding_prompt(&args.node, &args.session, args.profile.as_deref(), &prompt)
                     .await
             }
             "start_coding_session" => self.start_coding_session_tool(args).await,
@@ -5050,25 +4878,6 @@ impl ServerHandler for TmuxMcpServer {
                         "Sent action '{}' to {} on node {}",
                         action, session, node
                     ))),
-                    Err(e) => Ok(Self::error_result(e)),
-                }
-            }
-            "load_profile" => {
-                let toml_text = if let Some(path) = args.get("path").and_then(|v| v.as_str()) {
-                    std::fs::read_to_string(path).map_err(|e| {
-                        McpError::invalid_request(format!("read error: {}", e), None)
-                    })?
-                } else if let Some(text) = args.get("toml").and_then(|v| v.as_str()) {
-                    text.to_owned()
-                } else {
-                    return Err(McpError::invalid_request("provide 'toml' or 'path'", None));
-                };
-                match load_profile_from_toml(&toml_text) {
-                    Ok(profile) => {
-                        let name = profile.name.clone();
-                        self.profiles.write().unwrap().insert(name.clone(), profile);
-                        Ok(Self::text_result(format!("Loaded profile '{}'", name)))
-                    }
                     Err(e) => Ok(Self::error_result(e)),
                 }
             }
@@ -5224,8 +5033,8 @@ impl ServerHandler for TmuxMcpServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, McpError> {
-        let profiles = self.profiles.read().unwrap();
-        let resources: Vec<Resource> = profiles
+        let resources: Vec<Resource> = self
+            .profiles
             .keys()
             .map(|name| {
                 RawResource {
@@ -5292,8 +5101,7 @@ impl ServerHandler for TmuxMcpServer {
         let uri = request.uri;
         if uri.starts_with("profile://") {
             let name = uri.trim_start_matches("profile://");
-            let profiles = self.profiles.read().unwrap();
-            if let Some(profile) = profiles.get(name) {
+            if let Some(profile) = self.profiles.get(name) {
                 let json = serde_json::to_string_pretty(profile)
                     .unwrap_or_else(|e| format!("{{\"error\":\"{}\"}}", e));
                 Ok(ReadResourceResult::new(vec![
@@ -5435,7 +5243,10 @@ impl ServerHandler for TmuxMcpServer {
                     .as_ref()
                     .and_then(|a| a.get("profile"))
                     .and_then(|v| v.as_str())
-                    .unwrap_or("opencode");
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .or_else(|| self.default_profile_name())
+                    .unwrap_or("codex");
                 let session = request
                     .arguments
                     .as_ref()
@@ -5954,6 +5765,7 @@ impl MmuxNodeRegistryService for NodeRegistryConnectService {
 pub(crate) async fn run_mcp_http_server(
     bind: SocketAddr,
     profiles: ProfileRegistry,
+    default_coder_profile: String,
     policy: ControllerPolicy,
     mcp_token: Option<String>,
     wire_auth: ResolvedNodeWirePolicy,
@@ -6000,6 +5812,7 @@ pub(crate) async fn run_mcp_http_server(
     if embedded_local_node_enabled {
         TmuxMcpServer::new(
             profiles.clone(),
+            Some(default_coder_profile.clone()),
             policy.clone(),
             node_executor.clone(),
             registry.clone(),
@@ -6024,6 +5837,7 @@ pub(crate) async fn run_mcp_http_server(
             move || {
                 Ok(TmuxMcpServer::new(
                     profiles.clone(),
+                    Some(default_coder_profile.clone()),
                     service_policy.clone(),
                     node_executor.clone(),
                     service_registry.clone(),
@@ -6620,24 +6434,10 @@ where
         std::process::exit(1);
     });
 
-    // Resolve node profile config path: --node-config > mmux.toml in cwd > built-in defaults
-    let node_config = cli.node_config.clone();
-    let profiles = if let Some(path) = node_config {
-        mmux_node::load_profiles_from_config(&path).unwrap_or_else(|e| {
-            eprintln!("Node profile config error: {}", e);
-            std::process::exit(1);
-        })
-    } else if let Some(path) = mmux_node::default_profile_config_in_cwd() {
-        mmux_node::load_profiles_from_config(&path).unwrap_or_else(|e| {
-            eprintln!("Node profile config error: {}", e);
-            std::process::exit(1);
-        })
-    } else {
-        println!(
-            "No node profile config found. Using built-in profiles (codex, opencode, kimi, claude, generic)."
-        );
-        mmux_node::default_profiles()
-    };
+    let coder_profiles = resolve_coder_profiles(&cli).unwrap_or_else(|e| {
+        eprintln!("Coder profile config error: {}", e);
+        std::process::exit(1);
+    });
 
     // MCP HTTP server mode
     let bind: SocketAddr = format!("{}:{}", cli.host, cli.port)
@@ -6657,7 +6457,8 @@ where
     let rt = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");
     let local_runtime = runtime::LocalRuntime::new(runtime::LocalRuntimeConfig {
         bind,
-        profiles,
+        profiles: coder_profiles.profiles,
+        default_coder_profile: coder_profiles.default_profile,
         policy,
         mcp_token,
         wire_auth,
@@ -6683,7 +6484,6 @@ mod tests {
         TaskSummary,
     };
     use std::fs;
-    use std::sync::RwLock;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn unique_temp_dir(prefix: &str) -> PathBuf {
@@ -6696,7 +6496,6 @@ mod tests {
 
     fn test_cli() -> Cli {
         Cli {
-            node_config: None,
             host: "127.0.0.1".into(),
             port: 3000,
             mcp_token: None,
@@ -6718,6 +6517,8 @@ mod tests {
             max_timeout_seconds: 120.0,
             max_request_bytes: 2 * 1024 * 1024,
             max_capture_bytes: 2 * 1024 * 1024,
+            enabled_coder_profiles: None,
+            default_coder_profile: None,
             enable_local_node: false,
             enable_microsandbox_node: false,
             sandbox_name: None,
@@ -6739,7 +6540,8 @@ mod tests {
         .await
         .expect("node execution actor");
         TmuxMcpServer::new(
-            Arc::new(RwLock::new(HashMap::new())),
+            Arc::new(HashMap::new()),
+            None,
             ControllerPolicy::new(&test_cli()).unwrap(),
             node_executor,
             registry,
@@ -6766,8 +6568,10 @@ mod tests {
         )
         .await
         .expect("node execution actor");
+        let default_coder_profile = first_enabled_builtin_profile(&profiles);
         TmuxMcpServer::new(
             profiles,
+            default_coder_profile,
             ControllerPolicy::new(&test_cli()).unwrap(),
             node_executor,
             registry,
@@ -6799,8 +6603,10 @@ mod tests {
         )
         .await
         .expect("node execution actor");
+        let default_coder_profile = first_enabled_builtin_profile(&profiles);
         TmuxMcpServer::new(
             profiles,
+            default_coder_profile,
             ControllerPolicy::new(&test_cli()).unwrap(),
             node_executor,
             registry,
@@ -6811,9 +6617,7 @@ mod tests {
     }
 
     fn profile_registry(profile: CliProfile) -> ProfileRegistry {
-        let mut profiles = HashMap::new();
-        profiles.insert(profile.name.clone(), profile);
-        Arc::new(RwLock::new(profiles))
+        Arc::new(HashMap::from([(profile.name.clone(), profile)]))
     }
 
     async fn test_create_session(server: &TmuxMcpServer, session: &str, command: &str) {
@@ -6842,24 +6646,11 @@ mod tests {
 
     fn ready_profile() -> CliProfile {
         CliProfile {
-            name: "testcoder".into(),
+            name: "codex".into(),
             cmd: Some("sh -c 'printf READY; sleep 30'".into()),
             permission_bypass_cmd: Some("sh -c 'printf READY; sleep 30'".into()),
             prompt_indicator: "READY".into(),
             busy_indicators: Vec::new(),
-            ..CliProfile::default()
-        }
-    }
-
-    fn startup_dismiss_profile() -> CliProfile {
-        CliProfile {
-            name: "dismisscoder".into(),
-            prompt_indicator: "READY".into(),
-            startup_dismiss: Some(mmux_shared::StartupDismiss {
-                policy: "custom-keys".into(),
-                key: Some("Down Enter".into()),
-                triggers: vec!["Update available!".into()],
-            }),
             ..CliProfile::default()
         }
     }
@@ -6962,7 +6753,7 @@ mod tests {
         CodingTaskSendArgs {
             node: "local".into(),
             session: "worker".into(),
-            profile: "codex".into(),
+            profile: Some("codex".into()),
             task_id_or_slug: task_id_or_slug.into(),
             prompt: prompt.into(),
             template: None,
@@ -7145,7 +6936,7 @@ mod tests {
         SessionRecord {
             node_id: NodeId("local".into()),
             session: SessionId(session.into()),
-            profile: "testcoder".into(),
+            profile: "codex".into(),
             workspace_path: Some("/workspace".into()),
             bypass_permissions: false,
             task_ids,
@@ -7473,7 +7264,7 @@ mod tests {
             .record_session(SessionRecord {
                 node_id: NodeId("node-a".into()),
                 session: SessionId("worker-a".into()),
-                profile: "testcoder".into(),
+                profile: "codex".into(),
                 workspace_path: Some("/workspace/project".into()),
                 bypass_permissions: false,
                 task_ids: vec![task.id.clone()],
@@ -7678,7 +7469,7 @@ mod tests {
                 "task_id": task.id.0,
                 "node_id": "node-a",
                 "session": "worker-a",
-                "profile": "testcoder",
+                "profile": "codex",
                 "role": "implementation-worker",
                 "kind": "codex",
                 "skills": ["rust"]
@@ -7690,7 +7481,7 @@ mod tests {
         let owner = assigned.owner.unwrap();
         assert_eq!(owner.node_id.0, "node-a");
         assert_eq!(owner.session.0, "worker-a");
-        assert_eq!(owner.profile, "testcoder");
+        assert_eq!(owner.profile, "codex");
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -7758,7 +7549,7 @@ mod tests {
             json!({
                 "node_id": "local",
                 "session": "worker-a",
-                "profile": "testcoder",
+                "profile": "codex",
                 "workspace_path": "/workspace/project",
                 "bypass_permissions": true,
                 "task_ids": [task.id.0],
@@ -7774,7 +7565,7 @@ mod tests {
 
         assert_eq!(record.node_id.0, "local");
         assert_eq!(record.session.0, "worker-a");
-        assert_eq!(record.profile, "testcoder");
+        assert_eq!(record.profile, "codex");
         assert_eq!(record.task_ids, vec![task.id]);
         assert!(record.bypass_permissions);
         test_kill_session(&server, "worker-a").await;
@@ -7991,7 +7782,7 @@ mod tests {
             json!({
                 "node_id": "local",
                 "session": "missing-worker",
-                "profile": "testcoder",
+                "profile": "codex",
                 "workspace_path": "/workspace/project",
                 "task_ids": [task.id.0],
                 "role": "implementation-worker",
@@ -8048,7 +7839,7 @@ mod tests {
                 "node": "local",
                 "session": "wait-lifecycle",
                 "kind": "coding-ready",
-                "profile": "testcoder",
+                "profile": "codex",
                 "timeout_seconds": 2,
                 "poll_seconds": 0.05
             }),
@@ -8248,11 +8039,8 @@ mod tests {
     #[tokio::test]
     async fn test_orchestration_wait_jobs_support_distributed_coding_ready_startup_dismiss() {
         let dir = unique_temp_dir("mmux-mcp-wait-distributed-dismiss");
-        let server = test_orchestration_server_with_profiles(
-            &dir,
-            profile_registry(startup_dismiss_profile()),
-        )
-        .await;
+        let server =
+            test_orchestration_server_with_profiles(&dir, mmux_node::default_profiles()).await;
         let node_id = "node-a";
         register_test_node(&server, node_id).await;
 
@@ -8260,7 +8048,7 @@ mod tests {
             "node": node_id,
             "session": "remote-coder",
             "kind": "coding-ready",
-            "profile": "dismisscoder",
+            "profile": "codex",
             "timeout_seconds": 2,
             "poll_seconds": 0.05,
             "stability_seconds": 0.0
@@ -8291,7 +8079,9 @@ mod tests {
                 &server,
                 node_id,
                 command_id,
-                NodeCommandResult::TmuxOutput("Update available!\n1. Update now\n2. Skip".into()),
+                NodeCommandResult::TmuxOutput(
+                    "✨ Update available!\n› 1. Update now\n  2. Skip".into(),
+                ),
             )
             .await;
 
@@ -8323,7 +8113,7 @@ mod tests {
                 &server,
                 node_id,
                 command_id,
-                NodeCommandResult::TmuxOutput("READY".into()),
+                NodeCommandResult::TmuxOutput("› Improve documentation in @filename".into()),
             )
             .await;
         };
@@ -8355,7 +8145,7 @@ mod tests {
             "node": node_id,
             "session": "remote-coder",
             "kind": "coding-ready",
-            "profile": "testcoder",
+            "profile": "codex",
             "timeout_seconds": 2,
             "poll_seconds": 0.05,
             "stability_seconds": 0.1
@@ -8497,7 +8287,7 @@ mod tests {
             json!({
                 "node_id": "missing-node",
                 "session": "worker-a",
-                "profile": "testcoder",
+                "profile": "codex",
                 "workspace_path": "/workspace/project",
                 "task_ids": [task.id.0],
                 "role": "implementation-worker",
@@ -8527,7 +8317,7 @@ mod tests {
             json!({
                 "node_id": node_id,
                 "session": "worker-a",
-                "profile": "testcoder",
+                "profile": "codex",
                 "workspace_path": "/workspace/project",
                 "task_ids": [task.id.0],
                 "role": "implementation-worker",
@@ -8637,7 +8427,7 @@ mod tests {
 
         let result = server
             .start_coding_session_tool(object_args(json!({
-                "profile": "testcoder",
+                "profile": "codex",
                 "node": "local",
                 "workspace_path": workspace_path.clone(),
                 "bypass_permissions": true,
@@ -8662,7 +8452,7 @@ mod tests {
             .0
             .starts_with(&format!("mmux-{}-model-owner-", task.slug)));
         assert_eq!(record.node_id.0, "local");
-        assert_eq!(record.profile, "testcoder");
+        assert_eq!(record.profile, "codex");
         assert_eq!(
             record.workspace_path.as_deref(),
             Some(workspace_path.as_str())
@@ -8701,7 +8491,7 @@ mod tests {
         assert!(!Path::new(&backend_workspace).exists());
 
         let start = server.start_coding_session_tool(object_args(json!({
-            "profile": "testcoder",
+            "profile": "codex",
             "node": node_id,
             "session": "remote-worker",
             "workspace_path": backend_workspace.clone(),
@@ -8932,7 +8722,7 @@ mod tests {
                 "title": "Agent Workspace",
                 "objective": "Require explicit workspace path",
                 "agents": [{
-                    "kind": "testcoder",
+                    "kind": "codex",
                     "role": "implementation-worker",
                     "skills": ["rust"],
                     "workspace_path": "/agent/workspace",
@@ -8945,7 +8735,7 @@ mod tests {
 
         let error = server
             .start_coding_session_tool(object_args(json!({
-                "profile": "testcoder",
+                "profile": "codex",
                 "node": "local",
                 "bypass_permissions": false,
                 "task_ids": [task.id.0],
@@ -9001,7 +8791,7 @@ mod tests {
 
         let result = server
             .start_coding_session_tool(object_args(json!({
-                "profile": "testcoder",
+                "profile": "codex",
                 "session": "plain-start",
                 "node": "local",
                 "workspace_path": workspace.to_string_lossy()
@@ -9011,7 +8801,7 @@ mod tests {
 
         let payload: Value = result_json(&result);
         assert_eq!(payload["session"], "plain-start");
-        assert_eq!(payload["profile"], "testcoder");
+        assert_eq!(payload["profile"], "codex");
         assert_eq!(payload["readiness"]["status"], "not_waited");
         assert_eq!(payload["readiness"]["next_tool"], "wait_start");
         assert!(payload["session_record"].is_null());
@@ -9032,7 +8822,7 @@ mod tests {
 
         let error = server
             .start_coding_session_tool(object_args(json!({
-                "profile": "testcoder",
+                "profile": "codex",
                 "session": "timeout-start",
                 "node": "local",
                 "workspace_path": workspace.to_string_lossy(),
@@ -9069,7 +8859,7 @@ mod tests {
             json!({
                 "node_id": "local",
                 "session": "roundtrip-worker",
-                "profile": "testcoder",
+                "profile": "codex",
                 "workspace_path": backend_workspace.clone(),
                 "bypass_permissions": false,
                 "task_ids": [task.id.0],
@@ -9087,7 +8877,7 @@ mod tests {
             .sessions
             .get("local:roundtrip-worker")
             .expect("persisted session record");
-        assert_eq!(record.profile, "testcoder");
+        assert_eq!(record.profile, "codex");
         assert_eq!(record.kind, "validator");
         assert_eq!(record.task_ids, vec![task.id]);
         assert_eq!(
@@ -9319,6 +9109,21 @@ mod tests {
     }
 
     #[test]
+    fn test_coding_task_send_omitted_profile_uses_server_default_path() {
+        let args = parse_tool_args::<CodingTaskSendArgs>(
+            "coding_task_send",
+            object_args(json!({
+                "session": "worker",
+                "task_id_or_slug": "task-1",
+                "prompt": "Implement now."
+            })),
+        )
+        .unwrap();
+
+        assert_eq!(args.profile, None);
+    }
+
+    #[test]
     fn test_coding_task_prompt_rejects_ambiguous_slug_and_bad_context() {
         let mut state = OrchestrationState::new();
         let first_project = state
@@ -9448,7 +9253,7 @@ mod tests {
                 "task_id": "task-missing",
                 "node_id": "node-a",
                 "session": "worker-a",
-                "profile": "testcoder",
+                "profile": "codex",
                 "role": "implementation-worker",
                 "kind": "codex"
             }),
@@ -9579,159 +9384,28 @@ mod tests {
     }
 
     #[test]
-    fn test_load_profile_from_toml() {
-        let toml = r#"
-name = "test"
-prompt_indicator = ">"
-busy_indicators = ["Loading"]
-approve_keys = "y"
-reject_keys = "n"
-cancel_keys = "C-c"
-escape_keys = "Escape"
-"#;
-        let profile = load_profile_from_toml(toml).unwrap();
-        assert_eq!(profile.name, "test");
-        assert_eq!(profile.prompt_indicator, ">");
-        assert_eq!(profile.busy_indicators, vec!["Loading"]);
-        assert_eq!(profile.approve_keys, "y");
-    }
-
-    #[test]
-    fn test_load_profile_with_startup_dismiss() {
-        let toml = r#"
-name = "test"
-prompt_indicator = ">"
-busy_indicators = []
-approve_keys = "y"
-reject_keys = "n"
-cancel_keys = "C-c"
-escape_keys = "Escape"
-
-[startup_dismiss]
-policy = "custom-keys"
-key = "Escape"
-triggers = ["Starting MCP servers"]
-"#;
-        let profile = load_profile_from_toml(toml).unwrap();
-        assert!(profile.startup_dismiss.is_some());
-        let dismiss = profile.startup_dismiss.unwrap();
-        assert_eq!(dismiss.policy, "custom-keys");
-        assert_eq!(dismiss.key.as_deref(), Some("Escape"));
-        assert_eq!(dismiss.triggers, vec!["Starting MCP servers"]);
-    }
-
-    #[test]
-    fn test_load_profile_with_update_policy_override() {
-        let toml = r#"
-name = "codex"
-prompt_indicator = "›"
-busy_indicators = ["• Working"]
-approve_keys = "y Enter"
-reject_keys = "n Enter"
-cancel_keys = "C-c"
-escape_keys = "Escape"
-
-[startup_dismiss]
-policy = "update-now"
-triggers = ["Update now"]
-"#;
-        let profile = load_profile_from_toml(toml).unwrap();
-        let output = "✨ Update available!\n› 1. Update now\n  2. Skip\nPress enter to continue";
-
-        assert_eq!(startup_dismiss_key(output, &profile), Some("Enter".into()));
-    }
-
-    #[test]
-    fn test_load_profile_update_policy_defaults_to_skip_update() {
-        let toml = r#"
-name = "codex"
-prompt_indicator = "›"
-busy_indicators = ["• Working"]
-approve_keys = "y Enter"
-reject_keys = "n Enter"
-cancel_keys = "C-c"
-escape_keys = "Escape"
-
-[startup_dismiss]
-triggers = ["Update now"]
-"#;
-        let profile = load_profile_from_toml(toml).unwrap();
-        let output = "✨ Update available!\n› 1. Update now\n  2. Skip\nPress enter to continue";
-
-        assert_eq!(
-            startup_dismiss_key(output, &profile),
-            Some("Down Enter".into())
-        );
-    }
-
-    #[test]
-    fn test_load_profile_rejects_unknown_update_policy() {
-        let toml = r#"
-name = "codex"
-prompt_indicator = "›"
-busy_indicators = []
-approve_keys = "y"
-reject_keys = "n"
-cancel_keys = "C-c"
-escape_keys = "Escape"
-
-[startup_dismiss]
-policy = "maybe-update"
-triggers = ["Update now"]
-"#;
-        let error = load_profile_from_toml(toml).unwrap_err();
-
-        assert!(
-            error.contains("unsupported startup_dismiss policy"),
-            "{error}"
-        );
-    }
-
-    #[test]
-    fn test_load_profile_rejects_key_without_custom_keys_policy() {
-        let toml = r#"
-name = "codex"
-prompt_indicator = "›"
-busy_indicators = []
-approve_keys = "y"
-reject_keys = "n"
-cancel_keys = "C-c"
-escape_keys = "Escape"
-
-[startup_dismiss]
-key = "Down Enter"
-triggers = ["Update now"]
-"#;
-        let error = load_profile_from_toml(toml).unwrap_err();
-
-        assert!(error.contains("does not accept key"), "{error}");
-    }
-
-    #[test]
     fn test_profile_launch_command_requires_explicit_permission_bypass_cmd() {
-        let mut profile = CliProfile {
-            name: "test".into(),
-            cmd: Some("test-cli".into()),
-            permission_bypass_cmd: None,
-            ..CliProfile::default()
-        };
-
-        assert_eq!(profile_launch_command(&profile, false).unwrap(), "test-cli");
-        assert!(profile_launch_command(&profile, true)
+        let profiles = mmux_node::default_profiles();
+        let opencode = mmux_node::get_profile(&profiles, "opencode").unwrap();
+        assert_eq!(
+            profile_launch_command(&opencode, false).unwrap(),
+            "opencode"
+        );
+        assert!(profile_launch_command(&opencode, true)
             .unwrap_err()
             .contains("does not define permission_bypass_cmd"));
 
-        profile.permission_bypass_cmd = Some("test-cli --dangerously-bypass-permissions".into());
+        let codex = mmux_node::get_profile(&profiles, "codex").unwrap();
         assert_eq!(
-            profile_launch_command(&profile, true).unwrap(),
-            "test-cli --dangerously-bypass-permissions"
+            profile_launch_command(&codex, true).unwrap(),
+            "codex --dangerously-bypass-approvals-and-sandbox"
         );
     }
 
     #[test]
     fn test_profile_launch_strategy_defaults_and_validates() {
         let mut profile = CliProfile {
-            name: "test".into(),
+            name: "codex".into(),
             ..CliProfile::default()
         };
 
@@ -9747,9 +9421,74 @@ triggers = ["Update now"]
     }
 
     #[test]
+    fn test_enabled_coder_profiles_filters_default_registry() {
+        let mut cli = test_cli();
+        cli.enabled_coder_profiles = Some("codex, claude".into());
+
+        let resolved = resolve_coder_profiles(&cli).unwrap();
+        let profiles = resolved.profiles;
+
+        assert_eq!(profiles.len(), 2);
+        assert!(profiles.contains_key("codex"));
+        assert!(profiles.contains_key("claude"));
+        assert!(!profiles.contains_key("opencode"));
+        assert!(!profiles.contains_key("kimi"));
+        assert_eq!(resolved.default_profile, "codex");
+    }
+
+    #[test]
+    fn test_enabled_coder_profiles_rejects_bad_values() {
+        let mut cli = test_cli();
+        cli.enabled_coder_profiles = Some("codex,,claude".into());
+        assert!(resolve_coder_profiles(&cli)
+            .unwrap_err()
+            .contains("empty profile name"));
+
+        cli.enabled_coder_profiles = Some("codex,missing".into());
+        assert!(resolve_coder_profiles(&cli)
+            .unwrap_err()
+            .contains("unknown coder profile 'missing'"));
+    }
+
+    #[test]
+    fn test_default_coder_profile_flag_must_be_enabled() {
+        let mut cli = test_cli();
+        cli.enabled_coder_profiles = Some("codex,claude".into());
+        cli.default_coder_profile = Some("claude".into());
+
+        let resolved = resolve_coder_profiles(&cli).unwrap();
+        assert_eq!(resolved.default_profile, "claude");
+
+        cli.default_coder_profile = Some("opencode".into());
+        assert!(resolve_coder_profiles(&cli)
+            .unwrap_err()
+            .contains("is not enabled"));
+    }
+
+    #[test]
+    fn test_profile_default_uses_first_enabled_builtin_without_opencode_special_case() {
+        let cli = test_cli();
+
+        let resolved = resolve_coder_profiles(&cli).unwrap();
+
+        assert_eq!(resolved.default_profile, "codex");
+    }
+
+    #[tokio::test]
+    async fn test_profile_default_uses_first_enabled_when_opencode_disabled() {
+        let dir = unique_temp_dir("mmux-profile-allowlist");
+        let codex = mmux_node::get_profile(&mmux_node::default_profiles(), "codex").unwrap();
+        let server = test_orchestration_server_with_profiles(&dir, profile_registry(codex)).await;
+
+        assert_eq!(server.default_profile_name(), Some("codex"));
+        assert_eq!(server.resolve_profile(None).unwrap().name, "codex");
+        assert!(server.resolve_profile(Some("opencode")).is_none());
+    }
+
+    #[test]
     fn test_profile_text_mode_defaults_and_validates() {
         let mut profile = CliProfile {
-            name: "test".into(),
+            name: "codex".into(),
             ..CliProfile::default()
         };
 
@@ -9762,13 +9501,6 @@ triggers = ["Update now"]
         assert!(profile_text_mode(&profile)
             .unwrap_err()
             .contains("unsupported text_mode"));
-    }
-
-    #[test]
-    fn test_load_profile_invalid_toml() {
-        let toml = "not valid toml ::";
-        let result = load_profile_from_toml(toml);
-        assert!(result.is_err());
     }
 
     #[test]
@@ -10127,7 +9859,7 @@ triggers = ["Update now"]
 
         assert_eq!(
             compact_coding_output(output, &profile),
-            "⚠ The cormiloDev MCP server is not logged in. Run `codex mcp login cormiloDev`.\n› Reply exactly: MMUX_SMOKE_CODEX\n• Working (1m 14s • esc to interrupt)"
+            "⚠ The cormiloDev MCP server is not logged in. Run `codex mcp login cormiloDev`.\n› Reply exactly: MMUX_SMOKE_CODEX"
         );
     }
 
@@ -10191,7 +9923,7 @@ interval
 
         assert_eq!(
             compact_coding_output(output, &profile),
-            "❯ Reply exactly: MMUX_SMOKE_CLAUDE\n● MMUX_SMOKE_CLAUDE\n✻ Brewed for 1s"
+            "❯ Reply exactly: MMUX_SMOKE_CLAUDE\n● MMUX_SMOKE_CLAUDE"
         );
     }
 
@@ -10300,16 +10032,7 @@ attempt #4]
 
     #[test]
     fn test_startup_dismiss_triggers_count_as_busy_and_return_key() {
-        let profile = CliProfile {
-            name: "codex".into(),
-            prompt_indicator: "›".into(),
-            startup_dismiss: Some(mmux_shared::StartupDismiss {
-                policy: "skip-update".into(),
-                key: None,
-                triggers: vec!["Update now".into()],
-            }),
-            ..CliProfile::default()
-        };
+        let profile = mmux_node::get_profile(&mmux_node::default_profiles(), "codex").unwrap();
         let output = "✨ Update available!\n› 1. Update now\n  2. Skip\nPress enter to continue";
 
         assert!(profile_is_busy(output, &profile));
@@ -10325,16 +10048,7 @@ attempt #4]
 
     #[test]
     fn test_codex_trust_prompt_is_not_startup_dismissed() {
-        let profile = CliProfile {
-            name: "codex".into(),
-            prompt_indicator: "›".into(),
-            startup_dismiss: Some(mmux_shared::StartupDismiss {
-                policy: "skip-update".into(),
-                key: None,
-                triggers: vec!["Update now".into()],
-            }),
-            ..CliProfile::default()
-        };
+        let profile = mmux_node::get_profile(&mmux_node::default_profiles(), "codex").unwrap();
         let output = "\
 > You are in /tmp
 
@@ -10353,19 +10067,10 @@ attempt #4]
 
     #[test]
     fn test_stale_startup_dismiss_trigger_outside_active_region_is_ignored() {
-        let profile = CliProfile {
-            name: "codex".into(),
-            prompt_indicator: "›".into(),
-            startup_dismiss: Some(mmux_shared::StartupDismiss {
-                policy: "skip-update".into(),
-                key: None,
-                triggers: vec!["Update now".into()],
-            }),
-            ..CliProfile::default()
-        };
+        let profile = mmux_node::get_profile(&mmux_node::default_profiles(), "codex").unwrap();
         let old_banner =
             "✨ Update available!\n› 1. Update now\n  2. Skip\nPress enter to continue";
-        let filler = (0..BUSY_SCAN_TRAILING_LINES)
+        let filler = (0..30)
             .map(|index| format!("old line {index}"))
             .collect::<Vec<_>>()
             .join("\n");
@@ -10378,17 +10083,7 @@ attempt #4]
 
     #[test]
     fn test_stale_startup_dismiss_trigger_before_current_prompt_is_ignored() {
-        let profile = CliProfile {
-            name: "codex".into(),
-            prompt_indicator: "›".into(),
-            busy_indicators: vec!["• Working".into()],
-            startup_dismiss: Some(mmux_shared::StartupDismiss {
-                policy: "skip-update".into(),
-                key: None,
-                triggers: vec!["Update now".into()],
-            }),
-            ..CliProfile::default()
-        };
+        let profile = mmux_node::get_profile(&mmux_node::default_profiles(), "codex").unwrap();
         let output = "\
   ✨ Update available! 0.135.0 -> 0.137.0
 › 1. Update now
@@ -10408,17 +10103,7 @@ attempt #4]
 
     #[test]
     fn test_busy_indicator_before_current_prompt_still_counts() {
-        let profile = CliProfile {
-            name: "codex".into(),
-            prompt_indicator: "›".into(),
-            busy_indicators: vec!["• Working".into()],
-            startup_dismiss: Some(mmux_shared::StartupDismiss {
-                policy: "skip-update".into(),
-                key: None,
-                triggers: vec!["Update now".into()],
-            }),
-            ..CliProfile::default()
-        };
+        let profile = mmux_node::get_profile(&mmux_node::default_profiles(), "codex").unwrap();
         let output = "\
 ⚠ The cormiloDev MCP server is not logged in.
 • Working (4m 12s • esc to interrupt)

@@ -260,10 +260,10 @@ wait_start(session="codex", kind="coding-ready", profile="codex", timeout_second
 wait_status(wait_id="<returned wait_id>")
 ```
 
-If the CLI shows startup noise or an update prompt, the profile's
-`startup_dismiss` config can handle it before proceeding. Codex update prompts
-use a policy: `skip-update` by default, or `update-now` when explicitly
-configured in profile TOML.
+If the CLI shows startup noise, update prompts, or a known blocking
+confirmation screen, the built-in profile adapter handles the supported cases.
+For example, codex and kimi update prompts are skipped by default, and claude
+bypass-permissions confirmations are treated as blocking rather than ready.
 
 ### Step 3: Send your prompt
 ```
@@ -310,17 +310,15 @@ coding_action(session="codex", profile="codex", action="cancel")
 
 ## Profile System
 
-Profiles define how to interact with a specific CLI. Common coder profiles are
-built into mmux so local mode works without a profile TOML file. Optional
-`[coder_profile.<name>]` sections in the active config overlay those built-ins:
-omitted fields keep their built-in values, nested tables merge, and scalar/list
-fields replace the built-in value. For this repo, backend examples live under
-`example-backends/`:
-
-- `example-backends/local/mmux.toml` for local overrides
-- `mmux.toml.example` for root examples
-
-The canonical profile section name is `coder_profile`.
+Profiles define how mmux interacts with supported coding CLIs. Profiles are
+canonical built-in Rust adapters; they are not loaded from TOML and cannot be
+added or overridden at runtime. Built-in profiles are `codex`, `opencode`,
+`kimi`, and `claude`. A controller may expose only a subset when started with
+`--enabled-coder-profiles <comma-separated-names>`; if the flag is omitted, all
+built-ins are enabled. `--default-coder-profile <name>` selects the profile used
+when profile-aware tools omit `profile`; without it, mmux uses the first enabled
+built-in profile in canonical order: `codex`, `opencode`, `kimi`, then
+`claude`. Profile-aware tools reject profiles that are not enabled.
 
 Key fields:
 
@@ -337,25 +335,14 @@ Key fields:
 | `reject_keys` | Keys to send for rejection (e.g., `n Enter`) |
 | `cancel_keys` | Keys to send to cancel (e.g., `C-c`) |
 | `escape_keys` | Keys to send to escape/dismiss (e.g., `Escape`) |
-| `startup_dismiss` | Auto-dismiss startup noise if detected; update prompts use `policy = "skip-update"` or `policy = "update-now"` |
 
-Use `list_coder_profiles` to inspect the loaded runtime profiles.
-
-If a profile is missing, use `load_profile` to add it at runtime:
-```
-load_profile(toml="[coder_profile.custom]\nname = \"custom\"\ncmd = \"custom\"\n...")
-```
-
-Or load from a file:
-```
-load_profile(path="/path/to/custom.toml")
-```
+Use `list_coder_profiles` to inspect the enabled built-in runtime profiles.
 
 ## When to Use Which Tool
 
 ### `send_input` vs `coding_send`
 - `send_input` — raw text, no profile logic. Use for generic shells, REPLs, scripts.
-- `coding_send` — profile-aware. Auto-dismisses startup noise and uses the profile's text/submit strategy. Use only for coding CLIs. Claude Code uses `text_mode = "literal-keys"` so `Enter` is sent as a real keypress rather than pasted text.
+- `coding_send` — profile-aware. Auto-dismisses startup noise and uses the profile's text/submit strategy. Use only for coding CLIs. claude uses `text_mode = "literal-keys"` so `Enter` is sent as a real keypress rather than pasted text.
 - `coding_task_send` — task-aware initial delegation. It renders task context
   from orchestration state and appends your instruction before using the same
   profile-aware send behavior. Use `template="quality-guard"` when the worker
@@ -382,7 +369,7 @@ tmux or embedded Microsandbox.
 
 `check_state` returns `has_prompt`, `promptable`, `busy`, and `turn_idle`.
 `promptable=true` means the CLI can accept text, not that the current turn is
-finished. For Codex, a prompt can be visible while `busy=true` and
+finished. For codex, a prompt can be visible while `busy=true` and
 `turn_idle=false`; use `turn_idle=true` or a completed `coding-ready` wait when
 you need foreground work to have settled.
 
@@ -472,7 +459,6 @@ Both accept optional `profile` and `session` arguments.
   `--enable-local-node` for the built-in local tmux backend, or
   `--enable-microsandbox-node --sandbox-name <name>` to attach the host-side
   Microsandbox connector to an existing running sandbox as node `local`.
-- The local backend does not need a TOML file unless you want profile overlays.
 - The local backend uses a private tmux socket. Use `--tmux-config <path>` only
   for local tmux backends when an explicit tmux config is needed. Use
   `mmux tmux -- <args>` or `mmux attach <session>` for manual debugging.
@@ -480,4 +466,3 @@ Both accept optional `profile` and `session` arguments.
   Microsandbox mode for a single controller process, or use
   `mmux node --backend microsandbox --sandbox-name <name>` to attach an
   existing running sandbox to a distributed controller.
-- Pass `--node-config` to override the default profile config file if needed.

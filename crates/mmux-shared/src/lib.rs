@@ -1,15 +1,6 @@
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct StartupDismiss {
-    #[serde(default = "default_startup_dismiss_policy")]
-    pub policy: String,
-    #[serde(default)]
-    pub key: Option<String>,
-    pub triggers: Vec<String>,
-}
-
-#[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct CliProfile {
     pub name: String,
     pub cmd: Option<String>,
@@ -25,7 +16,6 @@ pub struct CliProfile {
     pub submit_after_text: bool,
     pub prompt_indicator: String,
     pub busy_indicators: Vec<String>,
-    pub startup_dismiss: Option<StartupDismiss>,
     pub approve_keys: String,
     pub reject_keys: String,
     pub cancel_keys: String,
@@ -44,10 +34,6 @@ pub fn default_submit_after_text() -> bool {
     true
 }
 
-pub fn default_startup_dismiss_policy() -> String {
-    "skip-update".into()
-}
-
 impl Default for CliProfile {
     fn default() -> Self {
         Self {
@@ -60,7 +46,6 @@ impl Default for CliProfile {
             submit_after_text: default_submit_after_text(),
             prompt_indicator: "$".into(),
             busy_indicators: vec![],
-            startup_dismiss: None,
             approve_keys: "y Enter".into(),
             reject_keys: "n Enter".into(),
             cancel_keys: "C-c".into(),

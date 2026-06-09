@@ -34,9 +34,11 @@ when needed.
   wait jobs, not in session creation.
 - After each significant coder action, capture output and check state before
   sending the next instruction.
-- In `check_state`, `promptable=true` means the CLI can accept text; it does
-  not mean the current turn is finished. Use `turn_idle=true` or a completed
-  `coding-ready` wait when you need foreground work to have settled.
+- In `check_state`, `promptable=true` means the CLI can accept text; use it for
+  steering the active turn only. It does not mean the current turn is finished.
+- Use `turn_idle=true` or a completed `coding-ready` wait before sending a new
+  independent prompt, new task prompt, validator prompt, review prompt, or
+  quality-guard prompt.
 - Do not leave accidental test sessions running. Keep intentional coder sessions
   alive when the user asks to wait for further instructions.
 - Worker sessions report findings, evidence, blockers, and proposed changes.
@@ -49,6 +51,10 @@ when needed.
    `GET /health`, then `list_coder_profiles` and project-scoped
    `list_sessions(project_id)` where `project_id` is a project UUID id or slug.
    Use `admin_list_node_sessions` only for raw node/tmux admin debugging.
+   `list_coder_profiles` reports only profiles enabled for this controller.
+   When a tool omits `profile`, mmux uses `--default-coder-profile` if
+   configured, otherwise the first enabled built-in in canonical order:
+   `codex`, `opencode`, `kimi`, then `claude`.
 2. Start or reuse the right coder session:
    `start_coding_session(profile, session, workspace_path, objective)`.
    This creates or adopts the tmux session and returns without waiting for the
@@ -57,7 +63,8 @@ when needed.
    `wait_start` with `kind = "coding-ready"` and `profile`, then `wait_status`;
    for quick checks use `check_state` or `capture_output`.
    If `check_state` shows `promptable=true` and `turn_idle=false`, you may send
-   steering text, but the previous foreground turn is still active.
+   steering text related to the current active turn. Do not send a new task or
+   unrelated prompt until `turn_idle=true` or the `coding-ready` wait completes.
 4. Delegate initial task work with `coding_task_send`; use `coding_send` for
    follow-up steering or non-task prompts.
 5. Wait, read, and steer:

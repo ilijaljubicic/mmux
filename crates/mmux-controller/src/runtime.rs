@@ -16,6 +16,7 @@ pub(crate) trait ControllerRuntime {
 pub(crate) struct LocalRuntimeConfig {
     pub(crate) bind: SocketAddr,
     pub(crate) profiles: ProfileRegistry,
+    pub(crate) default_coder_profile: String,
     pub(crate) policy: ControllerPolicy,
     pub(crate) mcp_token: Option<String>,
     pub(crate) wire_auth: ResolvedNodeWirePolicy,
@@ -40,6 +41,7 @@ impl ControllerRuntime for LocalRuntime {
             run_mcp_http_server(
                 config.bind,
                 config.profiles,
+                config.default_coder_profile,
                 config.policy,
                 config.mcp_token,
                 config.wire_auth,

@@ -5,7 +5,7 @@ use connectrpc::{
     rustls,
 };
 use http::header::{HeaderValue, AUTHORIZATION};
-use mmux_shared::{CliProfile, ReadFileResult, SaveFileResult, StartupDismiss};
+use mmux_shared::{ReadFileResult, SaveFileResult};
 use mmux_wire::connect::mmux::wire::v1::MmuxNodeRegistryServiceClient;
 use mmux_wire::{
     heartbeat_request_to_proto, pull_commands_request_to_proto, pull_commands_response_from_proto,
@@ -13,17 +13,15 @@ use mmux_wire::{
     NodeCommand, NodeCommandKind, NodeCommandResult, NodeDescriptor, NodeStatus,
     PullCommandsRequest, RegisterNodeRequest, SubmitCommandResultRequest,
 };
-use std::collections::HashMap;
 use std::ffi::OsString;
 use std::fs::OpenOptions;
 use std::io::{BufReader, Cursor, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-pub const DEFAULT_NODE_PROFILE_CONFIG_NAME: &str = "mmux.toml";
 pub const DEFAULT_STORE_DIR_NAME: &str = ".mmux";
 const LOCAL_TMUX_QUICK_TIMEOUT: Duration = Duration::from_secs(5);
 const LOCAL_TMUX_CONTROL_TIMEOUT: Duration = Duration::from_secs(10);
@@ -32,7 +30,8 @@ const MICROSANDBOX_TMUX_TIMEOUT: Duration = Duration::from_secs(20);
 const MICROSANDBOX_FILE_TIMEOUT: Duration = Duration::from_secs(60);
 const BACKEND_PROCESS_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
-pub type ProfileRegistry = Arc<RwLock<HashMap<String, CliProfile>>>;
+pub mod profiles;
+pub use profiles::{default_profiles, get_profile, ProfileRegistry};
 
 #[derive(Clone, Debug)]
 struct NodeClientIdentity {
@@ -121,8 +120,6 @@ pub struct NodeCli {
         help = "Milliseconds between command polls"
     )]
     pub poll_interval_ms: u64,
-    #[arg(long, help = "Path to node profile TOML file")]
-    pub node_config: Option<String>,
     #[arg(
         long,
         help = "Directory for local node runtime state. The private tmux socket is a deterministic short runtime path derived from this store path."
@@ -160,13 +157,6 @@ where
         eprintln!("Node backend config error: {}", error);
         std::process::exit(1);
     }
-    if let Some(path) = cli.node_config.as_deref() {
-        if let Err(error) = load_profiles_from_config(path) {
-            eprintln!("Node profile config error: {}", error);
-            std::process::exit(1);
-        }
-    }
-
     println!("mmux node '{}'", cli.node_id);
     if let Some(url) = cli.controller_url.as_deref() {
         println!("  Controller URL: {}", url);
@@ -1166,237 +1156,6 @@ fn run_output_command_with_timeout(
     }
 }
 
-pub fn default_profile_config_in_cwd() -> Option<String> {
-    let path = std::path::Path::new(DEFAULT_NODE_PROFILE_CONFIG_NAME);
-    if path.exists() {
-        Some(path.to_string_lossy().into_owned())
-    } else {
-        None
-    }
-}
-
-pub fn load_profile_from_toml(text: &str) -> Result<CliProfile, String> {
-    let profile: CliProfile =
-        toml::from_str(text).map_err(|e| format!("toml parse error: {}", e))?;
-    validate_profile(&profile)?;
-    Ok(profile)
-}
-
-pub fn get_profile(registry: &ProfileRegistry, name: &str) -> Option<CliProfile> {
-    registry.read().unwrap().get(name).cloned()
-}
-
-pub fn load_profiles_from_config(path: &str) -> Result<ProfileRegistry, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("failed to read node profile config '{}': {}", path, e))?;
-    let config: toml::Table = toml::from_str(&text)
-        .map_err(|e| format!("failed to parse node profile config '{}': {}", path, e))?;
-
-    let mut registry = default_profile_map();
-
-    if let Some(profiles) = config.get("coder_profile").and_then(|v| v.as_table()) {
-        for (name, value) in profiles {
-            let profile = load_profile_overlay(name, value, registry.get(name).cloned())?;
-            registry.insert(name.clone(), profile);
-        }
-    }
-
-    Ok(Arc::new(RwLock::new(registry)))
-}
-
-fn default_profile_map() -> HashMap<String, CliProfile> {
-    let mut registry = HashMap::new();
-
-    registry.insert(
-        "opencode".into(),
-        CliProfile {
-            name: "opencode".into(),
-            cmd: Some("opencode".into()),
-            permission_bypass_cmd: None,
-            launch_strategy: Some("shell_send".into()),
-            text_mode: "paste-buffer".into(),
-            submit_keys: "Enter".into(),
-            submit_after_text: true,
-            prompt_indicator: "ctrl+p commands".into(),
-            busy_indicators: vec![
-                "Thinking".into(),
-                "Working".into(),
-                "Running".into(),
-                "Processing".into(),
-                "Generating".into(),
-            ],
-            startup_dismiss: None,
-            approve_keys: "y Enter".into(),
-            reject_keys: "n Enter".into(),
-            cancel_keys: "C-c".into(),
-            escape_keys: "Escape".into(),
-        },
-    );
-
-    registry.insert(
-        "kimi".into(),
-        CliProfile {
-            name: "kimi".into(),
-            cmd: Some("kimi".into()),
-            permission_bypass_cmd: Some("kimi --yolo".into()),
-            launch_strategy: None,
-            text_mode: "paste-buffer".into(),
-            submit_keys: "Enter".into(),
-            submit_after_text: true,
-            prompt_indicator: ">".into(),
-            busy_indicators: vec![
-                "Working".into(),
-                "Running".into(),
-                "ctrl+c: cancel".into(),
-                "ctrl-s to steer".into(),
-                "to edit".into(),
-            ],
-            startup_dismiss: Some(StartupDismiss {
-                policy: "skip-update".into(),
-                key: None,
-                triggers: vec!["Kimi Code Update Available".into()],
-            }),
-            approve_keys: "y Enter".into(),
-            reject_keys: "n Enter".into(),
-            cancel_keys: "C-c".into(),
-            escape_keys: "Escape".into(),
-        },
-    );
-
-    registry.insert(
-        "codex".into(),
-        CliProfile {
-            name: "codex".into(),
-            cmd: Some("codex".into()),
-            permission_bypass_cmd: Some("codex --dangerously-bypass-approvals-and-sandbox".into()),
-            launch_strategy: None,
-            text_mode: "paste-buffer".into(),
-            submit_keys: "Enter".into(),
-            submit_after_text: true,
-            prompt_indicator: "›".into(),
-            busy_indicators: vec!["• Working".into()],
-            startup_dismiss: Some(StartupDismiss {
-                policy: "skip-update".into(),
-                key: None,
-                triggers: vec!["Update now".into()],
-            }),
-            approve_keys: "y Enter".into(),
-            reject_keys: "n Enter".into(),
-            cancel_keys: "C-c".into(),
-            escape_keys: "Escape".into(),
-        },
-    );
-
-    registry.insert(
-        "claude".into(),
-        CliProfile {
-            name: "claude".into(),
-            cmd: Some("claude".into()),
-            permission_bypass_cmd: Some("claude --dangerously-skip-permissions".into()),
-            launch_strategy: None,
-            text_mode: "literal-keys".into(),
-            submit_keys: "Enter".into(),
-            submit_after_text: true,
-            prompt_indicator: "❯".into(),
-            busy_indicators: vec!["Thinking".into(), "Working".into(), "Running".into()],
-            startup_dismiss: Some(StartupDismiss {
-                policy: "custom-keys".into(),
-                key: Some("Escape".into()),
-                triggers: vec![
-                    "Update available".into(),
-                    "Claude Code Update Available".into(),
-                    "A new version of Claude Code is available".into(),
-                ],
-            }),
-            approve_keys: "y Enter".into(),
-            reject_keys: "n Enter".into(),
-            cancel_keys: "C-c".into(),
-            escape_keys: "Escape".into(),
-        },
-    );
-
-    registry.insert("generic".into(), CliProfile::default());
-
-    registry
-}
-
-pub fn default_profiles() -> ProfileRegistry {
-    Arc::new(RwLock::new(default_profile_map()))
-}
-
-fn load_profile_overlay(
-    name: &str,
-    value: &toml::Value,
-    base: Option<CliProfile>,
-) -> Result<CliProfile, String> {
-    let mut merged = match base {
-        Some(profile) => toml::Value::try_from(profile)
-            .map_err(|error| format!("serialize built-in profile '{}': {}", name, error))?,
-        None => toml::Value::Table(toml::Table::new()),
-    };
-    merge_toml_value(&mut merged, value.clone());
-    let mut profile: CliProfile = merged
-        .try_into()
-        .map_err(|error| format!("profile '{}': {}", name, error))?;
-    if profile.name.is_empty() {
-        profile.name = name.to_owned();
-    }
-    validate_profile(&profile)?;
-    Ok(profile)
-}
-
-fn validate_profile(profile: &CliProfile) -> Result<(), String> {
-    if let Some(dismiss) = profile.startup_dismiss.as_ref() {
-        match dismiss.policy.as_str() {
-            "skip-update" | "update-now" => {
-                if dismiss.key.is_some() {
-                    return Err(format!(
-                        "profile '{}' startup_dismiss policy '{}' does not accept key; use policy 'custom-keys' for literal key sequences",
-                        profile.name, dismiss.policy
-                    ));
-                }
-            }
-            "custom-keys" => {
-                if dismiss
-                    .key
-                    .as_deref()
-                    .map(str::trim)
-                    .unwrap_or_default()
-                    .is_empty()
-                {
-                    return Err(format!(
-                        "profile '{}' startup_dismiss policy 'custom-keys' requires key",
-                        profile.name
-                    ));
-                }
-            }
-            other => {
-                return Err(format!(
-                    "profile '{}' uses unsupported startup_dismiss policy '{}'",
-                    profile.name, other
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
-fn merge_toml_value(base: &mut toml::Value, overlay: toml::Value) {
-    match (base, overlay) {
-        (toml::Value::Table(base), toml::Value::Table(overlay)) => {
-            for (key, value) in overlay {
-                match base.get_mut(&key) {
-                    Some(existing) => merge_toml_value(existing, value),
-                    None => {
-                        base.insert(key, value);
-                    }
-                }
-            }
-        }
-        (base, overlay) => *base = overlay,
-    }
-}
-
 pub fn detect_compression(bytes: &[u8]) -> Option<String> {
     if bytes.len() < 2 {
         return None;
@@ -1658,7 +1417,6 @@ mod tests {
             client_cert: None,
             client_key: None,
             poll_interval_ms: 500,
-            node_config: None,
             store_path: None,
             tmux_config: Some(PathBuf::from("tmux.local.conf")),
             sandbox_name: Some("mmux-node".into()),
@@ -1723,46 +1481,6 @@ mod tests {
     }
 
     #[test]
-    fn load_profiles_from_config_overlays_built_in_profiles() {
-        let dir = std::env::temp_dir();
-        let path = dir.join(format!(
-            "mmux-coder-profile-test-{}.toml",
-            std::process::id()
-        ));
-        std::fs::write(
-            &path,
-            r#"
-[coder_profile.codex]
-prompt_indicator = "codex ready"
-"#,
-        )
-        .unwrap();
-
-        let profiles = load_profiles_from_config(path.to_str().unwrap()).unwrap();
-        let profile = get_profile(&profiles, "codex").expect("profile loaded");
-        assert_eq!(profile.name, "codex");
-        assert_eq!(profile.cmd.as_deref(), Some("codex"));
-        assert_eq!(profile.prompt_indicator, "codex ready");
-        assert!(profile
-            .busy_indicators
-            .iter()
-            .any(|marker| marker == "• Working"));
-
-        let _ = std::fs::remove_file(path);
-    }
-
-    #[test]
-    fn root_mmux_example_config_parses() {
-        let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let config_path = manifest_dir.join("../..").join("mmux.toml.example");
-
-        let profiles = load_profiles_from_config(config_path.to_str().unwrap()).unwrap();
-
-        assert!(get_profile(&profiles, "codex").is_some());
-        assert!(get_profile(&profiles, "kimi").is_some());
-    }
-
-    #[test]
     fn default_profiles_include_tuned_coder_profiles() {
         let profiles = default_profiles();
 
@@ -1777,9 +1495,10 @@ prompt_indicator = "codex ready"
 
         let kimi = get_profile(&profiles, "kimi").expect("kimi profile");
         assert_eq!(kimi.cmd.as_deref(), Some("kimi"));
-        let kimi_dismiss = kimi.startup_dismiss.expect("kimi startup dismiss");
-        assert_eq!(kimi_dismiss.policy, "skip-update");
-        assert_eq!(kimi_dismiss.key, None);
+        assert_eq!(
+            profiles::startup_dismiss_key("Kimi Code Update Available", &kimi),
+            Some("Down Enter".into())
+        );
         assert!(kimi
             .busy_indicators
             .iter()
@@ -1794,13 +1513,10 @@ prompt_indicator = "codex ready"
             codex.permission_bypass_cmd.as_deref(),
             Some("codex --dangerously-bypass-approvals-and-sandbox")
         );
-        let codex_dismiss = codex.startup_dismiss.expect("codex startup dismiss");
-        assert_eq!(codex_dismiss.policy, "skip-update");
-        assert_eq!(codex_dismiss.key, None);
-        assert!(codex_dismiss
-            .triggers
-            .iter()
-            .any(|trigger| trigger == "Update now"));
+        assert_eq!(
+            profiles::startup_dismiss_key("✨ Update available!\n› 1. Update now", &codex),
+            Some("Down Enter".into())
+        );
 
         let claude = get_profile(&profiles, "claude").expect("claude profile");
         assert_eq!(claude.cmd.as_deref(), Some("claude"));

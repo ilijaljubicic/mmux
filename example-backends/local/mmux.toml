@@ -1,7 +1,0 @@
-# Local mode uses built-in coder profiles from code.
-#
-# This file is optional. Add [coder_profile.<name>] sections only when you need
-# local profile overlays. Omitted fields keep built-in values; scalar/list
-# fields that you set replace the built-in value.
-#
-# See ../../mmux.toml.example for copyable examples.

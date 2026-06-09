@@ -61,13 +61,13 @@ The MCP endpoint is:
 http://127.0.0.1:3000/mcp
 ```
 
-Register that HTTP MCP server with Codex:
+Register that HTTP MCP server with codex:
 
 ```bash
 codex mcp add mmux --url http://127.0.0.1:3000/mcp
 ```
 
-Register it with Claude Code:
+Register it with claude code:
 
 ```bash
 claude mcp add --transport http mmux http://127.0.0.1:3000/mcp
@@ -81,7 +81,7 @@ export MMUX_MCP_TOKEN="$(openssl rand -hex 32)"
 npx --yes @mmux/mmux controller --enable-local-node --mcp-token-env MMUX_MCP_TOKEN
 ```
 
-In another shell with `MMUX_MCP_TOKEN` set, register Codex:
+In another shell with `MMUX_MCP_TOKEN` set, register codex:
 
 ```bash
 codex mcp add mmux \
@@ -89,7 +89,7 @@ codex mcp add mmux \
   --bearer-token-env-var MMUX_MCP_TOKEN
 ```
 
-Register Claude Code by adding the bearer header:
+Register claude code by adding the bearer header:
 
 ```bash
 claude mcp add --transport http mmux http://127.0.0.1:3000/mcp \
@@ -319,7 +319,6 @@ Important controller flags:
 
 | Flag | Default | Purpose |
 | ---- | ------- | ------- |
-| `--node-config` | `mmux.toml` in the current directory, then built-ins | Loads coder profile overlays. |
 | `--host` | loopback interface | Bind host for the HTTP server. |
 | `--port` | `3000` | Bind port. |
 | `--mcp-token` | `MMUX_MCP_TOKEN` | Bearer token for public MCP requests. |
@@ -336,6 +335,8 @@ Important controller flags:
 | `--allow-unauthenticated-node-wire` | false | Allows node wire RPC without bearer auth and ignores `MMUX_WIRE_TOKEN`; mutually exclusive with explicit wire token flags. |
 | `--store-path` | `~/.mmux` | Local runtime state directory. The embedded local tmux socket is a deterministic short runtime path derived from this store path. |
 | `--tmux-config` | tmux default discovery | Local tmux config file for `--enable-local-node`; invalid without the embedded local node. |
+| `--enabled-coder-profiles` | all built-ins | Comma-separated MCP coder profile allowlist, for example `codex,claude`. |
+| `--default-coder-profile` | first enabled built-in in canonical order | Default coder profile used when profile-aware tools omit `profile`. Must be enabled. |
 | `--enable-local-node` | false | Starts the built-in local tmux node in-process. |
 | `--enable-microsandbox-node` | false | Attaches an embedded Microsandbox node in-process. Requires `--sandbox-name` for an existing running sandbox. |
 | `--sandbox-name` | none | Existing running Microsandbox sandbox name used with `--enable-microsandbox-node`. |
@@ -354,7 +355,6 @@ Important node flags:
 | `--client-cert` | none | PEM certificate chain to present for node wire mTLS. |
 | `--client-key` | none | PEM private key to present for node wire mTLS. |
 | `--poll-interval-ms` | `500` | Command polling interval. |
-| `--node-config` | none | Profile TOML loaded by the node process. |
 | `--store-path` | `~/.mmux` | Local backend runtime state directory. The local tmux socket is a deterministic short runtime path derived from this store path. |
 | `--tmux-config` | tmux default discovery | Local tmux config file for `--backend local`; invalid with `--backend microsandbox`. |
 
@@ -474,61 +474,34 @@ See `MTSL.md` for OpenSSL commands.
 
 ## Coder Profiles
 
-Coder profiles are built into mmux for common coding CLIs, so local mode works
-without a profile TOML file. If you provide `[coder_profile.<name>]` sections
-through `--node-config` or `mmux.toml` in the current directory, those sections
-overlay the built-ins. Omitted fields keep their built-in values.
+Coder profiles are built into mmux as canonical Rust adapters. There is no
+profile TOML overlay and no runtime profile loading. Supported profiles are:
 
-Use TOML only for intentional changes:
+- `codex`
+- `opencode`
+- `kimi`
+- `claude`
 
-- backend-agnostic profile tweaks, such as changing a command or prompt marker;
-- new custom profiles.
+Each built-in profile owns its launch command, prompt submission mode,
+readiness markers, startup/update handling, blocking-confirmation detection,
+compact-read filtering, and approve/reject/cancel/escape keys. Use
+`list_coder_profiles` to inspect the public metadata for the enabled built-ins.
+By default every built-in profile is enabled; pass `--enabled-coder-profiles`
+with a comma-separated list such as `codex,claude` to expose only that subset
+through MCP profile listing, profile resources, and profile-aware tools. When a
+profile-aware tool omits `profile`, mmux uses `--default-coder-profile` if set,
+otherwise the first enabled built-in profile in canonical order: `codex`,
+`opencode`, `kimi`, then `claude`.
 
-Nested tables merge with the built-in profile. Scalar and list fields replace
-the built-in value, so do not copy full profile definitions unless you want to
-own every copied field. See `mmux.toml.example` and
-the backend examples for copyable examples.
+Prompt submission is profile-aware. codex, kimi, and opencode sessions use tmux
+paste buffers by default. claude uses literal key input followed by a real
+Enter keypress because its Ink-based text box handles pasted newlines
+differently from actual keypresses.
 
-The fields shown here are the backend-agnostic profile shape: they describe how
-mmux launches and drives a CLI once a node has the CLI available.
-
-Backend-agnostic override example:
-
-```toml
-# Only this field changes. The rest of the built-in codex profile remains
-# unchanged.
-[coder_profile.codex]
-cmd = "codex --model gpt-5"
-permission_bypass_cmd = "codex --model gpt-5 --dangerously-bypass-approvals-and-sandbox"
-```
-
-Most profiles use the default direct launch strategy, which starts the CLI as
-the tmux session command. TUIs that need to be started from an interactive shell
-can set `launch_strategy = "shell_send"`; mmux then starts `bash` and sends
-`cmd` followed by Enter before waiting for the prompt marker.
-
-Prompt submission is also profile-aware. `text_mode = "paste-buffer"` is the
-default and preserves the current Codex-style behavior: mmux writes the prompt
-to a tmux paste buffer, pastes it into the pane, then sends `submit_keys`.
-`text_mode = "literal-keys"` sends the prompt with literal tmux key input
-(`send-keys -l`) and then sends `submit_keys` as real keypresses. Claude Code
-uses `literal-keys` because its Ink-based text box treats pasted newlines
-differently from an actual Enter keypress.
-
-```toml
-[coder_profile.claude]
-text_mode = "literal-keys"
-submit_keys = "Enter"
-submit_after_text = true
-```
-
-`permission_bypass_cmd` is optional and only used when `start_coding_session`
-receives `bypass_permissions = true`. Normal sessions always use `cmd`. This
-keeps approval/sandbox bypass modes an explicit per-session choice. Built-in
-profiles define `permission_bypass_cmd` only for CLIs whose local help exposes a
-clear bypass flag.
-
-Profiles can also be loaded at runtime with the `load_profile` MCP tool.
+`permission_bypass_cmd` is only used when `start_coding_session` receives
+`bypass_permissions = true`. Normal sessions always use the profile's normal
+command. Built-in profiles define permission bypass only for CLIs whose local
+help exposes a clear bypass flag.
 
 ## Sessions
 
@@ -734,14 +707,13 @@ Profile-aware coding tools:
 
 | Tool | Purpose |
 | ---- | ------- |
-| `list_coder_profiles` | List loaded coder profiles. |
+| `list_coder_profiles` | List enabled built-in coder profiles. |
 | `start_coding_session` | Create or adopt a CLI session from its profile command, or from `permission_bypass_cmd` when `bypass_permissions = true`; returns without waiting for readiness. Optional task metadata records a `SessionRecord`. |
 | `coding_send` | Send a prompt to a coding CLI; rejects blank prompts and placeholder strings such as `null` or `undefined`. |
 | `coding_task_send` | Send an initial task-scoped prompt by rendering task context from orchestration state with template `task`, `validate`, `review`, or `quality-guard`, then appending the provided instruction. The template selects the operating mode; the instruction supplies the concrete focus. |
 | `coding_read` | Read recent CLI output through profile-aware compaction by default; pass `raw = true` for the full tmux pane text. |
 | `coding_action` | Send `approve`, `reject`, `cancel`, `escape`, or `dismiss`. |
 | `check_state` | Non-blocking JSON state check with `has_prompt`, `promptable`, `busy`, and `turn_idle`. |
-| `load_profile` | Load a profile from inline TOML or a file. |
 
 `wait_start`, `wait_status`, and `wait_cancel` are the canonical orchestration
 wait API. Wait jobs are runtime-only in v1 and are not persisted to SQLite.
@@ -753,8 +725,8 @@ do not block `coding_read`, `check_state`, `capture_output`, or
 `coding_action`. Use `kind = "coding-ready"` with `profile` to wait until the
 current foreground turn is idle for the requested stability window.
 `check_state.promptable=true` means the CLI can accept text; it does not prove
-the current turn is finished. For Codex, the prompt can be visible while
-`busy=true` and `turn_idle=false`, because Codex may accept steering text while
+the current turn is finished. For codex, the prompt can be visible while
+`busy=true` and `turn_idle=false`, because codex may accept steering text while
 active work is still running.
 
 Orchestration tools:
@@ -841,11 +813,11 @@ Request and output limits are configurable with `--max-read-bytes`,
 ├── src/main.rs
 ├── crates/
 │   ├── mmux-controller/       # MCP server, auth, policy, node registry
-│   ├── mmux-node/             # tmux/filesystem adapter and profile loader
+│   ├── mmux-node/             # tmux/filesystem adapter and built-in profiles
 │   ├── mmux-shared/           # shared profile and file DTOs
 │   └── mmux-wire/             # ConnectRPC/Buffa wire schema and generated code
 ├── example-backends/
-│   ├── local/                 # local profile config
+│   ├── local/                 # local backend README
 │   └── microsandbox/          # sandbox config, scripts, assets, README
 └── Makefile
 ```
@@ -863,8 +835,7 @@ The canonical controller/node wire schema lives in
 
 ## Backend Layout
 
-- Local mode uses built-in coder profiles by default.
-- `mmux.toml.example` shows optional local/node profile overlays.
+- Local mode uses canonical built-in coder profiles.
 - `example-backends/microsandbox/` shows how to prepare a local Microsandbox
   runtime and attach mmux to it.
 

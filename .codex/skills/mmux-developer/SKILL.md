@@ -29,10 +29,10 @@ orchestration state, and local/remote backends.
 - Keep task orchestration simple in v1. Prefer strings for descriptive role,
   kind, and skill metadata unless the value controls runtime authority.
 - When adding MCP tools, update schema, handler, tests, README, `AGENTS.md`,
-  and relevant Codex skills/recipes in the same change.
-- When changing coder profile behavior, consider Codex, Claude Code, Kimi,
-  opencode, and generic profiles. Profile-specific behavior should live in
-  profile config or profile-aware helpers, not scattered special cases.
+  and relevant codex skills/recipes in the same change.
+- When changing coder profile behavior, consider codex, claude, kimi, and
+  opencode profiles. Profile-specific behavior should live in
+  canonical built-in profile modules, not scattered special cases.
 
 ## Code Areas
 
@@ -126,13 +126,13 @@ For coder prompt paths, verify:
 
 - complex text containing quotes, apostrophes, backticks, and fenced code is
   submitted correctly;
-- profile-specific submit behavior works for Codex and Claude Code when
+- profile-specific submit behavior works for codex and claude when
   relevant;
 - `coding_send` returns quickly and long work is tracked with
   `wait_start(kind="coding-ready")`, `wait_status`, and `coding_read`.
 - `coding_read` compact output removes profile chrome while `raw=true` still
   returns the full pane when needed.
-- blocking confirmation screens, such as Claude bypass-permissions prompts, are
+- blocking confirmation screens, such as claude bypass-permissions prompts, are
   not reported as promptable or turn-idle.
 
 Always stop the smoke controller and remove the temporary store afterwards.
