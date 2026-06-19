@@ -7,6 +7,9 @@ use uuid::Uuid;
 pub struct ProjectId(pub String);
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
+pub struct PlanId(pub String);
+
+#[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
 pub struct TaskId(pub String);
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, Serialize, Deserialize)]
@@ -20,7 +23,7 @@ pub struct Project {
     pub id: ProjectId,
     pub slug: String,
     pub title: String,
-    pub description: Option<String>,
+    pub description: String,
     pub status: ProjectStatus,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
@@ -33,33 +36,88 @@ pub enum ProjectStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct Plan {
+    pub id: PlanId,
+    pub project_id: ProjectId,
+    pub slug: String,
+    pub title: String,
+    pub brief: String,
+    pub status: PlanStatus,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub completed_at_ms: Option<u64>,
+    pub outcome: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash, Serialize, Deserialize)]
+pub enum PlanStatus {
+    Backlog,
+    Planned,
+    Running,
+    WaitingForValidation,
+    Blocked,
+    Failed,
+    Passed,
+    Delivered,
+    Canceled,
+}
+
+impl PlanStatus {
+    pub const ALL: [Self; 9] = [
+        Self::Backlog,
+        Self::Planned,
+        Self::Running,
+        Self::WaitingForValidation,
+        Self::Blocked,
+        Self::Failed,
+        Self::Passed,
+        Self::Delivered,
+        Self::Canceled,
+    ];
+
+    pub fn is_finished(self) -> bool {
+        matches!(self, Self::Delivered | Self::Canceled | Self::Failed)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct Task {
     pub id: TaskId,
-    pub project_id: ProjectId,
+    pub plan_id: PlanId,
     pub slug: String,
     pub title: String,
     pub objective: String,
     pub scope: TaskScope,
-    pub owner: Option<TaskParticipant>,
     pub status: TaskStatus,
-    pub agents: Vec<TaskAgent>,
+    pub session: Option<TaskSession>,
     pub gates: Vec<String>,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
     pub completed_at_ms: Option<u64>,
-    pub summary: Option<String>,
+    pub outcome: Option<String>,
     pub blockers: Vec<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct TaskAgent {
-    pub kind: String,
+pub struct TaskSession {
+    pub node_id: NodeId,
+    pub session: SessionId,
+    pub profile: String,
+    pub workspace_path: String,
+    pub bypass_permissions: bool,
     pub role: String,
+    pub kind: String,
     pub skills: Vec<String>,
-    pub workspace_path: Option<String>,
-    pub objective: Option<String>,
-    pub prompt: String,
+    pub created_at_ms: u64,
+    pub updated_at_ms: u64,
+    pub last_seen_ms: u64,
+}
+
+impl TaskSession {
+    pub fn key(&self) -> String {
+        session_key(&self.node_id, &self.session)
+    }
 }
 
 #[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
@@ -102,17 +160,6 @@ impl TaskStatus {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-pub struct TaskParticipant {
-    pub node_id: NodeId,
-    pub session: SessionId,
-    pub profile: String,
-    pub role: String,
-    pub kind: String,
-    pub skills: Vec<String>,
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct TaskEdge {
     pub from: TaskId,
     pub to: TaskId,
@@ -135,32 +182,9 @@ pub enum TaskEdgeKind {
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub struct SessionRecord {
-    pub node_id: NodeId,
-    pub session: SessionId,
-    pub profile: String,
-    pub workspace_path: Option<String>,
-    pub bypass_permissions: bool,
-    pub task_ids: Vec<TaskId>,
-    pub role: String,
-    pub kind: String,
-    pub skills: Vec<String>,
-    pub objective: Option<String>,
-    pub created_at_ms: u64,
-    pub updated_at_ms: u64,
-    pub last_seen_ms: u64,
-}
-
-impl SessionRecord {
-    pub fn key(&self) -> String {
-        session_key(&self.node_id, &self.session)
-    }
-}
-
-#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct OrchestrationStatus {
     pub projects: Vec<ProjectSummary>,
+    pub plans: Vec<PlanSummary>,
     pub tasks: Vec<TaskSummary>,
     pub task_edges: Vec<TaskEdgeSummary>,
     pub sessions: Vec<SessionSummary>,
@@ -175,8 +199,26 @@ pub struct ProjectSummary {
     pub id: ProjectId,
     pub slug: String,
     pub title: String,
-    pub description: Option<String>,
+    pub description: String,
     pub status: ProjectStatus,
+    pub plan_count: usize,
+    pub active_plan_count: usize,
+    pub plan_status_counts: BTreeMap<PlanStatus, usize>,
+    pub task_count: usize,
+    pub active_task_count: usize,
+    pub task_status_counts: BTreeMap<TaskStatus, usize>,
+    pub updated_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PlanSummary {
+    pub id: PlanId,
+    pub project_id: ProjectId,
+    pub slug: String,
+    pub title: String,
+    pub status: PlanStatus,
+    pub outcome: Option<String>,
     pub task_count: usize,
     pub active_task_count: usize,
     pub task_status_counts: BTreeMap<TaskStatus, usize>,
@@ -187,13 +229,12 @@ pub struct ProjectSummary {
 #[serde(deny_unknown_fields)]
 pub struct TaskSummary {
     pub id: TaskId,
-    pub project_id: ProjectId,
+    pub plan_id: PlanId,
     pub slug: String,
     pub title: String,
     pub status: TaskStatus,
-    pub summary: Option<String>,
-    pub owner: Option<TaskParticipant>,
-    pub agents: Vec<TaskAgent>,
+    pub outcome: Option<String>,
+    pub session: Option<TaskSession>,
     pub parent: Option<TaskId>,
     pub child_count: usize,
     pub dependency_count: usize,
@@ -219,12 +260,11 @@ pub struct SessionSummary {
     pub node_id: String,
     pub session: String,
     pub profile: String,
-    pub workspace_path: Option<String>,
+    pub workspace_path: String,
     pub bypass_permissions: bool,
-    pub task_ids: Vec<TaskId>,
+    pub task_id: TaskId,
     pub role: String,
     pub kind: String,
-    pub objective: Option<String>,
     pub last_seen_ms: Option<u64>,
     pub runtime_state: Option<String>,
 }
@@ -235,6 +275,14 @@ pub struct OrchestrationCounts {
     pub total_projects: usize,
     pub active_projects: usize,
     pub archived_projects: usize,
+    pub total_plans: usize,
+    pub active_plans: usize,
+    pub blocked_plans: usize,
+    pub waiting_for_validation_plans: usize,
+    pub passed_plans: usize,
+    pub delivered_plans: usize,
+    pub failed_plans: usize,
+    pub canceled_plans: usize,
     pub total_tasks: usize,
     pub active_tasks: usize,
     pub blocked_tasks: usize,
@@ -259,9 +307,10 @@ pub struct SessionCleanupCandidate {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct OrchestrationState {
     pub projects: HashMap<ProjectId, Project>,
+    pub plans: HashMap<PlanId, Plan>,
     pub tasks: HashMap<TaskId, Task>,
     pub task_edges: Vec<TaskEdge>,
-    pub sessions: HashMap<String, SessionRecord>,
+    pub next_plan_id: u64,
     pub next_task_id: u64,
 }
 
@@ -274,13 +323,11 @@ impl Default for OrchestrationState {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateTask {
-    pub project_id: ProjectId,
+    pub plan_id: PlanId,
     pub title: String,
     pub objective: String,
     #[serde(default)]
     pub scope: TaskScope,
-    #[serde(default)]
-    pub agents: Vec<TaskAgent>,
     #[serde(default)]
     pub gates: Vec<String>,
     #[serde(default)]
@@ -291,7 +338,17 @@ pub struct CreateTask {
 #[serde(deny_unknown_fields)]
 pub struct CreateProject {
     pub title: String,
-    pub description: Option<String>,
+    pub description: String,
+    #[serde(default)]
+    pub slug: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreatePlan {
+    pub project_id: ProjectId,
+    pub title: String,
+    pub brief: String,
     #[serde(default)]
     pub slug: Option<String>,
 }
@@ -301,6 +358,22 @@ pub struct CreateProject {
 pub struct UpdateProjectStatus {
     pub project_id: ProjectId,
     pub status: ProjectStatus,
+}
+
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdatePlan {
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub brief: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdatePlanStatus {
+    pub plan_id: PlanId,
+    pub status: PlanStatus,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -323,8 +396,6 @@ pub struct UpdateTask {
     pub objective: Option<String>,
     #[serde(default)]
     pub scope: UpdateTaskScope,
-    #[serde(default)]
-    pub agents: Option<Vec<TaskAgent>>,
     #[serde(default)]
     pub gates: Option<Vec<String>>,
 }
@@ -349,9 +420,10 @@ impl OrchestrationState {
     pub fn new() -> Self {
         Self {
             projects: HashMap::new(),
+            plans: HashMap::new(),
             tasks: HashMap::new(),
             task_edges: Vec::new(),
-            sessions: HashMap::new(),
+            next_plan_id: 1,
             next_task_id: 1,
         }
     }
@@ -429,36 +501,65 @@ impl OrchestrationState {
             dependencies.dedup();
         }
 
-        let mut task_count_by_project: HashMap<ProjectId, usize> = HashMap::new();
-        let mut active_task_count_by_project: HashMap<ProjectId, usize> = HashMap::new();
-        let mut status_counts_by_project: HashMap<ProjectId, BTreeMap<TaskStatus, usize>> =
+        let mut plan_count_by_project: HashMap<ProjectId, usize> = HashMap::new();
+        let mut active_plan_count_by_project: HashMap<ProjectId, usize> = HashMap::new();
+        let mut plan_status_counts_by_project: HashMap<ProjectId, BTreeMap<PlanStatus, usize>> =
+            HashMap::new();
+        for plan in self.plans.values() {
+            *plan_count_by_project
+                .entry(plan.project_id.clone())
+                .or_default() += 1;
+            *plan_status_counts_by_project
+                .entry(plan.project_id.clone())
+                .or_insert_with(empty_plan_status_counts)
+                .entry(plan.status)
+                .or_default() += 1;
+            if !plan.status.is_finished() {
+                *active_plan_count_by_project
+                    .entry(plan.project_id.clone())
+                    .or_default() += 1;
+            }
+            if !self.projects.contains_key(&plan.project_id) {
+                warnings.push(format!(
+                    "plan '{}' references missing project '{}'",
+                    plan.id.0, plan.project_id.0
+                ));
+            }
+        }
+
+        let mut task_count_by_plan: HashMap<PlanId, usize> = HashMap::new();
+        let mut active_task_count_by_plan: HashMap<PlanId, usize> = HashMap::new();
+        let mut status_counts_by_plan: HashMap<PlanId, BTreeMap<TaskStatus, usize>> =
             HashMap::new();
         for task in self.tasks.values() {
-            *task_count_by_project
-                .entry(task.project_id.clone())
-                .or_default() += 1;
-            *status_counts_by_project
-                .entry(task.project_id.clone())
+            *task_count_by_plan.entry(task.plan_id.clone()).or_default() += 1;
+            *status_counts_by_plan
+                .entry(task.plan_id.clone())
                 .or_insert_with(empty_task_status_counts)
                 .entry(task.status)
                 .or_default() += 1;
             if !task.status.is_finished() {
-                *active_task_count_by_project
-                    .entry(task.project_id.clone())
+                *active_task_count_by_plan
+                    .entry(task.plan_id.clone())
                     .or_default() += 1;
             }
-            if !self.projects.contains_key(&task.project_id) {
+            if !self.plans.contains_key(&task.plan_id) {
                 warnings.push(format!(
-                    "task '{}' references missing project '{}'",
-                    task.id.0, task.project_id.0
+                    "task '{}' references missing plan '{}'",
+                    task.id.0, task.plan_id.0
                 ));
             }
         }
 
         let mut counts = OrchestrationCounts {
             total_projects: self.projects.len(),
+            total_plans: self.plans.len(),
             total_tasks: self.tasks.len(),
-            durable_session_records: self.sessions.len(),
+            durable_session_records: self
+                .tasks
+                .values()
+                .filter(|task| task.session.is_some())
+                .count(),
             ..OrchestrationCounts::default()
         };
         let mut projects = self
@@ -487,23 +588,106 @@ impl OrchestrationState {
                     title: project.title.clone(),
                     description: project.description.clone(),
                     status: project.status,
-                    task_count: task_count_by_project
+                    plan_count: plan_count_by_project
                         .get(&project.id)
                         .copied()
                         .unwrap_or_default(),
-                    active_task_count: active_task_count_by_project
+                    active_plan_count: active_plan_count_by_project
                         .get(&project.id)
                         .copied()
                         .unwrap_or_default(),
-                    task_status_counts: status_counts_by_project
+                    plan_status_counts: plan_status_counts_by_project
                         .get(&project.id)
                         .cloned()
-                        .unwrap_or_else(empty_task_status_counts),
+                        .unwrap_or_else(empty_plan_status_counts),
+                    task_count: self
+                        .plans
+                        .values()
+                        .filter(|plan| plan.project_id == project.id)
+                        .map(|plan| {
+                            task_count_by_plan
+                                .get(&plan.id)
+                                .copied()
+                                .unwrap_or_default()
+                        })
+                        .sum(),
+                    active_task_count: self
+                        .plans
+                        .values()
+                        .filter(|plan| plan.project_id == project.id)
+                        .map(|plan| {
+                            active_task_count_by_plan
+                                .get(&plan.id)
+                                .copied()
+                                .unwrap_or_default()
+                        })
+                        .sum(),
+                    task_status_counts: task_status_counts_for_project(
+                        &project.id,
+                        &self.plans,
+                        &status_counts_by_plan,
+                    ),
                     updated_at_ms: project.updated_at_ms,
                 }
             })
             .collect::<Vec<_>>();
         projects.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+
+        let mut plans = self
+            .plans
+            .values()
+            .map(|plan| {
+                if plan.created_at_ms > now_ms {
+                    warnings.push(format!("plan '{}' has a future created_at_ms", plan.id.0));
+                }
+                if plan.updated_at_ms > now_ms {
+                    warnings.push(format!("plan '{}' has a future updated_at_ms", plan.id.0));
+                }
+                if plan
+                    .completed_at_ms
+                    .is_some_and(|completed_at_ms| completed_at_ms > now_ms)
+                {
+                    warnings.push(format!("plan '{}' has a future completed_at_ms", plan.id.0));
+                }
+                if !plan.status.is_finished() {
+                    counts.active_plans += 1;
+                }
+                if plan.status == PlanStatus::Blocked {
+                    counts.blocked_plans += 1;
+                }
+                match plan.status {
+                    PlanStatus::WaitingForValidation => counts.waiting_for_validation_plans += 1,
+                    PlanStatus::Passed => counts.passed_plans += 1,
+                    PlanStatus::Delivered => counts.delivered_plans += 1,
+                    PlanStatus::Failed => counts.failed_plans += 1,
+                    PlanStatus::Canceled => counts.canceled_plans += 1,
+                    _ => {}
+                }
+                PlanSummary {
+                    id: plan.id.clone(),
+                    project_id: plan.project_id.clone(),
+                    slug: plan.slug.clone(),
+                    title: plan.title.clone(),
+                    status: plan.status,
+                    outcome: plan.outcome.clone(),
+                    task_count: task_count_by_plan
+                        .get(&plan.id)
+                        .copied()
+                        .unwrap_or_default(),
+                    active_task_count: active_task_count_by_plan
+                        .get(&plan.id)
+                        .copied()
+                        .unwrap_or_default(),
+                    task_status_counts: status_counts_by_plan
+                        .get(&plan.id)
+                        .cloned()
+                        .unwrap_or_else(empty_task_status_counts),
+                    updated_at_ms: plan.updated_at_ms,
+                }
+            })
+            .collect::<Vec<_>>();
+        plans.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+
         let mut tasks: Vec<TaskSummary> = self
             .tasks
             .values()
@@ -556,13 +740,12 @@ impl OrchestrationState {
 
                 TaskSummary {
                     id: task.id.clone(),
-                    project_id: task.project_id.clone(),
+                    plan_id: task.plan_id.clone(),
                     slug: task.slug.clone(),
                     title: task.title.clone(),
                     status: task.status,
-                    summary: task.summary.clone(),
-                    owner: task.owner.clone(),
-                    agents: task.agents.clone(),
+                    outcome: task.outcome.clone(),
+                    session: task.session.clone(),
                     parent: parent_by_child
                         .get(&task.id)
                         .and_then(|parents| parents.first().cloned()),
@@ -611,16 +794,11 @@ impl OrchestrationState {
         });
 
         let mut sessions = self
-            .sessions
-            .iter()
-            .map(|(key, session)| {
+            .tasks
+            .values()
+            .filter_map(|task| {
+                let session = task.session.as_ref()?;
                 let expected_key = session.key();
-                if key != &expected_key {
-                    warnings.push(format!(
-                        "session record key '{}' does not match node/session '{}'",
-                        key, expected_key
-                    ));
-                }
                 if session.created_at_ms > now_ms {
                     warnings.push(format!(
                         "session '{}' has a future created_at_ms",
@@ -640,31 +818,18 @@ impl OrchestrationState {
                     ));
                 }
 
-                let mut task_ids = session.task_ids.clone();
-                task_ids.sort_by(|left, right| left.0.cmp(&right.0));
-                task_ids.dedup();
-                for task_id in &task_ids {
-                    if !self.tasks.contains_key(task_id) {
-                        warnings.push(format!(
-                            "session '{}' references missing task '{}'",
-                            expected_key, task_id.0
-                        ));
-                    }
-                }
-
-                SessionSummary {
+                Some(SessionSummary {
                     node_id: session.node_id.0.clone(),
                     session: session.session.0.clone(),
                     profile: session.profile.clone(),
                     workspace_path: session.workspace_path.clone(),
                     bypass_permissions: session.bypass_permissions,
-                    task_ids,
+                    task_id: task.id.clone(),
                     role: session.role.clone(),
                     kind: session.kind.clone(),
-                    objective: session.objective.clone(),
                     last_seen_ms: Some(session.last_seen_ms),
                     runtime_state: None,
-                }
+                })
             })
             .collect::<Vec<_>>();
         sessions.sort_by(|left, right| {
@@ -680,6 +845,7 @@ impl OrchestrationState {
 
         OrchestrationStatus {
             projects,
+            plans,
             tasks,
             task_edges,
             sessions,
@@ -692,6 +858,9 @@ impl OrchestrationState {
     pub fn create_project(&mut self, input: CreateProject, now_ms: u64) -> Result<Project, String> {
         if input.title.trim().is_empty() {
             return Err("project title must not be empty".into());
+        }
+        if input.description.trim().is_empty() {
+            return Err("project description must not be empty".into());
         }
         let id = ProjectId(Uuid::new_v4().to_string());
         let base_slug = input.slug.as_deref().unwrap_or(&input.title);
@@ -724,9 +893,90 @@ impl OrchestrationState {
         Ok(project.clone())
     }
 
-    pub fn create_task(&mut self, input: CreateTask, now_ms: u64) -> Result<Task, String> {
+    pub fn create_plan(&mut self, input: CreatePlan, now_ms: u64) -> Result<Plan, String> {
         if !self.projects.contains_key(&input.project_id) {
             return Err(format!("project '{}' not found", input.project_id.0));
+        }
+        if input.title.trim().is_empty() {
+            return Err("plan title must not be empty".into());
+        }
+        if input.brief.trim().is_empty() {
+            return Err("plan brief must not be empty".into());
+        }
+
+        let id = PlanId(format!("plan-{}", self.next_plan_id));
+        self.next_plan_id += 1;
+        let base_slug = input.slug.as_deref().unwrap_or(&input.title);
+        let slug = self.unique_plan_slug(&input.project_id, base_slug);
+        let plan = Plan {
+            id: id.clone(),
+            project_id: input.project_id,
+            slug,
+            title: input.title,
+            brief: input.brief,
+            status: PlanStatus::Backlog,
+            created_at_ms: now_ms,
+            updated_at_ms: now_ms,
+            completed_at_ms: None,
+            outcome: None,
+        };
+        self.plans.insert(id, plan.clone());
+        Ok(plan)
+    }
+
+    pub fn update_plan(
+        &mut self,
+        plan_id: &PlanId,
+        update: UpdatePlan,
+        now_ms: u64,
+    ) -> Result<Plan, String> {
+        if let Some(title) = update.title.as_ref() {
+            if title.trim().is_empty() {
+                return Err("plan title must not be empty".into());
+            }
+        }
+        if let Some(brief) = update.brief.as_ref() {
+            if brief.trim().is_empty() {
+                return Err("plan brief must not be empty".into());
+            }
+        }
+        let plan = self
+            .plans
+            .get_mut(plan_id)
+            .ok_or_else(|| format!("plan '{}' not found", plan_id.0))?;
+        if let Some(title) = update.title {
+            plan.title = title;
+        }
+        if let Some(brief) = update.brief {
+            plan.brief = brief;
+        }
+        plan.updated_at_ms = now_ms;
+        Ok(plan.clone())
+    }
+
+    pub fn update_plan_status(
+        &mut self,
+        plan_id: &PlanId,
+        status: PlanStatus,
+        outcome: Option<String>,
+        now_ms: u64,
+    ) -> Result<Plan, String> {
+        let plan = self
+            .plans
+            .get_mut(plan_id)
+            .ok_or_else(|| format!("plan '{}' not found", plan_id.0))?;
+        plan.status = status;
+        if let Some(outcome) = outcome {
+            plan.outcome = Some(outcome);
+        }
+        plan.updated_at_ms = now_ms;
+        plan.completed_at_ms = status.is_finished().then_some(now_ms);
+        Ok(plan.clone())
+    }
+
+    pub fn create_task(&mut self, input: CreateTask, now_ms: u64) -> Result<Task, String> {
+        if !self.plans.contains_key(&input.plan_id) {
+            return Err(format!("plan '{}' not found", input.plan_id.0));
         }
         if input.title.trim().is_empty() {
             return Err("task title must not be empty".into());
@@ -734,27 +984,25 @@ impl OrchestrationState {
         if input.objective.trim().is_empty() {
             return Err("task objective must not be empty".into());
         }
-        validate_task_agents(&input.agents)?;
 
         let id = TaskId(format!("task-{}", self.next_task_id));
         self.next_task_id += 1;
         let base_slug = input.slug.as_deref().unwrap_or(&input.title);
-        let slug = self.unique_task_slug(&input.project_id, base_slug);
+        let slug = self.unique_task_slug(&input.plan_id, base_slug);
         let task = Task {
             id: id.clone(),
-            project_id: input.project_id,
+            plan_id: input.plan_id,
             slug,
             title: input.title,
             objective: input.objective,
             scope: input.scope,
-            owner: None,
             status: TaskStatus::Backlog,
-            agents: input.agents,
+            session: None,
             gates: input.gates,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
             completed_at_ms: None,
-            summary: None,
+            outcome: None,
             blockers: Vec::new(),
         };
 
@@ -778,10 +1026,6 @@ impl OrchestrationState {
                 return Err("task objective must not be empty".into());
             }
         }
-        if let Some(agents) = update.agents.as_ref() {
-            validate_task_agents(agents)?;
-        }
-
         let task = self
             .tasks
             .get_mut(task_id)
@@ -801,9 +1045,6 @@ impl OrchestrationState {
         if let Some(notes) = update.scope.notes {
             task.scope.notes = notes;
         }
-        if let Some(agents) = update.agents {
-            task.agents = agents;
-        }
         if let Some(gates) = update.gates {
             task.gates = gates;
         }
@@ -811,26 +1052,12 @@ impl OrchestrationState {
         Ok(task.clone())
     }
 
-    pub fn assign_task(
-        &mut self,
-        task_id: &TaskId,
-        owner: TaskParticipant,
-        now_ms: u64,
-    ) -> Result<Task, String> {
-        let task = self
-            .tasks
-            .get_mut(task_id)
-            .ok_or_else(|| format!("task '{}' not found", task_id.0))?;
-        task.owner = Some(owner);
-        task.updated_at_ms = now_ms;
-        Ok(task.clone())
-    }
-
     pub fn record_session(
         &mut self,
-        mut session: SessionRecord,
+        task_id: &TaskId,
+        mut session: TaskSession,
         now_ms: u64,
-    ) -> Result<SessionRecord, String> {
+    ) -> Result<TaskSession, String> {
         if session.node_id.0.trim().is_empty() {
             return Err("session node_id must not be empty".into());
         }
@@ -840,22 +1067,30 @@ impl OrchestrationState {
         if session.profile.trim().is_empty() {
             return Err("session profile must not be empty".into());
         }
-        for task_id in &session.task_ids {
-            if !self.tasks.contains_key(task_id) {
-                return Err(format!("task '{}' not found", task_id.0));
-            }
+        if session.workspace_path.trim().is_empty() {
+            return Err("session workspace_path must not be empty".into());
         }
 
-        let key = session.key();
-        let created_at_ms = self
-            .sessions
-            .get(&key)
-            .map(|existing| existing.created_at_ms)
-            .unwrap_or(now_ms);
+        let task = self
+            .tasks
+            .get_mut(task_id)
+            .ok_or_else(|| format!("task '{}' not found", task_id.0))?;
+        let same_session = task.session.as_ref().is_some_and(|existing| {
+            existing.node_id == session.node_id && existing.session == session.session
+        });
+        let created_at_ms = if same_session {
+            task.session
+                .as_ref()
+                .map(|existing| existing.created_at_ms)
+                .unwrap_or(now_ms)
+        } else {
+            now_ms
+        };
         session.created_at_ms = created_at_ms;
         session.updated_at_ms = now_ms;
         session.last_seen_ms = now_ms;
-        self.sessions.insert(key, session.clone());
+        task.session = Some(session.clone());
+        task.updated_at_ms = now_ms;
         Ok(session)
     }
 
@@ -922,18 +1157,18 @@ impl OrchestrationState {
         if edge.from == edge.to {
             return Err("a task edge cannot point to itself".into());
         }
-        let from_project = &self
+        let from_plan = &self
             .tasks
             .get(&edge.from)
             .ok_or_else(|| format!("task '{}' not found", edge.from.0))?
-            .project_id;
-        let to_project = &self
+            .plan_id;
+        let to_plan = &self
             .tasks
             .get(&edge.to)
             .ok_or_else(|| format!("task '{}' not found", edge.to.0))?
-            .project_id;
-        if from_project != to_project {
-            return Err("task edges cannot cross project boundaries in v1".into());
+            .plan_id;
+        if from_plan != to_plan {
+            return Err("task edges cannot cross plan boundaries in v1".into());
         }
         if self.task_edges.iter().any(|existing| {
             existing.from == edge.from && existing.to == edge.to && existing.kind == edge.kind
@@ -983,26 +1218,48 @@ impl OrchestrationState {
         self.projects.values().any(|project| project.slug == slug)
     }
 
-    fn unique_task_slug(&self, project_id: &ProjectId, value: &str) -> String {
+    fn unique_plan_slug(&self, project_id: &ProjectId, value: &str) -> String {
         let base = sanitize_slug(value);
-        if !self.task_slug_exists(project_id, &base) {
+        if !self.plan_slug_exists(project_id, &base) {
             return base;
         }
 
         let mut suffix = 2;
         loop {
             let candidate = format!("{base}-{suffix}");
-            if !self.task_slug_exists(project_id, &candidate) {
+            if !self.plan_slug_exists(project_id, &candidate) {
                 return candidate;
             }
             suffix += 1;
         }
     }
 
-    fn task_slug_exists(&self, project_id: &ProjectId, slug: &str) -> bool {
+    fn plan_slug_exists(&self, project_id: &ProjectId, slug: &str) -> bool {
+        self.plans
+            .values()
+            .any(|plan| &plan.project_id == project_id && plan.slug == slug)
+    }
+
+    fn unique_task_slug(&self, plan_id: &PlanId, value: &str) -> String {
+        let base = sanitize_slug(value);
+        if !self.task_slug_exists(plan_id, &base) {
+            return base;
+        }
+
+        let mut suffix = 2;
+        loop {
+            let candidate = format!("{base}-{suffix}");
+            if !self.task_slug_exists(plan_id, &candidate) {
+                return candidate;
+            }
+            suffix += 1;
+        }
+    }
+
+    fn task_slug_exists(&self, plan_id: &PlanId, slug: &str) -> bool {
         self.tasks
             .values()
-            .any(|task| &task.project_id == project_id && task.slug == slug)
+            .any(|task| &task.plan_id == plan_id && task.slug == slug)
     }
 
     fn has_path(&self, start: &TaskId, target: &TaskId, kind: TaskEdgeKind) -> bool {
@@ -1066,7 +1323,7 @@ impl OrchestrationState {
                 .ok_or_else(|| format!("task '{}' not found", edge.to.0))?;
             if !child_status_allows_parent_delivery(child) {
                 return Err(format!(
-                    "task '{}' cannot be delivered before child '{}' is delivered, canceled, or failed with a summary",
+                    "task '{}' cannot be delivered before child '{}' is delivered, canceled, or failed with an outcome",
                     task_id.0, edge.to.0
                 ));
             }
@@ -1075,31 +1332,34 @@ impl OrchestrationState {
     }
 }
 
-fn validate_prompt_text(field: &str, prompt: &str) -> Result<(), String> {
-    let trimmed = prompt.trim();
-    if trimmed.is_empty() {
-        return Err(format!("{field} must not be empty"));
-    }
-    if matches!(trimmed, "null" | "undefined") {
-        return Err(format!(
-            "{field} must not be the placeholder string '{trimmed}'"
-        ));
-    }
-    Ok(())
-}
-
-fn validate_task_agents(agents: &[TaskAgent]) -> Result<(), String> {
-    for (index, agent) in agents.iter().enumerate() {
-        validate_prompt_text(&format!("agents[{index}].prompt"), &agent.prompt)?;
-    }
-    Ok(())
-}
-
 fn empty_task_status_counts() -> BTreeMap<TaskStatus, usize> {
     TaskStatus::ALL
         .into_iter()
         .map(|status| (status, 0))
         .collect()
+}
+
+fn empty_plan_status_counts() -> BTreeMap<PlanStatus, usize> {
+    PlanStatus::ALL
+        .into_iter()
+        .map(|status| (status, 0))
+        .collect()
+}
+
+fn task_status_counts_for_project(
+    project_id: &ProjectId,
+    plans: &HashMap<PlanId, Plan>,
+    status_counts_by_plan: &HashMap<PlanId, BTreeMap<TaskStatus, usize>>,
+) -> BTreeMap<TaskStatus, usize> {
+    let mut counts = empty_task_status_counts();
+    for plan in plans.values().filter(|plan| &plan.project_id == project_id) {
+        if let Some(plan_counts) = status_counts_by_plan.get(&plan.id) {
+            for (status, count) in plan_counts {
+                *counts.entry(*status).or_default() += count;
+            }
+        }
+    }
+    counts
 }
 
 fn session_key(node_id: &NodeId, session: &SessionId) -> String {
@@ -1117,9 +1377,9 @@ fn child_status_allows_parent_delivery(child: &Task) -> bool {
     matches!(child.status, TaskStatus::Delivered | TaskStatus::Canceled)
         || (child.status == TaskStatus::Failed
             && child
-                .summary
+                .outcome
                 .as_deref()
-                .is_some_and(|summary| !summary.trim().is_empty()))
+                .is_some_and(|outcome| !outcome.trim().is_empty()))
 }
 
 fn edge_kind_rank(kind: TaskEdgeKind) -> u8 {
@@ -1174,10 +1434,6 @@ fn sanitize_slug(value: &str) -> String {
 mod tests {
     use super::*;
     use serde::{
-        de::{
-            value::{Error as ValueError, MapDeserializer},
-            IntoDeserializer,
-        },
         ser::{Error as SerError, Impossible, SerializeStruct},
         Serialize, Serializer,
     };
@@ -1187,13 +1443,16 @@ mod tests {
         ProjectId("fixture-project".into())
     }
 
+    fn fixture_plan_id() -> PlanId {
+        PlanId("fixture-plan".into())
+    }
+
     fn create_task(title: &str) -> CreateTask {
         CreateTask {
-            project_id: fixture_project_id(),
+            plan_id: fixture_plan_id(),
             title: title.into(),
             objective: format!("Implement {title}"),
             scope: TaskScope::default(),
-            agents: Vec::new(),
             gates: Vec::new(),
             slug: None,
         }
@@ -1208,20 +1467,28 @@ mod tests {
                 id: project_id,
                 slug: "project".into(),
                 title: "Project".into(),
-                description: Some("Test project".into()),
+                description: "Test project".into(),
                 status: ProjectStatus::Active,
                 created_at_ms: 1,
                 updated_at_ms: 1,
             },
         );
+        state.plans.insert(
+            fixture_plan_id(),
+            Plan {
+                id: fixture_plan_id(),
+                project_id: fixture_project_id(),
+                slug: "plan".into(),
+                title: "Plan".into(),
+                brief: "Detailed plan brief for test tasks.".into(),
+                status: PlanStatus::Backlog,
+                created_at_ms: 1,
+                updated_at_ms: 1,
+                completed_at_ms: None,
+                outcome: None,
+            },
+        );
         state
-    }
-
-    fn create_task_with_agent(title: &str, agent: TaskAgent) -> CreateTask {
-        CreateTask {
-            agents: vec![agent],
-            ..create_task(title)
-        }
     }
 
     #[test]
@@ -1232,7 +1499,7 @@ mod tests {
             .create_project(
                 CreateProject {
                     title: "Project".into(),
-                    description: None,
+                    description: "First test project".into(),
                     slug: None,
                 },
                 100,
@@ -1242,7 +1509,7 @@ mod tests {
             .create_project(
                 CreateProject {
                     title: "Project".into(),
-                    description: None,
+                    description: "Second test project".into(),
                     slug: None,
                 },
                 101,
@@ -1256,40 +1523,16 @@ mod tests {
         assert_eq!(second.slug, "project-2");
     }
 
-    fn agent() -> TaskAgent {
-        TaskAgent {
-            kind: "codex".into(),
-            role: "implementation-worker".into(),
-            skills: vec!["rust".into()],
-            workspace_path: Some("/work".into()),
-            objective: Some("implement the task".into()),
-            prompt: "Do the focused task.".into(),
-        }
-    }
-
-    fn participant() -> TaskParticipant {
-        TaskParticipant {
+    fn session() -> TaskSession {
+        TaskSession {
             node_id: NodeId("node-a".into()),
             session: SessionId("session-a".into()),
             profile: "codex".into(),
-            role: "owner".into(),
-            kind: "codex".into(),
-            skills: vec!["rust".into()],
-        }
-    }
-
-    fn session(task_ids: Vec<TaskId>) -> SessionRecord {
-        SessionRecord {
-            node_id: NodeId("node-a".into()),
-            session: SessionId("session-a".into()),
-            profile: "codex".into(),
-            workspace_path: Some("/workspace/project".into()),
+            workspace_path: "/workspace/project".into(),
             bypass_permissions: false,
-            task_ids,
             role: "implementation-worker".into(),
             kind: "codex".into(),
             skills: vec!["rust".into()],
-            objective: Some("work on a task".into()),
             created_at_ms: 0,
             updated_at_ms: 0,
             last_seen_ms: 0,
@@ -1458,78 +1701,16 @@ mod tests {
     }
 
     #[test]
-    fn task_agent_serialization_shape_has_only_v1_fields() {
-        let fields = agent().serialize(FieldNameSerializer).unwrap();
+    fn task_creation_rejects_legacy_agents_field() {
+        let parsed = serde_json::from_value::<CreateTask>(serde_json::json!({
+            "plan_id": "fixture-plan",
+            "title": "Legacy agent task",
+            "objective": "Reject legacy agent data.",
+            "agents": []
+        }));
 
-        assert_eq!(
-            fields,
-            vec![
-                "kind",
-                "role",
-                "skills",
-                "workspace_path",
-                "objective",
-                "prompt"
-            ]
-        );
-        assert!(!fields.contains(&"count".into()));
-        assert!(!fields.contains(&"profile".into()));
-        assert!(!fields.contains(&"node".into()));
-        assert!(!fields.contains(&"bypass_permissions".into()));
-    }
-
-    #[test]
-    fn task_creation_rejects_runtime_placement_fields_in_agent_input() {
-        for forbidden_field in ["count", "profile", "node", "node_id", "bypass_permissions"] {
-            let entries = vec![
-                ("kind".into_deserializer(), "codex".into_deserializer()),
-                (
-                    "role".into_deserializer(),
-                    "implementation-worker".into_deserializer(),
-                ),
-                ("prompt".into_deserializer(), "Do it.".into_deserializer()),
-                (
-                    forbidden_field.into_deserializer(),
-                    "forbidden".into_deserializer(),
-                ),
-            ];
-            let parsed =
-                TaskAgent::deserialize(MapDeserializer::<_, ValueError>::new(entries.into_iter()));
-            let err = parsed.expect_err("accepted forbidden field");
-            assert!(
-                err.to_string().contains(forbidden_field),
-                "expected error for forbidden field {forbidden_field}, got {err}"
-            );
-        }
-    }
-
-    #[test]
-    fn task_creation_keeps_explicit_intended_agents_without_counts() {
-        let mut state = state_with_project();
-        let task = state
-            .create_task(create_task_with_agent("Agent Task", agent()), 100)
-            .unwrap();
-
-        assert_eq!(task.agents.len(), 1);
-        assert_eq!(task.agents[0].kind, "codex");
-        assert_eq!(task.agents[0].role, "implementation-worker");
-        assert_eq!(task.agents[0].prompt, "Do the focused task.");
-    }
-
-    #[test]
-    fn task_creation_rejects_empty_or_placeholder_agent_prompts() {
-        for prompt in ["", "   ", "null", " undefined "] {
-            let mut state = state_with_project();
-            let mut agent = agent();
-            agent.prompt = prompt.into();
-            let error = state
-                .create_task(create_task_with_agent("Bad Agent Prompt", agent), 100)
-                .unwrap_err();
-            assert!(
-                error.contains("agents[0].prompt"),
-                "expected agent prompt validation error for {prompt:?}, got {error}"
-            );
-        }
+        let error = parsed.expect_err("accepted legacy agents field");
+        assert!(error.to_string().contains("agents"), "{error}");
     }
 
     #[test]
@@ -1541,7 +1722,6 @@ mod tests {
             exclude_paths: vec!["target".into()],
             notes: Some("old notes".into()),
         };
-        input.agents = vec![agent()];
         input.gates = vec!["old gate".into()];
         let task = state.create_task(input, 100).unwrap();
         let related = state.create_task(create_task("Related"), 101).unwrap();
@@ -1556,15 +1736,13 @@ mod tests {
                 120,
             )
             .unwrap();
-        state
-            .record_session(session(vec![task.id.clone()]), 130)
-            .unwrap();
+        state.record_session(&task.id, session(), 130).unwrap();
         state
             .update_task_status(&task.id, TaskStatus::Failed, 140)
             .unwrap();
 
         let original_edges = state.task_edges.clone();
-        let original_sessions = state.sessions.clone();
+        let original_session = state.tasks[&task.id].session.clone();
         let updated = state
             .update_task(
                 &task.id,
@@ -1576,10 +1754,6 @@ mod tests {
                         exclude_paths: Some(Vec::new()),
                         notes: Some(Some("new notes".into())),
                     },
-                    agents: Some(vec![TaskAgent {
-                        role: "validator".into(),
-                        ..agent()
-                    }]),
                     gates: Some(vec!["new gate".into(), "second gate".into()]),
                 },
                 200,
@@ -1593,35 +1767,22 @@ mod tests {
         assert_eq!(updated.scope.include_paths, vec!["new.rs"]);
         assert!(updated.scope.exclude_paths.is_empty());
         assert_eq!(updated.scope.notes.as_deref(), Some("new notes"));
-        assert_eq!(updated.agents.len(), 1);
-        assert_eq!(updated.agents[0].role, "validator");
         assert_eq!(updated.gates, vec!["new gate", "second gate"]);
         assert_eq!(updated.status, TaskStatus::Failed);
         assert_eq!(updated.completed_at_ms, Some(140));
         assert_eq!(updated.updated_at_ms, 200);
         assert_eq!(state.task_edges, original_edges);
-        assert_eq!(state.sessions, original_sessions);
+        assert_eq!(updated.session, original_session);
     }
 
     #[test]
-    fn task_update_rejects_empty_or_placeholder_agent_prompts() {
-        let mut state = state_with_project();
-        let task = state.create_task(create_task("Task"), 100).unwrap();
-        let mut agent = agent();
-        agent.prompt = "null".into();
+    fn task_update_rejects_legacy_agents_field() {
+        let parsed = serde_json::from_value::<UpdateTask>(serde_json::json!({
+            "agents": []
+        }));
 
-        let error = state
-            .update_task(
-                &task.id,
-                UpdateTask {
-                    agents: Some(vec![agent]),
-                    ..UpdateTask::default()
-                },
-                200,
-            )
-            .unwrap_err();
-
-        assert!(error.contains("agents[0].prompt"), "{error}");
+        let error = parsed.expect_err("accepted legacy agents field");
+        assert!(error.to_string().contains("agents"), "{error}");
     }
 
     #[test]
@@ -1633,7 +1794,6 @@ mod tests {
             exclude_paths: vec!["target".into()],
             notes: Some("keep notes".into()),
         };
-        input.agents = vec![agent()];
         input.gates = vec!["gate".into()];
         let task = state.create_task(input, 100).unwrap();
 
@@ -1651,21 +1811,18 @@ mod tests {
         assert_eq!(updated.scope.include_paths, vec!["a.rs"]);
         assert_eq!(updated.scope.exclude_paths, vec!["target"]);
         assert_eq!(updated.scope.notes.as_deref(), Some("keep notes"));
-        assert_eq!(updated.agents.len(), 1);
         assert_eq!(updated.gates, vec!["gate"]);
 
         let updated = state
             .update_task(
                 &task.id,
                 UpdateTask {
-                    agents: Some(Vec::new()),
                     gates: Some(Vec::new()),
                     ..UpdateTask::default()
                 },
                 120,
             )
             .unwrap();
-        assert!(updated.agents.is_empty());
         assert!(updated.gates.is_empty());
     }
 
@@ -1734,29 +1891,49 @@ mod tests {
     }
 
     #[test]
-    fn assign_task_records_participant() {
-        let mut state = state_with_project();
-        let task = state.create_task(create_task("Assignable"), 100).unwrap();
-
-        let assigned = state.assign_task(&task.id, participant(), 150).unwrap();
-
-        assert_eq!(
-            assigned.owner.unwrap().session,
-            SessionId("session-a".into())
-        );
-        assert_eq!(assigned.updated_at_ms, 150);
-    }
-
-    #[test]
-    fn record_session_is_keyed_by_node_and_session() {
+    fn record_session_records_task_owned_runtime_placement() {
         let mut state = state_with_project();
         let task = state.create_task(create_task("Session Task"), 100).unwrap();
-        let recorded = state.record_session(session(vec![task.id]), 200).unwrap();
+        let recorded = state.record_session(&task.id, session(), 200).unwrap();
 
         assert_eq!(recorded.created_at_ms, 200);
         assert_eq!(recorded.updated_at_ms, 200);
         assert_eq!(recorded.last_seen_ms, 200);
-        assert!(state.sessions.contains_key("node-a:session-a"));
+        assert_eq!(state.tasks[&task.id].session, Some(recorded));
+        assert_eq!(state.tasks[&task.id].updated_at_ms, 200);
+    }
+
+    #[test]
+    fn record_session_refresh_preserves_created_at_ms() {
+        let mut state = state_with_project();
+        let task = state.create_task(create_task("Session Task"), 100).unwrap();
+        state.record_session(&task.id, session(), 200).unwrap();
+        let mut refresh = session();
+        refresh.role = "validator".into();
+        let recorded = state.record_session(&task.id, refresh, 300).unwrap();
+
+        assert_eq!(recorded.created_at_ms, 200);
+        assert_eq!(recorded.updated_at_ms, 300);
+        assert_eq!(recorded.last_seen_ms, 300);
+        assert_eq!(recorded.session, SessionId("session-a".into()));
+        assert_eq!(recorded.role, "validator");
+        assert_eq!(state.tasks[&task.id].session, Some(recorded));
+    }
+
+    #[test]
+    fn record_session_replaces_different_session_with_fresh_created_at_ms() {
+        let mut state = state_with_project();
+        let task = state.create_task(create_task("Session Task"), 100).unwrap();
+        state.record_session(&task.id, session(), 200).unwrap();
+        let mut replacement = session();
+        replacement.session = SessionId("session-b".into());
+        let recorded = state.record_session(&task.id, replacement, 300).unwrap();
+
+        assert_eq!(recorded.created_at_ms, 300);
+        assert_eq!(recorded.updated_at_ms, 300);
+        assert_eq!(recorded.last_seen_ms, 300);
+        assert_eq!(recorded.session, SessionId("session-b".into()));
+        assert_eq!(state.tasks[&task.id].session, Some(recorded));
     }
 
     #[test]
@@ -1766,20 +1943,19 @@ mod tests {
             .create_task(create_task("Backend Workspace"), 100)
             .unwrap();
         let backend_workspace = "/__backend_only__/project/../project";
-        let mut record = session(vec![task.id]);
-        record.workspace_path = Some(backend_workspace.into());
+        let mut record = session();
+        record.workspace_path = backend_workspace.into();
 
-        let recorded = state.record_session(record, 200).unwrap();
+        let recorded = state.record_session(&task.id, record, 200).unwrap();
 
-        assert_eq!(recorded.workspace_path.as_deref(), Some(backend_workspace));
+        assert_eq!(recorded.workspace_path, backend_workspace);
         assert_eq!(
-            state
-                .sessions
-                .get("node-a:session-a")
+            state.tasks[&task.id]
+                .session
+                .as_ref()
                 .unwrap()
-                .workspace_path
-                .as_deref(),
-            Some(backend_workspace)
+                .workspace_path,
+            backend_workspace
         );
     }
 
@@ -1951,7 +2127,7 @@ mod tests {
     }
 
     #[test]
-    fn parent_delivery_allows_canceled_or_failed_child_with_summary() {
+    fn parent_delivery_allows_canceled_or_failed_child_with_outcome() {
         let mut state = state_with_project();
         let canceled_parent = state
             .create_task(create_task("Canceled Parent"), 100)
@@ -1995,9 +2171,9 @@ mod tests {
         let err = state
             .update_task_status(&failed_parent.id, TaskStatus::Delivered, 400)
             .unwrap_err();
-        assert!(err.contains("failed with a summary"));
+        assert!(err.contains("failed with an outcome"));
 
-        state.tasks.get_mut(&failed_child.id).unwrap().summary =
+        state.tasks.get_mut(&failed_child.id).unwrap().outcome =
             Some("Operator accepted the failed child outcome.".into());
         let delivered = state
             .update_task_status(&failed_parent.id, TaskStatus::Delivered, 450)
@@ -2110,12 +2286,12 @@ mod tests {
     }
 
     #[test]
-    fn orchestration_status_includes_task_agent_prompts() {
+    fn orchestration_status_includes_task_session() {
         let mut state = state_with_project();
-        let agent = agent();
         let task = state
-            .create_task(create_task_with_agent("Agent Summary", agent.clone()), 100)
+            .create_task(create_task("Session Summary"), 100)
             .unwrap();
+        let recorded = state.record_session(&task.id, session(), 150).unwrap();
 
         let status = state.orchestration_status(200);
         let summary = status
@@ -2124,7 +2300,10 @@ mod tests {
             .find(|summary| summary.id == task.id)
             .unwrap();
 
-        assert_eq!(summary.agents, vec![agent]);
+        assert_eq!(summary.session, Some(recorded.clone()));
+        assert_eq!(status.sessions.len(), 1);
+        assert_eq!(status.sessions[0].task_id, task.id);
+        assert_eq!(status.sessions[0].session, recorded.session.0);
     }
 
     #[test]
@@ -2279,9 +2458,9 @@ mod tests {
     fn session_summary_serialization_shape_and_values_are_compact() {
         let mut state = state_with_project();
         let task = state.create_task(create_task("Session Task"), 100).unwrap();
-        let mut session = session(vec![task.id.clone()]);
+        let mut session = session();
         session.bypass_permissions = true;
-        state.record_session(session, 200).unwrap();
+        state.record_session(&task.id, session, 200).unwrap();
 
         let status = state.orchestration_status(300);
         let summary = status.sessions.first().unwrap();
@@ -2295,10 +2474,9 @@ mod tests {
                 "profile",
                 "workspace_path",
                 "bypass_permissions",
-                "task_ids",
+                "task_id",
                 "role",
                 "kind",
-                "objective",
                 "last_seen_ms",
                 "runtime_state"
             ]
@@ -2306,9 +2484,9 @@ mod tests {
         assert_eq!(summary.node_id, "node-a");
         assert_eq!(summary.session, "session-a");
         assert_eq!(summary.profile, "codex");
-        assert_eq!(summary.workspace_path, Some("/workspace/project".into()));
+        assert_eq!(summary.workspace_path, "/workspace/project");
         assert!(summary.bypass_permissions);
-        assert_eq!(summary.task_ids, vec![task.id]);
+        assert_eq!(summary.task_id, task.id);
         assert_eq!(summary.last_seen_ms, Some(200));
         assert_eq!(summary.runtime_state, None);
     }
@@ -2361,14 +2539,14 @@ mod tests {
             )
             .unwrap();
 
-        let mut session_b = session(vec![third.id.clone(), first.id.clone()]);
+        let mut session_b = session();
         session_b.node_id = NodeId("node-b".into());
         session_b.session = SessionId("session-b".into());
-        state.record_session(session_b, 250).unwrap();
-        let mut session_a = session(vec![second.id.clone()]);
+        state.record_session(&third.id, session_b, 250).unwrap();
+        let mut session_a = session();
         session_a.node_id = NodeId("node-a".into());
         session_a.session = SessionId("session-a".into());
-        state.record_session(session_a, 251).unwrap();
+        state.record_session(&second.id, session_a, 251).unwrap();
 
         let status = state.orchestration_status(300);
 
@@ -2407,6 +2585,11 @@ mod tests {
     fn orchestration_status_reports_suspicious_deserialized_state() {
         let mut state = state_with_project();
         let task = state.create_task(create_task("Task"), 100).unwrap();
+        let mut task_session = session();
+        task_session.created_at_ms = 500;
+        task_session.updated_at_ms = 500;
+        task_session.last_seen_ms = 500;
+        state.tasks.get_mut(&task.id).unwrap().session = Some(task_session);
         state.task_edges.push(TaskEdge {
             from: task.id.clone(),
             to: TaskId("missing".into()),
@@ -2414,13 +2597,6 @@ mod tests {
             created_at_ms: 200,
             note: None,
         });
-        let mut stored_session = session(vec![TaskId("missing".into())]);
-        stored_session.node_id = NodeId("node-real".into());
-        stored_session.session = SessionId("session-real".into());
-        stored_session.created_at_ms = 100;
-        stored_session.updated_at_ms = 100;
-        stored_session.last_seen_ms = 100;
-        state.sessions.insert("wrong:key".into(), stored_session);
 
         let status = state.orchestration_status(300);
 
@@ -2431,10 +2607,10 @@ mod tests {
         assert!(status
             .warnings
             .iter()
-            .any(|warning| warning.contains("does not match node/session")));
+            .any(|warning| warning.contains("future created_at_ms")));
         assert!(status
             .warnings
             .iter()
-            .any(|warning| warning.contains("references missing task 'missing'")));
+            .any(|warning| warning.contains("future last_seen_ms")));
     }
 }

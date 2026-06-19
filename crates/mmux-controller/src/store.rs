@@ -134,8 +134,8 @@ impl OrchestrationStore {
 mod tests {
     use super::*;
     use mmux_controller_core::orchestration::{
-        CreateProject, CreateTask, CreateTaskEdge, NodeId, ProjectId, SessionId, SessionRecord,
-        TaskEdgeKind, TaskId, TaskScope,
+        CreatePlan, CreateProject, CreateTask, CreateTaskEdge, NodeId, PlanId, ProjectId,
+        SessionId, TaskEdgeKind, TaskId, TaskScope, TaskSession,
     };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -148,9 +148,18 @@ mod tests {
         std::env::temp_dir().join(format!("{prefix}-{}-{unique}", std::process::id()))
     }
 
-    fn create_task(project_id: ProjectId, title: &str) -> CreateTask {
-        CreateTask {
+    fn create_plan(project_id: ProjectId) -> CreatePlan {
+        CreatePlan {
             project_id,
+            title: "Plan".into(),
+            brief: "Detailed test plan brief.".into(),
+            slug: None,
+        }
+    }
+
+    fn create_task(plan_id: PlanId, title: &str) -> CreateTask {
+        CreateTask {
+            plan_id,
             title: title.into(),
             objective: format!("Objective for {title}"),
             scope: TaskScope {
@@ -158,7 +167,6 @@ mod tests {
                 exclude_paths: vec!["target".into()],
                 notes: Some("focused scope".into()),
             },
-            agents: Vec::new(),
             gates: vec!["cargo test".into()],
             slug: None,
         }
@@ -167,23 +175,21 @@ mod tests {
     fn create_project() -> CreateProject {
         CreateProject {
             title: "Project".into(),
-            description: None,
+            description: "Store test project".into(),
             slug: None,
         }
     }
 
-    fn session(task_ids: Vec<TaskId>) -> SessionRecord {
-        SessionRecord {
+    fn session() -> TaskSession {
+        TaskSession {
             node_id: NodeId("node-a".into()),
             session: SessionId("session-a".into()),
             profile: "codex".into(),
-            workspace_path: Some("/workspace/project".into()),
+            workspace_path: "/workspace/project".into(),
             bypass_permissions: false,
-            task_ids,
             role: "implementation-worker".into(),
             kind: "codex".into(),
             skills: vec!["rust".into()],
-            objective: Some("work on a task".into()),
             created_at_ms: 0,
             updated_at_ms: 0,
             last_seen_ms: 0,
@@ -193,11 +199,12 @@ mod tests {
     fn populated_state() -> OrchestrationState {
         let mut state = OrchestrationState::new();
         let project = state.create_project(create_project(), 99).unwrap();
+        let plan = state.create_plan(create_plan(project.id), 100).unwrap();
         let parent = state
-            .create_task(create_task(project.id.clone(), "Parent"), 100)
+            .create_task(create_task(plan.id.clone(), "Parent"), 101)
             .unwrap();
         let child = state
-            .create_task(create_task(project.id.clone(), "Child"), 101)
+            .create_task(create_task(plan.id.clone(), "Child"), 102)
             .unwrap();
         state
             .add_task_edge(
@@ -210,7 +217,7 @@ mod tests {
                 200,
             )
             .unwrap();
-        state.record_session(session(vec![child.id]), 300).unwrap();
+        state.record_session(&child.id, session(), 300).unwrap();
         state
     }
 
@@ -246,8 +253,13 @@ mod tests {
         let loaded = store.load().unwrap().unwrap();
 
         assert_eq!(loaded.tasks.len(), 2);
+        assert_eq!(loaded.plans.len(), 1);
         assert_eq!(loaded.task_edges, state.task_edges);
-        assert_eq!(loaded.sessions, state.sessions);
+        assert_eq!(
+            loaded.tasks.get(&TaskId("task-2".into())).unwrap().session,
+            state.tasks.get(&TaskId("task-2".into())).unwrap().session
+        );
+        assert_eq!(loaded.next_plan_id, state.next_plan_id);
         assert_eq!(loaded.next_task_id, state.next_task_id);
         assert_eq!(
             loaded.tasks.get(&TaskId("task-1".into())).unwrap().gates,
@@ -264,8 +276,9 @@ mod tests {
         let first = populated_state();
         let mut second = OrchestrationState::new();
         let project = second.create_project(create_project(), 499).unwrap();
+        let plan = second.create_plan(create_plan(project.id), 500).unwrap();
         second
-            .create_task(create_task(project.id, "Replacement"), 500)
+            .create_task(create_task(plan.id, "Replacement"), 501)
             .unwrap();
 
         store.save(&first, 400).unwrap();
@@ -283,7 +296,7 @@ mod tests {
         assert_eq!(loaded.tasks.len(), 1);
         assert!(loaded.tasks.contains_key(&TaskId("task-1".into())));
         assert!(loaded.task_edges.is_empty());
-        assert!(loaded.sessions.is_empty());
+        assert!(loaded.tasks.values().all(|task| task.session.is_none()));
 
         fs::remove_dir_all(dir).unwrap();
     }

@@ -6,10 +6,10 @@ use connectrpc::{
 };
 use mmux_controller_core::{
     orchestration::{
-        CreateProject, CreateTask, CreateTaskEdge, NodeId, OrchestrationCounts, OrchestrationState,
-        OrchestrationStatus, ProjectId, ProjectStatus, SessionCleanupCandidate, SessionId,
-        SessionRecord, Task, TaskAgent, TaskEdge, TaskEdgeKind, TaskId, TaskParticipant, TaskScope,
-        TaskStatus, UpdateTask, UpdateTaskScope,
+        CreatePlan, CreateProject, CreateTask, CreateTaskEdge, NodeId, OrchestrationCounts,
+        OrchestrationState, OrchestrationStatus, PlanId, PlanStatus, ProjectId, ProjectStatus,
+        SessionCleanupCandidate, SessionId, Task, TaskEdge, TaskEdgeKind, TaskId, TaskScope,
+        TaskSession, TaskStatus, UpdatePlan, UpdateTask, UpdateTaskScope,
     },
     NodeRegistry, NodeWireAuthContext, NodeWireAuthMode, NodeWireAuthPolicy, NodeWireIdentity,
 };
@@ -207,6 +207,11 @@ struct Cli {
         help = "Permit node wire RPC without bearer auth and ignore MMUX_WIRE_TOKEN. Intended only for development or trusted private tunnels."
     )]
     allow_unauthenticated_node_wire: bool,
+    #[arg(
+        long,
+        help = "Enable admin-only MCP tools that create or change project boundaries."
+    )]
+    enable_admin_tools: bool,
     #[arg(long, default_value_t = 4 * 1024 * 1024, help = "Maximum bytes returned by read_file.")]
     max_read_bytes: usize,
     #[arg(long, default_value_t = 4 * 1024 * 1024, help = "Maximum decoded bytes accepted by save_file.")]
@@ -274,6 +279,7 @@ impl EmbeddedNodeConfig {
 
 #[derive(Clone, Debug)]
 pub(crate) struct ControllerPolicy {
+    enable_admin_tools: bool,
     max_read_bytes: usize,
     max_write_bytes: usize,
     max_timeout_seconds: f64,
@@ -284,6 +290,7 @@ pub(crate) struct ControllerPolicy {
 impl ControllerPolicy {
     fn new(cli: &Cli) -> Result<Self, String> {
         Ok(Self {
+            enable_admin_tools: cli.enable_admin_tools,
             max_read_bytes: cli.max_read_bytes,
             max_write_bytes: cli.max_write_bytes,
             max_timeout_seconds: cli.max_timeout_seconds,
@@ -313,11 +320,20 @@ impl ControllerPolicy {
             self.max_capture_bytes, suffix
         )
     }
+
+    fn ensure_admin_tools_enabled(&self, tool_name: &str) -> Result<(), McpError> {
+        if self.enable_admin_tools {
+            return Ok(());
+        }
+        Err(McpError::invalid_request(
+            format!("{tool_name} requires controller flag --enable-admin-tools"),
+            None,
+        ))
+    }
 }
 
-const SESSION_OBJECTIVE_OPTION: &str = "@mmux_objective";
 const SESSION_LIST_FORMAT: &str =
-    "#{session_name}|#{session_windows}|#{session_attached}|#{session_created}|#{@mmux_objective}";
+    "#{session_name}|#{session_windows}|#{session_attached}|#{session_created}";
 const SESSION_INFO_LIST_FORMAT: &str = "#{session_name}|#{session_created}";
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -327,7 +343,6 @@ struct SessionListEntry {
     windows: Option<u64>,
     attached: Option<u64>,
     created_at_seconds: Option<u64>,
-    objective: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -360,7 +375,7 @@ struct OrchestrationPruneStoreArgs {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum LocalStartupReconciliationAction {
-    Recreate { record: SessionRecord },
+    Recreate { record: TaskSession },
     Missing { key: String, reason: String },
     Historical { key: String },
 }
@@ -413,7 +428,7 @@ fn cleanup_candidates_from_live_sessions(
         .map(|live| SessionCleanupCandidate {
             node_id: node_id.to_owned(),
             session: live.session.clone(),
-            reason: "live mmux-* session is absent from durable SessionRecord storage".into(),
+            reason: "live mmux-* session is absent from durable task session storage".into(),
             created_at_ms: live
                 .created_at_seconds
                 .map(|seconds| seconds.saturating_mul(1000)),
@@ -511,19 +526,21 @@ fn decorate_orchestration_status_with_local_runtime(
 fn durable_session_keys(
     state: &mmux_controller_core::orchestration::OrchestrationState,
 ) -> HashSet<String> {
-    state.sessions.keys().cloned().collect()
+    state
+        .tasks
+        .values()
+        .filter_map(|task| task.session.as_ref().map(TaskSession::key))
+        .collect()
 }
 
 fn active_attached_task_exists(
     state: &mmux_controller_core::orchestration::OrchestrationState,
-    record: &SessionRecord,
+    task_id: &TaskId,
 ) -> bool {
-    record.task_ids.iter().any(|task_id| {
-        state
-            .tasks
-            .get(task_id)
-            .is_some_and(|task| !task.status.is_finished())
-    })
+    state
+        .tasks
+        .get(task_id)
+        .is_some_and(|task| !task.status.is_finished())
 }
 
 fn plan_local_startup_reconciliation(
@@ -537,13 +554,17 @@ fn plan_local_startup_reconciliation(
         .collect::<HashSet<_>>();
     let mut actions = Vec::new();
 
-    for record in state.sessions.values() {
+    for (task_id, record) in state
+        .tasks
+        .iter()
+        .filter_map(|(task_id, task)| task.session.as_ref().map(|session| (task_id, session)))
+    {
         if record.node_id.0 != "local" || live_session_names.contains(record.session.0.as_str()) {
             continue;
         }
 
         let key = record.key();
-        if !active_attached_task_exists(state, record) {
+        if !active_attached_task_exists(state, task_id) {
             actions.push(LocalStartupReconciliationAction::Historical { key });
             continue;
         }
@@ -1205,15 +1226,11 @@ fn parse_session_list(node: &str, output: &str) -> Vec<SessionListEntry> {
             if line.trim().is_empty() || line.trim() == "No tmux sessions running" {
                 return None;
             }
-            let fields = line.splitn(5, '|').collect::<Vec<_>>();
+            let fields = line.splitn(4, '|').collect::<Vec<_>>();
             let session = fields.first().copied().unwrap_or("").trim();
             if session.is_empty() {
                 return None;
             }
-            let objective = fields
-                .get(4)
-                .map(|value| value.trim().to_owned())
-                .filter(|value| !value.is_empty());
             Some(SessionListEntry {
                 node: node.to_owned(),
                 session: session.to_owned(),
@@ -1226,7 +1243,6 @@ fn parse_session_list(node: &str, output: &str) -> Vec<SessionListEntry> {
                 created_at_seconds: fields
                     .get(3)
                     .and_then(|value| value.trim().parse::<u64>().ok()),
-                objective,
             })
         })
         .collect::<Vec<_>>();
@@ -1244,28 +1260,18 @@ fn project_scoped_session_entries(
         return Err(format!("project '{}' not found", project_id.0));
     }
 
-    let project_task_ids = state
-        .tasks
-        .values()
-        .filter(|task| &task.project_id == project_id)
-        .map(|task| task.id.clone())
-        .collect::<std::collections::HashSet<_>>();
     let live_by_session = live_sessions
         .iter()
         .map(|session| (session.session.as_str(), session))
         .collect::<std::collections::HashMap<_, _>>();
 
     let mut entries = state
-        .sessions
+        .tasks
         .values()
-        .filter(|record| record.node_id.0 == node)
-        .filter(|record| {
-            record
-                .task_ids
-                .iter()
-                .any(|task_id| project_task_ids.contains(task_id))
-        })
-        .map(|record| {
+        .filter(|task| task_project_id(state, task).as_ref() == Some(project_id))
+        .filter_map(|task| task.session.as_ref().map(|record| (task, record)))
+        .filter(|(_, record)| record.node_id.0 == node)
+        .map(|(task, record)| {
             let live = live_by_session.get(record.session.0.as_str()).copied();
             ProjectSessionListEntry {
                 node: record.node_id.0.clone(),
@@ -1273,10 +1279,9 @@ fn project_scoped_session_entries(
                 profile: record.profile.clone(),
                 workspace_path: record.workspace_path.clone(),
                 bypass_permissions: record.bypass_permissions,
-                task_ids: record.task_ids.clone(),
+                task_id: task.id.clone(),
                 role: record.role.clone(),
                 kind: record.kind.clone(),
-                objective: record.objective.clone(),
                 last_seen_ms: record.last_seen_ms,
                 runtime_state: if live.is_some() {
                     "running".into()
@@ -1286,7 +1291,6 @@ fn project_scoped_session_entries(
                 windows: live.and_then(|session| session.windows),
                 attached: live.and_then(|session| session.attached),
                 created_at_seconds: live.and_then(|session| session.created_at_seconds),
-                live_objective: live.and_then(|session| session.objective.clone()),
             }
         })
         .collect::<Vec<_>>();
@@ -1315,6 +1319,47 @@ fn resolve_project_id_or_slug(
         .find(|project| project.slug == selector)
         .map(|project| project.id.clone())
         .ok_or_else(|| format!("project '{selector}' not found"))
+}
+
+fn resolve_plan_id_or_slug(
+    state: &OrchestrationState,
+    plan_id_or_slug: &str,
+) -> Result<PlanId, String> {
+    let selector = plan_id_or_slug.trim();
+    if selector.is_empty() {
+        return Err("plan_id must not be empty".into());
+    }
+    if state.plans.contains_key(&PlanId(selector.to_owned())) {
+        return Ok(PlanId(selector.to_owned()));
+    }
+    let mut matches = state
+        .plans
+        .values()
+        .filter(|plan| plan.slug == selector)
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+    match matches.as_slice() {
+        [plan] => Ok(plan.id.clone()),
+        [] => Err(format!("plan '{selector}' not found")),
+        plans => {
+            let matches = plans
+                .iter()
+                .map(|plan| format!("{} in project {}", plan.id.0, plan.project_id.0))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(format!(
+                "plan slug '{}' is ambiguous; matches: {}",
+                selector, matches
+            ))
+        }
+    }
+}
+
+fn task_project_id(state: &OrchestrationState, task: &Task) -> Option<ProjectId> {
+    state
+        .plans
+        .get(&task.plan_id)
+        .map(|plan| plan.project_id.clone())
 }
 
 fn is_no_tmux_sessions_error(error: &str) -> bool {
@@ -1432,18 +1477,16 @@ struct ProjectSessionListEntry {
     node: String,
     session: String,
     profile: String,
-    workspace_path: Option<String>,
+    workspace_path: String,
     bypass_permissions: bool,
-    task_ids: Vec<TaskId>,
+    task_id: TaskId,
     role: String,
     kind: String,
-    objective: Option<String>,
     last_seen_ms: u64,
     runtime_state: String,
     windows: Option<u64>,
     attached: Option<u64>,
     created_at_seconds: Option<u64>,
-    live_objective: Option<String>,
 }
 
 struct RuntimeWaitJob {
@@ -1506,6 +1549,7 @@ struct CodingTaskSendArgs {
     include_dependencies: Option<bool>,
     include_gates: Option<bool>,
     include_scope: Option<bool>,
+    context_task_ids: Option<Vec<String>>,
     extra_context: Option<String>,
 }
 
@@ -1530,7 +1574,7 @@ enum RuntimeWaitTarget {
 #[serde(deny_unknown_fields)]
 struct ProjectCreateArgs {
     title: String,
-    description: Option<String>,
+    description: String,
     slug: Option<String>,
 }
 
@@ -1543,12 +1587,37 @@ struct ProjectStatusUpdateArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct TaskCreateArgs {
+struct PlanCreateArgs {
     project_id: String,
     title: String,
-    objective: String,
+    brief: String,
+    slug: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlanUpdateArgs {
+    plan_id: String,
     #[serde(default)]
-    agents: Vec<TaskAgent>,
+    title: Option<String>,
+    #[serde(default)]
+    brief: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct PlanStatusUpdateArgs {
+    plan_id: String,
+    status: PlanStatus,
+    outcome: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskCreateArgs {
+    plan_id: String,
+    title: String,
+    objective: String,
     #[serde(default)]
     include_paths: Vec<String>,
     #[serde(default)]
@@ -1573,22 +1642,7 @@ struct TaskUpdateArgs {
     #[serde(default)]
     notes: Option<Option<String>>,
     #[serde(default)]
-    agents: Option<Vec<TaskAgent>>,
-    #[serde(default)]
     gates: Option<Vec<String>>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct TaskAssignArgs {
-    task_id: String,
-    node_id: String,
-    session: String,
-    profile: String,
-    role: String,
-    kind: String,
-    #[serde(default)]
-    skills: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1610,20 +1664,17 @@ struct TaskEdgeRemoveArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct SessionRecordArgs {
+struct TaskSessionRecordArgs {
     node_id: String,
     session: String,
     profile: String,
-    workspace_path: Option<String>,
-    #[serde(default)]
+    workspace_path: String,
     bypass_permissions: bool,
-    #[serde(default)]
-    task_ids: Vec<String>,
+    task_id: String,
     role: String,
     kind: String,
     #[serde(default)]
     skills: Vec<String>,
-    objective: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1631,7 +1682,7 @@ struct SessionRecordArgs {
 struct TaskStatusUpdateArgs {
     task_id: String,
     status: TaskStatus,
-    summary: Option<String>,
+    outcome: Option<String>,
     blockers: Option<Vec<String>>,
 }
 
@@ -1639,6 +1690,7 @@ struct TaskStatusUpdateArgs {
 #[serde(deny_unknown_fields)]
 struct OrchestrationStatusArgs {
     project_id: Option<String>,
+    plan_id: Option<String>,
     task_id: Option<String>,
     #[serde(default)]
     include_completed: bool,
@@ -1656,10 +1708,11 @@ struct NodeWaitOptions<'a> {
 struct TaskAwareStart {
     session_name: String,
     workspace_path: String,
-    task_ids: Vec<TaskId>,
+    task_id: TaskId,
     role: String,
     kind: String,
     skills: Vec<String>,
+    previous_session: Option<TaskSession>,
 }
 
 impl TmuxMcpServer {
@@ -1893,9 +1946,10 @@ impl TmuxMcpServer {
         Self::json_result(job.snapshot.clone())
     }
 
-    fn orchestration_tool_definitions() -> Vec<Tool> {
-        vec![
-            Tool::new(
+    fn orchestration_tool_definitions(enable_admin_tools: bool) -> Vec<Tool> {
+        let mut tools = Vec::new();
+        if enable_admin_tools {
+            tools.push(Tool::new(
                 "project_create",
                 "Create an orchestration project boundary and return the created Project object directly",
                 Arc::new(tool_schema(
@@ -1904,15 +1958,17 @@ impl TmuxMcpServer {
                         "description": { "type": "string" },
                         "slug": { "type": "string" }
                     }),
-                    Some(vec!["title"]),
+                    Some(vec!["title", "description"]),
                 )),
-            ),
-            Tool::new(
-                "project_list",
-                "List orchestration projects",
-                Arc::new(tool_schema(json!({}), None)),
-            ),
-            Tool::new(
+            ));
+        }
+        tools.push(Tool::new(
+            "project_list",
+            "List orchestration projects",
+            Arc::new(tool_schema(json!({}), None)),
+        ));
+        if enable_admin_tools {
+            tools.push(Tool::new(
                 "project_status_update",
                 "Update orchestration project status",
                 Arc::new(tool_schema(
@@ -1922,37 +1978,70 @@ impl TmuxMcpServer {
                     }),
                     Some(vec!["project_id", "status"]),
                 )),
+            ));
+        }
+        tools.extend([
+            Tool::new(
+                "plan_create",
+                "Create an orchestration plan document under a project and return the created Plan object directly",
+                Arc::new(tool_schema(
+                    json!({
+                        "project_id": { "type": "string", "description": "Project UUID id or globally unique project slug" },
+                        "title": { "type": "string" },
+                        "brief": { "type": "string", "description": "Required Markdown plan brief with enough context and detail to derive tasks" },
+                        "slug": { "type": "string" }
+                    }),
+                    Some(vec!["project_id", "title", "brief"]),
+                )),
+            ),
+            Tool::new(
+                "plan_list",
+                "List orchestration plans, optionally filtered by project",
+                Arc::new(tool_schema(
+                    json!({
+                        "project_id": { "type": "string", "description": "Optional project UUID id or globally unique project slug" }
+                    }),
+                    None,
+                )),
+            ),
+            Tool::new(
+                "plan_update",
+                "Update mutable orchestration plan metadata without changing status, tasks, sessions, or id",
+                Arc::new(tool_schema(
+                    json!({
+                        "plan_id": { "type": "string", "description": "Plan id or slug" },
+                        "title": { "type": "string" },
+                        "brief": { "type": "string", "description": "Markdown plan brief with enough context and detail to derive tasks" }
+                    }),
+                    Some(vec!["plan_id"]),
+                )),
+            ),
+            Tool::new(
+                "plan_status_update",
+                "Update orchestration plan status and optional outcome",
+                Arc::new(tool_schema(
+                    json!({
+                        "plan_id": { "type": "string", "description": "Plan id or slug" },
+                        "status": { "type": "string", "enum": ["Backlog", "Planned", "Running", "WaitingForValidation", "Blocked", "Failed", "Passed", "Delivered", "Canceled"] },
+                        "outcome": { "type": "string", "description": "Plan-level result after execution or validation" }
+                    }),
+                    Some(vec!["plan_id", "status"]),
+                )),
             ),
             Tool::new(
                 "task_create",
                 "Create an orchestration task and return the created Task object directly",
                 Arc::new(tool_schema(
                     json!({
-                        "project_id": { "type": "string", "description": "Project UUID id or globally unique project slug" },
+                        "plan_id": { "type": "string", "description": "Plan id or slug" },
                         "title": { "type": "string" },
                         "objective": { "type": "string" },
-                        "agents": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "kind": { "type": "string" },
-                                    "role": { "type": "string" },
-                                    "skills": { "type": "array", "items": { "type": "string" } },
-                                    "workspace_path": { "type": "string" },
-                                    "objective": { "type": "string" },
-                                    "prompt": { "type": "string" }
-                                },
-                                "required": ["kind", "role", "skills", "prompt"],
-                                "additionalProperties": false
-                            }
-                        },
                         "include_paths": { "type": "array", "items": { "type": "string" } },
                         "exclude_paths": { "type": "array", "items": { "type": "string" } },
                         "notes": { "type": "string" },
                         "gates": { "type": "array", "items": { "type": "string" } }
                     }),
-                    Some(vec!["project_id", "title", "objective"]),
+                    Some(vec!["plan_id", "title", "objective"]),
                 )),
             ),
             Tool::new(
@@ -1966,43 +2055,9 @@ impl TmuxMcpServer {
                         "include_paths": { "type": "array", "items": { "type": "string" } },
                         "exclude_paths": { "type": "array", "items": { "type": "string" } },
                         "notes": { "type": ["string", "null"] },
-                        "agents": {
-                            "type": "array",
-                            "items": {
-                                "type": "object",
-                                "properties": {
-                                    "kind": { "type": "string" },
-                                    "role": { "type": "string" },
-                                    "skills": { "type": "array", "items": { "type": "string" } },
-                                    "workspace_path": { "type": "string" },
-                                    "objective": { "type": "string" },
-                                    "prompt": { "type": "string" }
-                                },
-                                "required": ["kind", "role", "skills", "prompt"],
-                                "additionalProperties": false
-                            }
-                        },
                         "gates": { "type": "array", "items": { "type": "string" } }
                     }),
                     Some(vec!["task_id"]),
-                )),
-            ),
-            Tool::new(
-                "task_assign",
-                "Assign a task to a recorded or operator-chosen session owner",
-                Arc::new(tool_schema(
-                    json!({
-                        "task_id": { "type": "string" },
-                        "node_id": { "type": "string" },
-                        "session": { "type": "string" },
-                        "profile": { "type": "string" },
-                        "role": { "type": "string" },
-                        "kind": { "type": "string" },
-                        "skills": { "type": "array", "items": { "type": "string" } }
-                    }),
-                    Some(vec![
-                        "task_id", "node_id", "session", "profile", "role", "kind",
-                    ]),
                 )),
             ),
             Tool::new(
@@ -2040,13 +2095,12 @@ impl TmuxMcpServer {
                         "profile": { "type": "string" },
                         "workspace_path": { "type": "string", "description": "Backend-owned workspace/start directory for the recorded session." },
                         "bypass_permissions": { "type": "boolean" },
-                        "task_ids": { "type": "array", "items": { "type": "string" } },
+                        "task_id": { "type": "string" },
                         "role": { "type": "string" },
                         "kind": { "type": "string" },
-                        "skills": { "type": "array", "items": { "type": "string" } },
-                        "objective": { "type": "string" }
+                        "skills": { "type": "array", "items": { "type": "string" } }
                     }),
-                    Some(vec!["node_id", "session", "profile", "role", "kind"]),
+                    Some(vec!["node_id", "session", "profile", "workspace_path", "bypass_permissions", "task_id", "role", "kind"]),
                 )),
             ),
             Tool::new(
@@ -2056,7 +2110,7 @@ impl TmuxMcpServer {
                     json!({
                         "task_id": { "type": "string" },
                         "status": { "type": "string", "enum": ["Backlog", "Planned", "Running", "WaitingForValidation", "Blocked", "Failed", "Passed", "Delivered", "Canceled"] },
-                        "summary": { "type": "string" },
+                        "outcome": { "type": "string" },
                         "blockers": { "type": "array", "items": { "type": "string" } }
                     }),
                     Some(vec!["task_id", "status"]),
@@ -2069,6 +2123,7 @@ impl TmuxMcpServer {
                     json!({
                         "task_id": { "type": "string" },
                         "project_id": { "type": "string", "description": "Project UUID id or globally unique project slug" },
+                        "plan_id": { "type": "string", "description": "Plan id or slug" },
                         "include_completed": { "type": "boolean" }
                     }),
                     None,
@@ -2088,18 +2143,19 @@ impl TmuxMcpServer {
             ),
             Tool::new(
                 "orchestration_prune_store",
-                "Dry-run or explicitly prune stale durable session records for missing local sessions attached only to finished tasks",
+                "Dry-run or explicitly prune stale durable task sessions and finished plans",
                 Arc::new(tool_schema(
                     json!({
                         "dry_run": { "type": "boolean", "description": "When true, only report candidates. Default: true." },
-                        "sessions_only": { "type": "boolean", "description": "Scope pruning to session records. Current v1 pruning only supports session records." },
-                        "older_than_days": { "type": "integer", "description": "Only include stale session records last seen at least this many days ago." },
+                        "sessions_only": { "type": "boolean", "description": "Scope pruning to task sessions and skip finished plan pruning." },
+                        "older_than_days": { "type": "integer", "description": "Only include stale task sessions last seen at least this many days ago." },
                         "node": { "type": "string", "description": "Execution node id. Only local is supported in v1; default: local." }
                     }),
                     None,
                 )),
             ),
-        ]
+        ]);
+        tools
     }
 
     fn call_orchestration_tool(
@@ -2111,9 +2167,12 @@ impl TmuxMcpServer {
             "project_create" => self.project_create_tool(args),
             "project_list" => self.project_list_tool(args),
             "project_status_update" => self.project_status_update_tool(args),
+            "plan_create" => self.plan_create_tool(args),
+            "plan_list" => self.plan_list_tool(args),
+            "plan_update" => self.plan_update_tool(args),
+            "plan_status_update" => self.plan_status_update_tool(args),
             "task_create" => self.task_create_tool(args),
             "task_update" => self.task_update_tool(args),
-            "task_assign" => self.task_assign_tool(args),
             "task_edge_add" => self.task_edge_add_tool(args),
             "task_edge_remove" => self.task_edge_remove_tool(args),
             "task_status_update" => self.task_status_update_tool(args),
@@ -2124,6 +2183,7 @@ impl TmuxMcpServer {
     }
 
     fn project_create_tool(&self, args: Map<String, Value>) -> Result<CallToolResult, McpError> {
+        self.policy.ensure_admin_tools_enabled("project_create")?;
         let args: ProjectCreateArgs = parse_tool_args("project_create", args)?;
         let project = self
             .orchestration
@@ -2146,6 +2206,8 @@ impl TmuxMcpServer {
         &self,
         args: Map<String, Value>,
     ) -> Result<CallToolResult, McpError> {
+        self.policy
+            .ensure_admin_tools_enabled("project_status_update")?;
         let args: ProjectStatusUpdateArgs = parse_tool_args("project_status_update", args)?;
         let state = self.orchestration.snapshot().map_err(mcp_invalid_request)?;
         let project_id =
@@ -2157,16 +2219,72 @@ impl TmuxMcpServer {
         Self::json_result(project)
     }
 
-    fn task_create_tool(&self, args: Map<String, Value>) -> Result<CallToolResult, McpError> {
-        validate_task_agent_arguments(&args)?;
-        let args: TaskCreateArgs = parse_tool_args("task_create", args)?;
+    fn plan_create_tool(&self, args: Map<String, Value>) -> Result<CallToolResult, McpError> {
+        let args: PlanCreateArgs = parse_tool_args("plan_create", args)?;
         let state = self.orchestration.snapshot().map_err(mcp_invalid_request)?;
         let project_id =
             resolve_project_id_or_slug(&state, &args.project_id).map_err(mcp_invalid_request)?;
+        let plan = self
+            .orchestration
+            .create_plan(CreatePlan {
+                project_id,
+                title: args.title,
+                brief: args.brief,
+                slug: args.slug,
+            })
+            .map_err(mcp_invalid_request)?;
+        Self::json_result(plan)
+    }
+
+    fn plan_list_tool(&self, args: Map<String, Value>) -> Result<CallToolResult, McpError> {
+        let args: OrchestrationStatusArgs = parse_tool_args("plan_list", args)?;
+        let status = self.orchestration.status().map_err(mcp_invalid_request)?;
+        let status = filter_orchestration_status(status, args).map_err(mcp_invalid_request)?;
+        Self::json_result(status.plans)
+    }
+
+    fn plan_update_tool(&self, args: Map<String, Value>) -> Result<CallToolResult, McpError> {
+        let args: PlanUpdateArgs = parse_tool_args("plan_update", args)?;
+        let state = self.orchestration.snapshot().map_err(mcp_invalid_request)?;
+        let plan_id =
+            resolve_plan_id_or_slug(&state, &args.plan_id).map_err(mcp_invalid_request)?;
+        let plan = self
+            .orchestration
+            .update_plan(
+                plan_id,
+                UpdatePlan {
+                    title: args.title,
+                    brief: args.brief,
+                },
+            )
+            .map_err(mcp_invalid_request)?;
+        Self::json_result(plan)
+    }
+
+    fn plan_status_update_tool(
+        &self,
+        args: Map<String, Value>,
+    ) -> Result<CallToolResult, McpError> {
+        let args: PlanStatusUpdateArgs = parse_tool_args("plan_status_update", args)?;
+        let state = self.orchestration.snapshot().map_err(mcp_invalid_request)?;
+        let plan_id =
+            resolve_plan_id_or_slug(&state, &args.plan_id).map_err(mcp_invalid_request)?;
+        let plan = self
+            .orchestration
+            .update_plan_status(plan_id, args.status, args.outcome)
+            .map_err(mcp_invalid_request)?;
+        Self::json_result(plan)
+    }
+
+    fn task_create_tool(&self, args: Map<String, Value>) -> Result<CallToolResult, McpError> {
+        let args: TaskCreateArgs = parse_tool_args("task_create", args)?;
+        let state = self.orchestration.snapshot().map_err(mcp_invalid_request)?;
+        let plan_id =
+            resolve_plan_id_or_slug(&state, &args.plan_id).map_err(mcp_invalid_request)?;
         let task = self
             .orchestration
             .create_task(CreateTask {
-                project_id,
+                plan_id,
                 title: args.title,
                 objective: args.objective,
                 scope: TaskScope {
@@ -2174,7 +2292,6 @@ impl TmuxMcpServer {
                     exclude_paths: args.exclude_paths,
                     notes: args.notes,
                 },
-                agents: args.agents,
                 gates: args.gates,
                 slug: None,
             })
@@ -2183,7 +2300,6 @@ impl TmuxMcpServer {
     }
 
     fn task_update_tool(&self, args: Map<String, Value>) -> Result<CallToolResult, McpError> {
-        validate_task_agent_arguments(&args)?;
         let args: TaskUpdateArgs = parse_tool_args("task_update", args)?;
         let task = self
             .orchestration
@@ -2197,30 +2313,7 @@ impl TmuxMcpServer {
                         exclude_paths: args.exclude_paths,
                         notes: args.notes,
                     },
-                    agents: args.agents,
                     gates: args.gates,
-                },
-            )
-            .map_err(mcp_invalid_request)?;
-        Self::json_result(task)
-    }
-
-    fn task_assign_tool(&self, args: Map<String, Value>) -> Result<CallToolResult, McpError> {
-        let args: TaskAssignArgs = parse_tool_args("task_assign", args)?;
-        if self.resolve_profile(Some(&args.profile)).is_none() {
-            return Err(McpError::invalid_request("unknown profile", None));
-        }
-        let task = self
-            .orchestration
-            .assign_task(
-                TaskId(args.task_id),
-                TaskParticipant {
-                    node_id: NodeId(args.node_id),
-                    session: SessionId(args.session),
-                    profile: args.profile,
-                    role: args.role,
-                    kind: args.kind,
-                    skills: args.skills,
                 },
             )
             .map_err(mcp_invalid_request)?;
@@ -2257,55 +2350,60 @@ impl TmuxMcpServer {
         &self,
         args: Map<String, Value>,
     ) -> Result<CallToolResult, McpError> {
-        let args: SessionRecordArgs = parse_tool_args("session_record", args)?;
-        let task_attached = !args.task_ids.is_empty();
-        if task_attached {
-            if args
-                .workspace_path
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .is_none()
-            {
-                return Err(McpError::invalid_request(
-                    "task-attached session_record requires workspace_path",
-                    None,
-                ));
-            }
-            if self.resolve_profile(Some(&args.profile)).is_none() {
-                return Err(McpError::invalid_request("unknown profile", None));
-            }
-            if !self
-                .node_session_exists(&args.node_id, &args.session)
-                .await
-                .map_err(mcp_invalid_request)?
-            {
-                return Err(McpError::invalid_request(
-                    format!(
-                        "session '{}' does not exist on node '{}'",
-                        args.session, args.node_id
-                    ),
-                    None,
-                ));
-            }
+        let args: TaskSessionRecordArgs = parse_tool_args("session_record", args)?;
+        if args.workspace_path.trim().is_empty() {
+            return Err(McpError::invalid_request(
+                "session_record requires workspace_path",
+                None,
+            ));
         }
+        if self.resolve_profile(Some(&args.profile)).is_none() {
+            return Err(McpError::invalid_request("unknown profile", None));
+        }
+        if !self
+            .node_session_exists(&args.node_id, &args.session)
+            .await
+            .map_err(mcp_invalid_request)?
+        {
+            return Err(McpError::invalid_request(
+                format!(
+                    "session '{}' does not exist on node '{}'",
+                    args.session, args.node_id
+                ),
+                None,
+            ));
+        }
+        let task_id = TaskId(args.task_id);
+        let previous_session = self
+            .orchestration
+            .snapshot()
+            .map_err(mcp_invalid_request)?
+            .tasks
+            .get(&task_id)
+            .ok_or_else(|| mcp_invalid_request(format!("task '{}' not found", task_id.0)))?
+            .session
+            .clone();
+        self.stop_replaced_task_session(previous_session.as_ref(), &args.node_id, &args.session)
+            .await
+            .map_err(mcp_invalid_request)?;
         let session = self
             .orchestration
-            .record_session(SessionRecord {
-                node_id: NodeId(args.node_id),
-                session: SessionId(args.session),
-                profile: args.profile,
-                workspace_path: args.workspace_path,
-                bypass_permissions: args.bypass_permissions,
-                task_ids: args.task_ids.into_iter().map(TaskId).collect(),
-                role: args.role,
-                kind: args.kind,
-                skills: args.skills,
-                objective: args.objective,
-                created_at_ms: 0,
-                updated_at_ms: 0,
-                last_seen_ms: 0,
-            })
+            .record_session(
+                task_id,
+                TaskSession {
+                    node_id: NodeId(args.node_id),
+                    session: SessionId(args.session),
+                    profile: args.profile,
+                    workspace_path: args.workspace_path,
+                    bypass_permissions: args.bypass_permissions,
+                    role: args.role,
+                    kind: args.kind,
+                    skills: args.skills,
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                    last_seen_ms: 0,
+                },
+            )
             .map_err(mcp_invalid_request)?;
         Self::json_result(session)
     }
@@ -2320,7 +2418,7 @@ impl TmuxMcpServer {
             .update_task_status_details(
                 TaskId(args.task_id),
                 args.status,
-                args.summary,
+                args.outcome,
                 args.blockers,
             )
             .map_err(mcp_invalid_request)?;
@@ -2606,28 +2704,12 @@ impl TmuxMcpServer {
                             "local",
                             &record.session.0,
                             &command,
-                            record.workspace_path.as_deref(),
+                            Some(record.workspace_path.as_str()),
                             &profile,
                         )
                         .await
                     {
                         Ok(_) => {
-                            if let Some(objective) = record.objective.as_deref() {
-                                if let Err(error) = self
-                                    .set_node_session_objective(
-                                        "local",
-                                        &record.session.0,
-                                        objective,
-                                    )
-                                    .await
-                                {
-                                    warnings.push(format!(
-                                        "recreated stored active session '{}' but failed to restore objective: {}",
-                                        record.key(),
-                                        error
-                                    ));
-                                }
-                            }
                             warnings.push(format!(
                                 "recreated stored active session '{}'; operator may need to provide fresh task context",
                                 record.key()
@@ -2667,7 +2749,7 @@ impl TmuxMcpServer {
         &self,
         args: &Map<String, Value>,
     ) -> Result<Option<TaskAwareStart>, McpError> {
-        let has_task_metadata = ["task_ids", "role", "kind", "skills"]
+        let has_task_metadata = ["task_id", "role", "kind", "skills"]
             .iter()
             .any(|field| args.contains_key(*field))
             || args
@@ -2681,9 +2763,7 @@ impl TmuxMcpServer {
         for field in ["profile", "node", "workspace_path", "bypass_permissions"] {
             if !args.contains_key(field) {
                 return Err(McpError::invalid_request(
-                    format!(
-                        "task-aware start_coding_session requires explicit {field}; TaskAgent metadata is not used as runtime placement"
-                    ),
+                    format!("task-aware start_coding_session requires explicit {field}"),
                     None,
                 ));
             }
@@ -2713,13 +2793,13 @@ impl TmuxMcpServer {
             ));
         }
 
-        let task_ids = string_vec_arg(args, "task_ids")?;
-        if task_ids.is_empty() {
-            return Err(McpError::invalid_request(
-                "task-aware start_coding_session requires at least one task_id",
-                None,
-            ));
-        }
+        let task_id = args
+            .get("task_id")
+            .and_then(|value| value.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| McpError::invalid_request("task_id is required", None))?
+            .to_owned();
         let role = args
             .get("role")
             .and_then(|value| value.as_str())
@@ -2754,27 +2834,14 @@ impl TmuxMcpServer {
         }
 
         let state = self.orchestration.snapshot().map_err(mcp_invalid_request)?;
-        let mut first_task_slug = None;
-        let task_ids = task_ids
-            .into_iter()
-            .map(|task_id| {
-                let task_id = TaskId(task_id);
-                let task = state.tasks.get(&task_id).ok_or_else(|| {
-                    mcp_invalid_request(format!("task '{}' not found", task_id.0))
-                })?;
-                if first_task_slug.is_none() {
-                    first_task_slug = Some(task.slug.clone());
-                }
-                Ok(task_id)
-            })
-            .collect::<Result<Vec<_>, McpError>>()?;
+        let task_id = TaskId(task_id);
+        let task = state
+            .tasks
+            .get(&task_id)
+            .ok_or_else(|| mcp_invalid_request(format!("task '{}' not found", task_id.0)))?;
 
         let session_name = if generate_session_name {
-            generated_orchestration_session_name(
-                first_task_slug.as_deref().unwrap_or("task"),
-                &kind,
-                &short_session_suffix(),
-            )
+            generated_orchestration_session_name(&task.slug, &kind, &short_session_suffix())
         } else {
             args.get("session")
                 .and_then(|value| value.as_str())
@@ -2787,10 +2854,11 @@ impl TmuxMcpServer {
         Ok(Some(TaskAwareStart {
             session_name,
             workspace_path,
-            task_ids,
+            task_id,
             role,
             kind,
             skills,
+            previous_session: task.session.clone(),
         }))
     }
 
@@ -2839,12 +2907,6 @@ impl TmuxMcpServer {
             .map(str::trim)
             .filter(|value| !value.is_empty())
             .map(str::to_owned);
-        let objective = args
-            .get("objective")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned);
         let bypass_permissions = args
             .get("bypass_permissions")
             .and_then(|v| v.as_bool())
@@ -2866,33 +2928,32 @@ impl TmuxMcpServer {
             Err(e) => return Ok(Self::error_result(e)),
         };
 
-        if let Some(objective) = objective.as_deref() {
-            if let Err(error) = self
-                .set_node_session_objective(node, &session_name, objective)
-                .await
-            {
-                return Ok(Self::error_result(error));
-            }
-        }
-
         let session_record = if let Some(metadata) = task_metadata {
+            self.stop_replaced_task_session(
+                metadata.previous_session.as_ref(),
+                node,
+                &session_name,
+            )
+            .await
+            .map_err(mcp_invalid_request)?;
             Some(
                 self.orchestration
-                    .record_session(SessionRecord {
-                        node_id: NodeId(node.to_owned()),
-                        session: SessionId(session_name.clone()),
-                        profile: profile.name.clone(),
-                        workspace_path: Some(metadata.workspace_path),
-                        bypass_permissions,
-                        task_ids: metadata.task_ids,
-                        role: metadata.role,
-                        kind: metadata.kind,
-                        skills: metadata.skills,
-                        objective: objective.clone(),
-                        created_at_ms: 0,
-                        updated_at_ms: 0,
-                        last_seen_ms: 0,
-                    })
+                    .record_session(
+                        metadata.task_id,
+                        TaskSession {
+                            node_id: NodeId(node.to_owned()),
+                            session: SessionId(session_name.clone()),
+                            profile: profile.name.clone(),
+                            workspace_path: metadata.workspace_path,
+                            bypass_permissions,
+                            role: metadata.role,
+                            kind: metadata.kind,
+                            skills: metadata.skills,
+                            created_at_ms: 0,
+                            updated_at_ms: 0,
+                            last_seen_ms: 0,
+                        },
+                    )
                     .map_err(mcp_invalid_request)?,
             )
         } else {
@@ -2905,7 +2966,6 @@ impl TmuxMcpServer {
             "session": session_name,
             "profile": profile.name,
             "workspace_path": workspace_path,
-            "objective": objective,
             "bypass_permissions": bypass_permissions,
             "readiness": {
                 "status": "not_waited",
@@ -3080,6 +3140,49 @@ impl TmuxMcpServer {
         }
     }
 
+    async fn stop_replaced_task_session(
+        &self,
+        previous: Option<&TaskSession>,
+        new_node: &str,
+        new_session: &str,
+    ) -> Result<bool, String> {
+        let Some(previous) = previous else {
+            return Ok(false);
+        };
+        if previous.node_id.0 == new_node && previous.session.0 == new_session {
+            return Ok(false);
+        }
+        match self
+            .node_session_exists(&previous.node_id.0, &previous.session.0)
+            .await
+        {
+            Ok(false) => Ok(false),
+            Ok(true) => match self
+                .node_tmux(
+                    &previous.node_id.0,
+                    vec![
+                        "kill-session".into(),
+                        "-t".into(),
+                        previous.session.0.clone(),
+                    ],
+                    Duration::from_secs(20),
+                )
+                .await
+            {
+                Ok(_) => Ok(true),
+                Err(error) if is_tmux_missing_session_error(&error) => Ok(false),
+                Err(error) => Err(format!(
+                    "failed to stop previous task session '{}:{}': {}",
+                    previous.node_id.0, previous.session.0, error
+                )),
+            },
+            Err(error) => Err(format!(
+                "failed to inspect previous task session '{}:{}': {}",
+                previous.node_id.0, previous.session.0, error
+            )),
+        }
+    }
+
     async fn node_session_capture(
         &self,
         node_id: &str,
@@ -3118,45 +3221,6 @@ impl TmuxMcpServer {
             .find(|line| !line.trim().is_empty())
             .map(|line| line.trim().to_string())
             .ok_or_else(|| format!("Session '{}' has no panes on node '{}'", session, node_id))
-    }
-
-    async fn set_node_session_objective(
-        &self,
-        node: &str,
-        session: &str,
-        objective: &str,
-    ) -> Result<(), String> {
-        self.node_tmux(
-            node,
-            vec![
-                "set-option".into(),
-                "-t".into(),
-                session.into(),
-                SESSION_OBJECTIVE_OPTION.into(),
-                objective.into(),
-            ],
-            Duration::from_secs(20),
-        )
-        .await?;
-        Ok(())
-    }
-
-    async fn node_session_objective(&self, node: &str, session: &str) -> Option<String> {
-        self.node_tmux(
-            node,
-            vec![
-                "show-options".into(),
-                "-v".into(),
-                "-t".into(),
-                session.into(),
-                SESSION_OBJECTIVE_OPTION.into(),
-            ],
-            Duration::from_secs(20),
-        )
-        .await
-        .ok()
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty())
     }
 
     async fn send_coding_prompt(
@@ -3607,33 +3671,6 @@ fn mcp_invalid_request(error: impl ToString) -> McpError {
     McpError::invalid_request(error.to_string(), None)
 }
 
-fn validate_task_agent_arguments(args: &Map<String, Value>) -> Result<(), McpError> {
-    let Some(agents) = args.get("agents") else {
-        return Ok(());
-    };
-    let Some(agents) = agents.as_array() else {
-        return Ok(());
-    };
-
-    const FORBIDDEN: &[&str] = &["count", "profile", "node", "node_id", "bypass_permissions"];
-    for (index, agent) in agents.iter().enumerate() {
-        let Some(agent) = agent.as_object() else {
-            continue;
-        };
-        for field in FORBIDDEN {
-            if agent.contains_key(*field) {
-                return Err(McpError::invalid_request(
-                    format!(
-                        "agents[{index}] contains runtime placement field '{field}'; TaskAgent only accepts kind, role, skills, workspace_path, objective, and prompt"
-                    ),
-                    None,
-                ));
-            }
-        }
-    }
-    Ok(())
-}
-
 fn validate_prompt_text_value(field: &str, prompt: &str) -> Result<(), String> {
     let trimmed = prompt.trim();
     if trimmed.is_empty() {
@@ -3660,12 +3697,17 @@ fn build_coding_task_prompt(
     if let Some(extra_context) = args.extra_context.as_deref() {
         validate_prompt_text_value("extra_context", extra_context)?;
     }
+    let context_tasks = resolve_context_task_cards(state, args.context_task_ids.as_deref())?;
 
     let task = resolve_task_by_id_or_slug(state, &args.task_id_or_slug)?;
-    let project = state.projects.get(&task.project_id);
+    let plan = state.plans.get(&task.plan_id);
+    let project = plan.and_then(|plan| state.projects.get(&plan.project_id));
     let project_text = project
         .map(|project| format!("{} / {}", project.id.0, project.slug))
-        .unwrap_or_else(|| format!("{} / <missing>", task.project_id.0));
+        .unwrap_or_else(|| "<missing>".into());
+    let plan_text = plan
+        .map(|plan| format!("{} / {}", plan.id.0, plan.slug))
+        .unwrap_or_else(|| format!("{} / <missing>", task.plan_id.0));
 
     let template = args.template.unwrap_or(CodingTaskSendTemplate::Task);
     let mut rendered = coding_task_send_template_text(template).to_owned();
@@ -3675,6 +3717,7 @@ fn build_coding_task_prompt(
         ("{{task_title}}", task.title.as_str()),
         ("{{task_status}}", task_status_name(task.status)),
         ("{{project}}", project_text.as_str()),
+        ("{{plan}}", plan_text.as_str()),
         ("{{objective}}", task.objective.as_str()),
     ] {
         rendered = rendered.replace(placeholder, value);
@@ -3687,6 +3730,10 @@ fn build_coding_task_prompt(
                 args.include_scope.unwrap_or(true),
                 build_scope_section(&task.scope),
             ),
+        )
+        .replace(
+            "{{plan_brief_section}}",
+            &build_plan_brief_section(plan.map(|plan| plan.brief.as_str())),
         )
         .replace(
             "{{gates_section}}",
@@ -3707,6 +3754,10 @@ fn build_coding_task_prompt(
             &build_blockers_section(&task.blockers),
         )
         .replace(
+            "{{task_card_context_section}}",
+            &build_task_card_context_section(state, &context_tasks),
+        )
+        .replace(
             "{{extra_context_section}}",
             &args
                 .extra_context
@@ -3717,6 +3768,29 @@ fn build_coding_task_prompt(
         .replace("{{instruction}}", args.prompt.trim());
 
     Ok(rendered)
+}
+
+fn resolve_context_task_cards<'a>(
+    state: &'a OrchestrationState,
+    selectors: Option<&'a [String]>,
+) -> Result<Vec<&'a Task>, String> {
+    let Some(selectors) = selectors else {
+        return Ok(Vec::new());
+    };
+    let mut seen = HashSet::new();
+    let mut tasks = Vec::new();
+    for (index, selector) in selectors.iter().enumerate() {
+        validate_prompt_text_value(&format!("context_task_ids[{index}]"), selector)?;
+        let task = resolve_task_by_id_or_slug(state, selector)?;
+        if !seen.insert(task.id.clone()) {
+            return Err(format!(
+                "context_task_ids contains duplicate task '{}'",
+                task.id.0
+            ));
+        }
+        tasks.push(task);
+    }
+    Ok(tasks)
 }
 
 fn coding_task_send_template_text(template: CodingTaskSendTemplate) -> &'static str {
@@ -3758,7 +3832,7 @@ fn resolve_task_by_id_or_slug<'a>(
         tasks => {
             let matches = tasks
                 .iter()
-                .map(|task| format!("{} in project {}", task.id.0, task.project_id.0))
+                .map(|task| format!("{} in plan {}", task.id.0, task.plan_id.0))
                 .collect::<Vec<_>>()
                 .join(", ");
             Err(format!(
@@ -3775,6 +3849,16 @@ fn build_scope_section(scope: &TaskScope) -> String {
         format_string_list(&scope.include_paths),
         format_string_list(&scope.exclude_paths),
         scope.notes.as_deref().unwrap_or("- none")
+    )
+}
+
+fn build_plan_brief_section(brief: Option<&str>) -> String {
+    format!(
+        "Plan Brief:\n{}\n\n",
+        brief
+            .map(str::trim)
+            .filter(|brief| !brief.is_empty())
+            .unwrap_or("- missing")
     )
 }
 
@@ -3813,6 +3897,101 @@ fn build_blockers_section(blockers: &[String]) -> String {
 
 fn build_extra_context_section(extra_context: &str) -> String {
     format!("Extra Context:\n{}\n\n", extra_context.trim())
+}
+
+fn build_task_card_context_section(state: &OrchestrationState, tasks: &[&Task]) -> String {
+    if tasks.is_empty() {
+        return String::new();
+    }
+
+    let mut section = String::from(
+        "Operator Task Card Bundle:\n\
+         Purpose: read-only multi-task evidence supplied by the operator. Do not call mmux from the worker session to reconstruct this context.\n\
+         Field checklist for each card: id, plan_id, slug, title, objective, status, outcome, gates, scope, blockers, edges, session.\n\
+         Validation rule: every gate must be addressed by the outcome, command evidence, an explicit caveat, or a named waiver.\n\n",
+    );
+    for task in tasks {
+        section.push_str(&format!("Task Card: {}\n", task.id.0));
+        section.push_str(&format!("Plan: {}\n", task.plan_id.0));
+        section.push_str(&format!("Slug: {}\n", task.slug));
+        section.push_str(&format!("Title: {}\n", task.title));
+        section.push_str(&format!("Status: {}\n", task_status_name(task.status)));
+        section.push_str(&format!("Objective:\n{}\n", task.objective));
+        section.push_str(&build_scope_section(&task.scope));
+        section.push_str(&build_gates_section(&task.gates));
+        section.push_str(&format!(
+            "Outcome:\n{}\n",
+            task.outcome.as_deref().unwrap_or("- none")
+        ));
+        section.push_str(&build_blockers_section(&task.blockers));
+        section.push_str("Incoming edges:\n");
+        section.push_str(&format_task_edges(
+            state,
+            &state
+                .task_edges
+                .iter()
+                .filter(|edge| edge.to == task.id)
+                .collect::<Vec<_>>(),
+        ));
+        section.push_str("Outgoing edges:\n");
+        section.push_str(&format_task_edges(
+            state,
+            &state
+                .task_edges
+                .iter()
+                .filter(|edge| edge.from == task.id)
+                .collect::<Vec<_>>(),
+        ));
+        section.push_str("Session:\n");
+        section.push_str(&format_task_session(task.session.as_ref()));
+        section.push('\n');
+    }
+    section
+}
+
+fn format_task_edges(state: &OrchestrationState, edges: &[&TaskEdge]) -> String {
+    if edges.is_empty() {
+        return "- none\n".into();
+    }
+    let mut labels = edges
+        .iter()
+        .map(|edge| {
+            format!(
+                "- {} -> {} kind={:?} note={}\n",
+                task_label(state, &edge.from),
+                task_label(state, &edge.to),
+                edge.kind,
+                edge.note.as_deref().unwrap_or("<none>")
+            )
+        })
+        .collect::<Vec<_>>();
+    labels.sort();
+    labels.concat()
+}
+
+fn format_task_session(session: Option<&TaskSession>) -> String {
+    let Some(record) = session else {
+        return "- none\n".into();
+    };
+    format!(
+        "- node={} session={} profile={} role={} kind={} skills={} workspace={} bypass_permissions={}\n",
+        record.node_id.0,
+        record.session.0,
+        record.profile,
+        record.role,
+        record.kind,
+        format_inline_list(&record.skills),
+        record.workspace_path,
+        record.bypass_permissions
+    )
+}
+
+fn format_inline_list(values: &[String]) -> String {
+    if values.is_empty() {
+        "<none>".into()
+    } else {
+        values.join(",")
+    }
 }
 
 fn format_string_list(values: &[String]) -> String {
@@ -3882,6 +4061,11 @@ fn filter_orchestration_status(
         .as_deref()
         .map(|selector| resolve_project_id_or_slug_from_status(&status, selector))
         .transpose()?;
+    let plan_filter = args
+        .plan_id
+        .as_deref()
+        .map(|selector| resolve_plan_id_or_slug_from_status(&status, selector))
+        .transpose()?;
     let task_filter = args.task_id.map(TaskId);
     if let Some(project_id) = project_filter.as_ref() {
         if !status
@@ -3892,23 +4076,47 @@ fn filter_orchestration_status(
             return Err(format!("project '{}' not found", project_id.0));
         }
     }
+    if let Some(plan_id) = plan_filter.as_ref() {
+        if !status.plans.iter().any(|plan| &plan.id == plan_id) {
+            return Err(format!("plan '{}' not found", plan_id.0));
+        }
+    }
     if let Some(task_id) = task_filter.as_ref() {
         if !status.tasks.iter().any(|task| &task.id == task_id) {
             return Err(format!("task '{}' not found", task_id.0));
         }
     }
 
-    status.tasks.retain(|task| {
+    status.plans.retain(|plan| {
         let project_matches = project_filter
             .as_ref()
-            .map(|project_id| &task.project_id == project_id)
+            .map(|project_id| &plan.project_id == project_id)
+            .unwrap_or(true);
+        let plan_matches = plan_filter
+            .as_ref()
+            .map(|plan_id| &plan.id == plan_id)
+            .unwrap_or(true);
+        let completion_matches = args.include_completed || !plan.status.is_finished();
+        project_matches && plan_matches && completion_matches
+    });
+    let visible_plan_ids = status
+        .plans
+        .iter()
+        .map(|plan| plan.id.clone())
+        .collect::<std::collections::HashSet<_>>();
+
+    status.tasks.retain(|task| {
+        let plan_visible = visible_plan_ids.contains(&task.plan_id);
+        let plan_matches = plan_filter
+            .as_ref()
+            .map(|plan_id| &task.plan_id == plan_id)
             .unwrap_or(true);
         let task_matches = task_filter
             .as_ref()
             .map(|task_id| &task.id == task_id)
             .unwrap_or(true);
         let completion_matches = args.include_completed || !task.status.is_finished();
-        project_matches && task_matches && completion_matches
+        plan_visible && plan_matches && task_matches && completion_matches
     });
 
     let visible_task_ids = status
@@ -3920,20 +4128,15 @@ fn filter_orchestration_status(
         visible_task_ids.contains(&edge.from) || visible_task_ids.contains(&edge.to)
     });
     status.sessions.retain(|session| {
-        task_filter
-            .as_ref()
-            .map(|task_id| {
-                session
-                    .task_ids
-                    .iter()
-                    .any(|session_task| session_task == task_id)
-            })
-            .unwrap_or(true)
+        if task_filter.is_some() || plan_filter.is_some() || project_filter.is_some() {
+            return visible_task_ids.contains(&session.task_id);
+        }
+        true
     });
     let visible_project_ids = status
-        .tasks
+        .plans
         .iter()
-        .map(|task| task.project_id.clone())
+        .map(|plan| plan.project_id.clone())
         .collect::<std::collections::HashSet<_>>();
     status.projects.retain(|project| {
         if let Some(project_id) = project_filter.as_ref() {
@@ -3964,9 +4167,44 @@ fn resolve_project_id_or_slug_from_status(
         .ok_or_else(|| format!("project '{selector}' not found"))
 }
 
+fn resolve_plan_id_or_slug_from_status(
+    status: &OrchestrationStatus,
+    plan_id_or_slug: &str,
+) -> Result<PlanId, String> {
+    let selector = plan_id_or_slug.trim();
+    if selector.is_empty() {
+        return Err("plan_id must not be empty".into());
+    }
+    if status.plans.iter().any(|plan| plan.id.0 == selector) {
+        return Ok(PlanId(selector.to_owned()));
+    }
+    let mut matches = status
+        .plans
+        .iter()
+        .filter(|plan| plan.slug == selector)
+        .collect::<Vec<_>>();
+    matches.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+    match matches.as_slice() {
+        [plan] => Ok(plan.id.clone()),
+        [] => Err(format!("plan '{selector}' not found")),
+        plans => {
+            let matches = plans
+                .iter()
+                .map(|plan| format!("{} in project {}", plan.id.0, plan.project_id.0))
+                .collect::<Vec<_>>()
+                .join(", ");
+            Err(format!(
+                "plan slug '{}' is ambiguous; matches: {}",
+                selector, matches
+            ))
+        }
+    }
+}
+
 fn summarize_orchestration_counts(status: &OrchestrationStatus) -> OrchestrationCounts {
     let mut counts = OrchestrationCounts {
         total_projects: status.projects.len(),
+        total_plans: status.plans.len(),
         total_tasks: status.tasks.len(),
         durable_session_records: status.sessions.len(),
         cleanup_candidates: status.cleanup_candidates.len(),
@@ -3976,6 +4214,22 @@ fn summarize_orchestration_counts(status: &OrchestrationStatus) -> Orchestration
         match project.status {
             ProjectStatus::Active => counts.active_projects += 1,
             ProjectStatus::Archived => counts.archived_projects += 1,
+        }
+    }
+    for plan in &status.plans {
+        if !plan.status.is_finished() {
+            counts.active_plans += 1;
+        }
+        if plan.status == PlanStatus::Blocked {
+            counts.blocked_plans += 1;
+        }
+        match plan.status {
+            PlanStatus::WaitingForValidation => counts.waiting_for_validation_plans += 1,
+            PlanStatus::Passed => counts.passed_plans += 1,
+            PlanStatus::Delivered => counts.delivered_plans += 1,
+            PlanStatus::Failed => counts.failed_plans += 1,
+            PlanStatus::Canceled => counts.canceled_plans += 1,
+            _ => {}
         }
     }
     for task in &status.tasks {
@@ -4167,12 +4421,11 @@ impl ServerHandler for TmuxMcpServer {
                         "session": { "type": "string", "description": "Session name (default: profile name)" },
                         "node": { "type": "string", "description": "Execution node id (default: local)" },
                         "workspace_path": { "type": "string", "description": "Backend-owned workspace/start directory for the selected node/backend. Used as the tmux start directory when creating the session." },
-                        "objective": { "type": "string", "description": "Short description of what this coder session is about" },
                         "bypass_permissions": { "type": "boolean", "description": "Use the profile's explicit permission_bypass_cmd for this session. This may disable the coder CLI's approval prompts or sandboxing. Default: false." },
-                        "task_ids": { "type": "array", "items": { "type": "string" }, "description": "Task IDs to record this coder session against. Enables task-aware recording." },
-                        "role": { "type": "string", "description": "Task participant role to persist when task_ids is provided." },
+                        "task_id": { "type": "string", "description": "Task ID to record this coder session against. Enables task-aware recording." },
+                        "role": { "type": "string", "description": "Task session role to persist when task_id is provided." },
                         "kind": { "type": "string", "description": "Task participant kind to persist and use in generated orchestration session names." },
-                        "skills": { "type": "array", "items": { "type": "string" }, "description": "Task participant skills to persist when task_ids is provided." },
+                        "skills": { "type": "array", "items": { "type": "string" }, "description": "Task session skills to persist when task_id is provided." },
                         "generate_session_name": { "type": "boolean", "description": "Generate an orchestration-owned session name mmux-{task_slug}-{kind}-{short_suffix}." }
                     }), None)),
                 ),
@@ -4259,6 +4512,7 @@ impl ServerHandler for TmuxMcpServer {
                         "include_dependencies": { "type": "boolean", "description": "Include parent/dependency/blocking task context (default: true)" },
                         "include_gates": { "type": "boolean", "description": "Include task gates (default: true)" },
                         "include_scope": { "type": "boolean", "description": "Include task scope paths and notes (default: true)" },
+                        "context_task_ids": { "type": "array", "items": { "type": "string" }, "description": "Optional task ids or unique slugs to render as an operator-supplied task-card bundle for multi-task validation/review" },
                         "extra_context": { "type": "string", "description": "Optional extra operator context appended before Instruction" }
                     }), Some(vec!["task_id_or_slug", "prompt"]))),
                 ),
@@ -4284,7 +4538,9 @@ impl ServerHandler for TmuxMcpServer {
                     }), Some(vec!["action"]))),
                 ),
             ];
-        tools.extend(Self::orchestration_tool_definitions());
+        tools.extend(Self::orchestration_tool_definitions(
+            self.policy.enable_admin_tools,
+        ));
         Ok(ListToolsResult::with_all_items(tools))
     }
 
@@ -4908,15 +5164,10 @@ impl ServerHandler for TmuxMcpServer {
                         Duration::from_secs(20),
                     )
                     .await;
-                let objective = self.node_session_objective(node, session).await;
-                let objective = objective
-                    .as_deref()
-                    .map(|value| format!("\nObjective: {}", value))
-                    .unwrap_or_default();
                 match (panes, windows) {
                     (Ok(panes), Ok(windows)) => Ok(Self::text_result(format!(
-                        "Node: {}\nSession: {}{}\nPanes:\n{}\nWindows:\n{}",
-                        node, session, objective, panes, windows
+                        "Node: {}\nSession: {}\nPanes:\n{}\nWindows:\n{}",
+                        node, session, panes, windows
                     ))),
                     (Err(e), _) | (_, Err(e)) => Ok(Self::error_result(e)),
                 }
@@ -5258,7 +5509,7 @@ impl ServerHandler for TmuxMcpServer {
                             PromptMessageRole::User,
                             PromptMessageContent::Text {
                                 text: format!(
-                                    "You are driving a coding CLI via mmux.\n\nProfile: {}\nSession: {}\n\nWorkflow:\n1. Start the session with start_coding_session using the profile-defined command\n2. For initial task delegation, use coding_task_send with task_id_or_slug, template, and a concrete instruction; for follow-up or non-task prompts, use coding_send\n3. Start a coding-ready wait with wait_start kind=coding-ready and this profile\n4. Poll wait_status until completed, failed, or canceled\n5. Use coding_read to capture the output\n6. Use coding_action (approve/reject/cancel/escape) to interact\n\ncoding_task_send templates:\n- task: initial implementation/delegation\n- validate: task gates and objective validation\n- review: correctness, regression, risk, missing-test, and scope-drift review\n- quality-guard: maintainability, architecture fit, naming, boundaries, lifecycle, API shape, and operator/project quality preferences\n\nTips:\n- check_state is a quick non-blocking way to inspect has_prompt, promptable, busy, and turn_idle\n- promptable means the CLI can accept text; turn_idle means foreground work has settled\n- resize_pane can help if the TUI layout is broken\n- capture_output with scrollback:true gets full history\n- Use wait_start with sentinel or prompt kind to detect specific output strings",
+                                    "You are driving a coding CLI via mmux.\n\nProfile: {}\nSession: {}\n\nWorkflow:\n1. Start the session with start_coding_session using the profile-defined command\n2. For initial task delegation, use coding_task_send with task_id_or_slug, template, and a concrete instruction; for follow-up or non-task prompts, use coding_send\n3. For validation/review spanning multiple tasks, pass context_task_ids so mmux renders operator-supplied task cards; do not ask the worker to call mmux for missing prior task results\n4. Start a coding-ready wait with wait_start kind=coding-ready and this profile\n5. Poll wait_status until completed, failed, or canceled\n6. Use coding_read to capture the output\n7. Use coding_action (approve/reject/cancel/escape) to interact\n\ncoding_task_send templates:\n- task: initial implementation/delegation\n- validate: task gates and objective validation; for task sets require field_coverage_table over supplied context_task_ids\n- review: correctness, regression, risk, missing-test, and scope-drift review\n- quality-guard: maintainability, architecture fit, naming, boundaries, lifecycle, API shape, and operator/project quality preferences\n\nTips:\n- check_state is a quick non-blocking way to inspect has_prompt, promptable, busy, and turn_idle\n- promptable means the CLI can accept text; turn_idle means foreground work has settled\n- resize_pane can help if the TUI layout is broken\n- capture_output with scrollback:true gets full history\n- Use wait_start with sentinel or prompt kind to detect specific output strings",
                                     profile, session
                                 ),
                             },
@@ -6231,6 +6482,54 @@ pub struct LocalProjectEntry {
     pub task_count: usize,
 }
 
+fn local_project_entry(
+    state: &OrchestrationState,
+    project: &mmux_controller_core::orchestration::Project,
+) -> LocalProjectEntry {
+    let task_count = state
+        .tasks
+        .values()
+        .filter(|task| task_project_id(state, task).as_ref() == Some(&project.id))
+        .count();
+    let active_task_count = state
+        .tasks
+        .values()
+        .filter(|task| {
+            task_project_id(state, task).as_ref() == Some(&project.id) && !task.status.is_finished()
+        })
+        .count();
+    LocalProjectEntry {
+        id: project.id.0.clone(),
+        slug: project.slug.clone(),
+        title: project.title.clone(),
+        status: format!("{:?}", project.status),
+        active_task_count,
+        task_count,
+    }
+}
+
+pub fn local_create_project(
+    store_path: Option<&Path>,
+    title: String,
+    description: String,
+    slug: Option<String>,
+) -> Result<LocalProjectEntry, String> {
+    let store_path = mmux_node::resolve_store_path(store_path)?;
+    let store = store::OrchestrationStore::open(store_path)?;
+    let mut state = store.load()?.unwrap_or_default();
+    let now_ms = now_ms();
+    let project = state.create_project(
+        CreateProject {
+            title,
+            description,
+            slug,
+        },
+        now_ms,
+    )?;
+    store.save(&state, now_ms)?;
+    Ok(local_project_entry(&state, &project))
+}
+
 pub fn local_projects(store_path: Option<&Path>) -> Result<Vec<LocalProjectEntry>, String> {
     let store_path = mmux_node::resolve_store_path(store_path)?;
     let store = store::OrchestrationStore::open(store_path)?;
@@ -6240,26 +6539,7 @@ pub fn local_projects(store_path: Option<&Path>) -> Result<Vec<LocalProjectEntry
     let mut projects = state
         .projects
         .values()
-        .map(|project| {
-            let task_count = state
-                .tasks
-                .values()
-                .filter(|task| task.project_id == project.id)
-                .count();
-            let active_task_count = state
-                .tasks
-                .values()
-                .filter(|task| task.project_id == project.id && !task.status.is_finished())
-                .count();
-            LocalProjectEntry {
-                id: project.id.0.clone(),
-                slug: project.slug.clone(),
-                title: project.title.clone(),
-                status: format!("{:?}", project.status),
-                active_task_count,
-                task_count,
-            }
-        })
+        .map(|project| local_project_entry(&state, project))
         .collect::<Vec<_>>();
     projects.sort_by(|left, right| {
         left.id
@@ -6275,16 +6555,64 @@ pub struct LocalPruneStoreReport {
     pub dry_run: bool,
     pub sessions_only: bool,
     pub candidates: Vec<LocalPruneSessionCandidate>,
-    pub pruned_count: usize,
+    pub pruned_session_count: usize,
+    pub pruned_plan_count: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct LocalPruneSessionCandidate {
     pub key: String,
     pub session: String,
-    pub task_ids: Vec<String>,
+    pub task_id: String,
     pub last_seen_ms: u64,
     pub reason: String,
+}
+
+pub(crate) fn prune_finished_plans(
+    state: &mut OrchestrationState,
+    sessions_only: bool,
+    cutoff_ms: Option<u64>,
+) -> usize {
+    if sessions_only {
+        return 0;
+    }
+    let plan_ids = state
+        .plans
+        .iter()
+        .filter(|(plan_id, plan)| {
+            if !plan.status.is_finished() {
+                return false;
+            }
+            let plan_finished_at_ms = plan.completed_at_ms.unwrap_or(plan.updated_at_ms);
+            if cutoff_ms.is_some_and(|cutoff_ms| plan_finished_at_ms > cutoff_ms) {
+                return false;
+            }
+            state
+                .tasks
+                .values()
+                .filter(|task| &task.plan_id == *plan_id)
+                .all(|task| task.status.is_finished())
+        })
+        .map(|(plan_id, _)| plan_id.clone())
+        .collect::<Vec<_>>();
+    let pruned_count = plan_ids.len();
+    let plan_ids = plan_ids.into_iter().collect::<HashSet<_>>();
+    let task_ids = state
+        .tasks
+        .iter()
+        .filter(|(_, task)| plan_ids.contains(&task.plan_id))
+        .map(|(task_id, _)| task_id.clone())
+        .collect::<HashSet<_>>();
+    for plan_id in &plan_ids {
+        state.plans.remove(&plan_id);
+    }
+    for task_id in &task_ids {
+        state.tasks.remove(task_id);
+    }
+    state
+        .task_edges
+        .retain(|edge| !task_ids.contains(&edge.from) && !task_ids.contains(&edge.to));
+    pruned_count
 }
 
 pub fn local_prune_store(
@@ -6301,7 +6629,8 @@ pub fn local_prune_store(
             dry_run,
             sessions_only,
             candidates: Vec::new(),
-            pruned_count: 0,
+            pruned_session_count: 0,
+            pruned_plan_count: 0,
         });
     };
     let now_ms = now_ms();
@@ -6313,38 +6642,26 @@ pub fn local_prune_store(
         })
         .transpose()?;
     let mut candidates = state
-        .sessions
-        .iter()
-        .filter_map(|(key, session)| {
+        .tasks
+        .values()
+        .filter_map(|task| {
+            let session = task.session.as_ref()?;
             if session.node_id.0 != "local" {
                 return None;
             }
             if live_local_sessions.contains(&session.session.0) {
                 return None;
             }
-            if session.task_ids.is_empty() {
-                return None;
-            }
             if cutoff_ms.is_some_and(|cutoff_ms| session.last_seen_ms > cutoff_ms) {
                 return None;
             }
-            let all_tasks_finished = session.task_ids.iter().all(|task_id| {
-                state
-                    .tasks
-                    .get(task_id)
-                    .is_some_and(|task| task.status.is_finished())
-            });
-            if !all_tasks_finished {
+            if !task.status.is_finished() {
                 return None;
             }
             Some(LocalPruneSessionCandidate {
-                key: key.clone(),
+                key: session.key(),
                 session: session.session.0.clone(),
-                task_ids: session
-                    .task_ids
-                    .iter()
-                    .map(|task_id| task_id.0.clone())
-                    .collect(),
+                task_id: task.id.0.clone(),
                 last_seen_ms: session.last_seen_ms,
                 reason: "missing local tmux session attached only to finished tasks".into(),
             })
@@ -6355,18 +6672,31 @@ pub fn local_prune_store(
             .cmp(&right.session)
             .then_with(|| left.key.cmp(&right.key))
     });
-    let pruned_count = candidates.len();
-    if !dry_run && pruned_count > 0 {
+    let pruned_session_count = candidates.len();
+    let pruned_plan_count = if dry_run {
+        let mut preview = state.clone();
         for candidate in &candidates {
-            state.sessions.remove(&candidate.key);
+            if let Some(task) = preview.tasks.get_mut(&TaskId(candidate.task_id.clone())) {
+                task.session = None;
+            }
         }
+        prune_finished_plans(&mut preview, sessions_only, cutoff_ms)
+    } else {
+        for candidate in &candidates {
+            if let Some(task) = state.tasks.get_mut(&TaskId(candidate.task_id.clone())) {
+                task.session = None;
+            }
+        }
+        let pruned_plan_count = prune_finished_plans(&mut state, sessions_only, cutoff_ms);
         store.save(&state, now_ms)?;
-    }
+        pruned_plan_count
+    };
     Ok(LocalPruneStoreReport {
         dry_run,
         sessions_only,
         candidates,
-        pruned_count,
+        pruned_session_count,
+        pruned_plan_count,
     })
 }
 
@@ -6390,22 +6720,12 @@ pub fn local_project_session_names(
         .find(|candidate| candidate.id.0 == project || candidate.slug == project)
         .map(|candidate| candidate.id.clone())
         .ok_or_else(|| format!("project '{project}' not found"))?;
-    let task_ids = state
+    let sessions = state
         .tasks
         .values()
-        .filter(|task| task.project_id == project_id)
-        .map(|task| task.id.clone())
-        .collect::<HashSet<_>>();
-    let sessions = state
-        .sessions
-        .values()
+        .filter(|task| task_project_id(&state, task).as_ref() == Some(&project_id))
+        .filter_map(|task| task.session.as_ref())
         .filter(|session| session.node_id.0 == "local")
-        .filter(|session| {
-            session
-                .task_ids
-                .iter()
-                .any(|task_id| task_ids.contains(task_id))
-        })
         .map(|session| session.session.0.clone())
         .collect();
     Ok(sessions)
@@ -6480,8 +6800,8 @@ mod tests {
     use super::*;
     use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
     use mmux_controller_core::orchestration::{
-        CreateProject, CreateTask, OrchestrationState, Project, ProjectSummary, Task, TaskEdge,
-        TaskSummary,
+        CreateProject, CreateTask, OrchestrationState, Plan, Project, ProjectSummary, Task,
+        TaskEdge, TaskSummary,
     };
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -6512,6 +6832,7 @@ mod tests {
             tmux_config: None,
             allow_remote_without_mcp_token: false,
             allow_unauthenticated_node_wire: false,
+            enable_admin_tools: true,
             max_read_bytes: 4 * 1024 * 1024,
             max_write_bytes: 4 * 1024 * 1024,
             max_timeout_seconds: 120.0,
@@ -6694,11 +7015,34 @@ mod tests {
         project: &Project,
         title: &str,
     ) -> Task {
+        let plan = create_test_plan_in_project(server, project, &format!("{title} Plan")).await;
+        create_test_task_in_plan(server, &plan, title).await
+    }
+
+    async fn create_test_plan_in_project(
+        server: &TmuxMcpServer,
+        project: &Project,
+        title: &str,
+    ) -> Plan {
+        let result = call_orchestration(
+            server,
+            "plan_create",
+            json!({
+                "project_id": project.id.0,
+                "title": title,
+                "brief": format!("Detailed plan brief for {title}")
+            }),
+        )
+        .unwrap();
+        result_json(&result)
+    }
+
+    async fn create_test_task_in_plan(server: &TmuxMcpServer, plan: &Plan, title: &str) -> Task {
         let result = call_orchestration(
             server,
             "task_create",
             json!({
-                "project_id": project.id.0,
+                "plan_id": plan.id.0,
                 "title": title,
                 "objective": format!("Objective for {title}")
             }),
@@ -6760,6 +7104,7 @@ mod tests {
             include_dependencies: None,
             include_gates: None,
             include_scope: None,
+            context_task_ids: None,
             extra_context: None,
         }
     }
@@ -6901,8 +7246,8 @@ mod tests {
 
     #[test]
     fn test_orchestration_tools_are_listed_by_helper() {
-        let tools = TmuxMcpServer::orchestration_tool_definitions();
-        let names = tools
+        let admin_tools = TmuxMcpServer::orchestration_tool_definitions(true);
+        let admin_names = admin_tools
             .iter()
             .map(|tool| tool.name.as_ref())
             .collect::<Vec<_>>();
@@ -6911,9 +7256,12 @@ mod tests {
             "project_create",
             "project_list",
             "project_status_update",
+            "plan_create",
+            "plan_list",
+            "plan_update",
+            "plan_status_update",
             "task_create",
             "task_update",
-            "task_assign",
             "task_edge_add",
             "task_edge_remove",
             "session_record",
@@ -6921,8 +7269,74 @@ mod tests {
             "orchestration_status",
             "orchestration_cleanup_zombies",
         ] {
-            assert!(names.contains(&expected), "missing {expected}");
+            assert!(admin_names.contains(&expected), "missing {expected}");
         }
+
+        let non_admin_tools = TmuxMcpServer::orchestration_tool_definitions(false);
+        let non_admin_names = non_admin_tools
+            .iter()
+            .map(|tool| tool.name.as_ref())
+            .collect::<Vec<_>>();
+        assert!(non_admin_names.contains(&"project_list"));
+        assert!(!non_admin_names.contains(&"project_create"));
+        assert!(!non_admin_names.contains(&"project_status_update"));
+    }
+
+    #[tokio::test]
+    async fn test_project_mutation_tools_require_admin_flag_but_project_list_does_not() {
+        let dir = unique_temp_dir("mmux-mcp-admin-tools");
+        let mut cli = test_cli();
+        cli.enable_admin_tools = false;
+        let (registry, _registry_handle) = Actor::spawn(None, NodeRegistryActor, None)
+            .await
+            .expect("registry actor");
+        let (node_executor, _node_executor_handle) = Actor::spawn(
+            None,
+            NodeExecutionActor,
+            NodeExecutionWorkerState {
+                embedded: None,
+                registry: registry.clone(),
+            },
+        )
+        .await
+        .expect("node execution actor");
+        let server = TmuxMcpServer::new(
+            Arc::new(HashMap::new()),
+            None,
+            ControllerPolicy::new(&cli).unwrap(),
+            node_executor,
+            registry,
+            orchestration_actor::OrchestrationHandle::open(Some(&dir)).unwrap(),
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+
+        let create_error = call_orchestration(
+            &server,
+            "project_create",
+            json!({ "title": "Admin Project" }),
+        )
+        .unwrap_err();
+        assert!(
+            create_error.message.contains("--enable-admin-tools"),
+            "{create_error}"
+        );
+
+        let status_error = call_orchestration(
+            &server,
+            "project_status_update",
+            json!({ "project_id": "missing", "status": "Archived" }),
+        )
+        .unwrap_err();
+        assert!(
+            status_error.message.contains("--enable-admin-tools"),
+            "{status_error}"
+        );
+
+        let projects: Vec<ProjectSummary> =
+            result_json(&call_orchestration(&server, "project_list", json!({})).unwrap());
+        assert!(projects.is_empty());
+        let _ = fs::remove_dir_all(dir);
     }
 
     fn local_info(session: &str, created_at_seconds: u64) -> LocalSessionInfo {
@@ -6932,61 +7346,72 @@ mod tests {
         }
     }
 
-    fn recorded_session(session: &str, task_ids: Vec<TaskId>) -> SessionRecord {
-        SessionRecord {
+    fn recorded_session(session: &str) -> TaskSession {
+        TaskSession {
             node_id: NodeId("local".into()),
             session: SessionId(session.into()),
             profile: "codex".into(),
-            workspace_path: Some("/workspace".into()),
+            workspace_path: "/workspace".into(),
             bypass_permissions: false,
-            task_ids,
             role: "implementation-worker".into(),
             kind: "codex".into(),
             skills: vec!["rust".into()],
-            objective: Some("recover active work".into()),
             created_at_ms: 0,
             updated_at_ms: 0,
             last_seen_ms: 0,
         }
     }
 
-    fn state_with_task(status: TaskStatus, with_agent: bool) -> (OrchestrationState, TaskId) {
+    fn create_state_plan(state: &mut OrchestrationState, project: &Project) -> Plan {
+        state
+            .create_plan(
+                CreatePlan {
+                    project_id: project.id.clone(),
+                    title: "Plan".into(),
+                    brief: "Detailed plan brief for test task derivation.".into(),
+                    slug: Some("plan".into()),
+                },
+                95,
+            )
+            .unwrap()
+    }
+
+    fn state_with_task(status: TaskStatus) -> (OrchestrationState, TaskId) {
         let mut state = OrchestrationState::new();
         let project = state
             .create_project(
                 CreateProject {
                     title: "Project".into(),
-                    description: None,
+                    description: "Test project".into(),
                     slug: None,
                 },
                 90,
             )
             .unwrap();
-        let mut task = state
+        let plan = state
+            .create_plan(
+                CreatePlan {
+                    project_id: project.id,
+                    title: "Plan".into(),
+                    brief: "Detailed plan brief for test task.".into(),
+                    slug: None,
+                },
+                95,
+            )
+            .unwrap();
+        let task = state
             .create_task(
                 CreateTask {
-                    project_id: project.id,
+                    plan_id: plan.id,
                     title: "Task".into(),
                     objective: "Objective".into(),
                     scope: TaskScope::default(),
-                    agents: Vec::new(),
                     gates: Vec::new(),
                     slug: None,
                 },
                 100,
             )
             .unwrap();
-        if with_agent {
-            task.agents.push(TaskAgent {
-                kind: "codex".into(),
-                role: "implementation-worker".into(),
-                skills: vec!["rust".into()],
-                workspace_path: Some("/workspace".into()),
-                objective: Some("work".into()),
-                prompt: "work".into(),
-            });
-            state.tasks.insert(task.id.clone(), task.clone());
-        }
         if status != TaskStatus::Backlog {
             state.update_task_status(&task.id, status, 200).unwrap();
         }
@@ -7079,31 +7504,54 @@ mod tests {
             .create_project(
                 CreateProject {
                     title: "Project".into(),
-                    description: None,
+                    description: "Test project".into(),
                     slug: None,
                 },
                 90,
             )
             .unwrap();
-        let task = state
+        let plan = state
+            .create_plan(
+                CreatePlan {
+                    project_id: project.id,
+                    title: "Plan".into(),
+                    brief: "Detailed plan brief for runtime status.".into(),
+                    slug: None,
+                },
+                95,
+            )
+            .unwrap();
+        let live_task = state
             .create_task(
                 CreateTask {
-                    project_id: project.id,
-                    title: "Runtime".into(),
-                    objective: "Status".into(),
+                    plan_id: plan.id.clone(),
+                    title: "Runtime Live".into(),
+                    objective: "Live status".into(),
                     scope: TaskScope::default(),
-                    agents: Vec::new(),
                     gates: Vec::new(),
                     slug: None,
                 },
                 100,
             )
             .unwrap();
-        state
-            .record_session(recorded_session("mmux-live", vec![task.id.clone()]), 110)
+        let missing_task = state
+            .create_task(
+                CreateTask {
+                    plan_id: plan.id,
+                    title: "Runtime Missing".into(),
+                    objective: "Missing status".into(),
+                    scope: TaskScope::default(),
+                    gates: Vec::new(),
+                    slug: None,
+                },
+                101,
+            )
             .unwrap();
         state
-            .record_session(recorded_session("mmux-missing", vec![task.id]), 120)
+            .record_session(&live_task.id, recorded_session("mmux-live"), 110)
+            .unwrap();
+        state
+            .record_session(&missing_task.id, recorded_session("mmux-missing"), 120)
             .unwrap();
         let mut status = state.orchestration_status(200);
         let live = vec![local_info("mmux-live", 10), local_info("mmux-zombie", 10)];
@@ -7127,9 +7575,9 @@ mod tests {
 
     #[test]
     fn test_missing_active_stored_session_is_planned_for_recreation() {
-        let (mut state, task_id) = state_with_task(TaskStatus::Running, false);
+        let (mut state, task_id) = state_with_task(TaskStatus::Running);
         state
-            .record_session(recorded_session("mmux-active", vec![task_id]), 200)
+            .record_session(&task_id, recorded_session("mmux-active"), 200)
             .unwrap();
 
         let actions =
@@ -7144,10 +7592,10 @@ mod tests {
 
     #[test]
     fn test_missing_active_stored_session_reports_when_not_recreatable() {
-        let (mut state, task_id) = state_with_task(TaskStatus::Running, false);
-        let mut record = recorded_session("mmux-active", vec![task_id]);
+        let (mut state, task_id) = state_with_task(TaskStatus::Running);
+        let mut record = recorded_session("mmux-active");
         record.profile = "missing-profile".into();
-        state.record_session(record, 200).unwrap();
+        state.record_session(&task_id, record, 200).unwrap();
 
         let actions =
             plan_local_startup_reconciliation(&state, &[], &profile_registry(ready_profile()));
@@ -7160,20 +7608,10 @@ mod tests {
     }
 
     #[test]
-    fn test_active_task_agents_without_session_records_do_not_spawn_reconciliation() {
-        let (state, _) = state_with_task(TaskStatus::Running, true);
-
-        let actions =
-            plan_local_startup_reconciliation(&state, &[], &profile_registry(ready_profile()));
-
-        assert!(actions.is_empty());
-    }
-
-    #[test]
     fn test_finished_missing_stored_session_remains_historical() {
-        let (mut state, task_id) = state_with_task(TaskStatus::Delivered, false);
+        let (mut state, task_id) = state_with_task(TaskStatus::Delivered);
         state
-            .record_session(recorded_session("mmux-finished", vec![task_id]), 200)
+            .record_session(&task_id, recorded_session("mmux-finished"), 200)
             .unwrap();
 
         let actions =
@@ -7186,30 +7624,108 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn test_local_prune_store_prunes_finished_plans_and_contained_tasks() {
+        let dir = unique_temp_dir("mmux-local-prune-plans");
+        let store = store::OrchestrationStore::open(dir.clone()).unwrap();
+        let mut state = OrchestrationState::new();
+        let project = state
+            .create_project(
+                CreateProject {
+                    title: "Project".into(),
+                    description: "Test project".into(),
+                    slug: None,
+                },
+                90,
+            )
+            .unwrap();
+        let plan = create_state_plan(&mut state, &project);
+        let parent = state
+            .create_task(
+                CreateTask {
+                    plan_id: plan.id.clone(),
+                    title: "Parent".into(),
+                    objective: "Parent objective".into(),
+                    scope: TaskScope::default(),
+                    gates: Vec::new(),
+                    slug: None,
+                },
+                100,
+            )
+            .unwrap();
+        let child = state
+            .create_task(
+                CreateTask {
+                    plan_id: plan.id.clone(),
+                    title: "Child".into(),
+                    objective: "Child objective".into(),
+                    scope: TaskScope::default(),
+                    gates: Vec::new(),
+                    slug: None,
+                },
+                101,
+            )
+            .unwrap();
+        state
+            .add_task_edge(
+                CreateTaskEdge {
+                    from: parent.id.clone(),
+                    to: child.id.clone(),
+                    kind: TaskEdgeKind::Related,
+                    note: None,
+                },
+                102,
+            )
+            .unwrap();
+        state
+            .record_session(&child.id, recorded_session("mmux-finished"), 103)
+            .unwrap();
+        state
+            .update_task_status(&parent.id, TaskStatus::Delivered, 104)
+            .unwrap();
+        state
+            .update_task_status(&child.id, TaskStatus::Delivered, 105)
+            .unwrap();
+        state
+            .update_plan_status(&plan.id, PlanStatus::Delivered, Some("done".into()), 106)
+            .unwrap();
+        store.save(&state, 107).unwrap();
+
+        let live = HashSet::new();
+        let dry_run = local_prune_store(Some(&dir), &live, true, false, None).unwrap();
+        assert_eq!(dry_run.pruned_session_count, 1);
+        assert_eq!(dry_run.pruned_plan_count, 1);
+        assert_eq!(store.load().unwrap().unwrap().plans.len(), 1);
+
+        let pruned = local_prune_store(Some(&dir), &live, false, false, None).unwrap();
+        assert_eq!(pruned.pruned_session_count, 1);
+        assert_eq!(pruned.pruned_plan_count, 1);
+        let loaded = store.load().unwrap().unwrap();
+        assert!(loaded.projects.contains_key(&project.id));
+        assert!(loaded.plans.is_empty());
+        assert!(loaded.tasks.is_empty());
+        assert!(loaded.task_edges.is_empty());
+        assert!(loaded.tasks.is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn test_task_create_json_parsing_and_persistence() {
         let dir = unique_temp_dir("mmux-mcp-task-create");
         let server = test_orchestration_server(&dir).await;
         let project = ensure_test_project(&server).await;
+        let plan = create_test_plan_in_project(&server, &project, "Tooling Plan").await;
 
         let result = call_orchestration(
             &server,
             "task_create",
             json!({
-                "project_id": project.id.0,
+                "plan_id": plan.id.0,
                 "title": "Implement Tooling",
                 "objective": "Expose orchestration tools",
                 "include_paths": ["crates/mmux-controller/src/lib.rs"],
                 "exclude_paths": ["target"],
                 "notes": "controller only",
-                "agents": [{
-                    "kind": "codex",
-                    "role": "implementation-worker",
-                    "skills": ["rust"],
-                    "workspace_path": "/workspace",
-                    "objective": "implement task",
-                    "prompt": "Do the focused task."
-                }],
                 "gates": ["cargo test -p mmux-controller"]
             }),
         )
@@ -7223,7 +7739,6 @@ mod tests {
             task.scope.include_paths,
             vec!["crates/mmux-controller/src/lib.rs"]
         );
-        assert_eq!(task.agents.len(), 1);
         assert!(state.tasks.contains_key(&task.id));
         let projects: Vec<ProjectSummary> =
             result_json(&call_orchestration(&server, "project_list", json!({})).unwrap());
@@ -7245,8 +7760,10 @@ mod tests {
         let dir = unique_temp_dir("mmux-mcp-task-update");
         let server =
             test_orchestration_server_with_profiles(&dir, profile_registry(ready_profile())).await;
-        let task = create_test_task(&server, "Original Update").await;
-        let related = create_test_task(&server, "Related Update").await;
+        let project = ensure_test_project(&server).await;
+        let plan = create_test_plan_in_project(&server, &project, "Update Plan").await;
+        let task = create_test_task_in_plan(&server, &plan, "Original Update").await;
+        let related = create_test_task_in_plan(&server, &plan, "Related Update").await;
 
         call_orchestration(
             &server,
@@ -7261,21 +7778,22 @@ mod tests {
         .unwrap();
         server
             .orchestration
-            .record_session(SessionRecord {
-                node_id: NodeId("node-a".into()),
-                session: SessionId("worker-a".into()),
-                profile: "codex".into(),
-                workspace_path: Some("/workspace/project".into()),
-                bypass_permissions: false,
-                task_ids: vec![task.id.clone()],
-                role: "implementation-worker".into(),
-                kind: "codex".into(),
-                skills: vec!["rust".into()],
-                objective: Some("keep runtime metadata".into()),
-                created_at_ms: 0,
-                updated_at_ms: 0,
-                last_seen_ms: 0,
-            })
+            .record_session(
+                task.id.clone(),
+                TaskSession {
+                    node_id: NodeId("node-a".into()),
+                    session: SessionId("worker-a".into()),
+                    profile: "codex".into(),
+                    workspace_path: "/workspace/project".into(),
+                    bypass_permissions: false,
+                    role: "implementation-worker".into(),
+                    kind: "codex".into(),
+                    skills: vec!["rust".into()],
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                    last_seen_ms: 0,
+                },
+            )
             .unwrap();
         let failed: Task = result_json(
             &call_orchestration(
@@ -7284,7 +7802,7 @@ mod tests {
                 json!({
                     "task_id": task.id.0,
                     "status": "Failed",
-                    "summary": "status must stay failed"
+                    "outcome": "status must stay failed"
                 }),
             )
             .unwrap(),
@@ -7301,14 +7819,6 @@ mod tests {
                 "include_paths": ["crates/mmux-controller/src/lib.rs"],
                 "exclude_paths": [],
                 "notes": "updated notes",
-                "agents": [{
-                    "kind": "codex",
-                    "role": "validator",
-                    "skills": ["rust"],
-                    "workspace_path": "/workspace",
-                    "objective": "validate the update",
-                    "prompt": "Review the task update."
-                }],
                 "gates": ["review", "tests"]
             }),
         )
@@ -7325,8 +7835,6 @@ mod tests {
         );
         assert!(updated.scope.exclude_paths.is_empty());
         assert_eq!(updated.scope.notes.as_deref(), Some("updated notes"));
-        assert_eq!(updated.agents.len(), 1);
-        assert_eq!(updated.agents[0].role, "validator");
         assert_eq!(updated.gates, vec!["review", "tests"]);
         assert_eq!(updated.status, TaskStatus::Failed);
         assert_eq!(updated.completed_at_ms, failed.completed_at_ms);
@@ -7334,7 +7842,10 @@ mod tests {
 
         let after = server.orchestration.snapshot().unwrap();
         assert_eq!(after.task_edges, before.task_edges);
-        assert_eq!(after.sessions, before.sessions);
+        assert_eq!(
+            after.tasks.get(&task.id).unwrap().session,
+            before.tasks.get(&task.id).unwrap().session
+        );
 
         let status: OrchestrationStatus = result_json(
             &call_orchestration(
@@ -7355,13 +7866,13 @@ mod tests {
             .unwrap()
             .clone();
         assert_eq!(reloaded_task.scope, updated.scope);
-        assert_eq!(reloaded_task.agents, updated.agents);
+        assert_eq!(reloaded_task.session, updated.session);
         assert_eq!(reloaded_task.gates, updated.gates);
         let _ = fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
-    async fn test_orchestration_task_update_rejects_unknown_fields_and_agent_runtime_fields() {
+    async fn test_orchestration_task_update_rejects_unknown_fields() {
         let dir = unique_temp_dir("mmux-mcp-task-update-reject");
         let server = test_orchestration_server(&dir).await;
         let task = create_test_task(&server, "Reject Update").await;
@@ -7381,140 +7892,40 @@ mod tests {
             );
         }
 
-        for field in ["count", "profile", "node", "node_id", "bypass_permissions"] {
-            let mut agent = json!({
-                "kind": "codex",
-                "role": "implementation-worker",
-                "skills": ["rust"],
-                "prompt": "Do it."
-            });
-            agent
-                .as_object_mut()
-                .unwrap()
-                .insert(field.into(), json!("bad"));
-            let error = call_orchestration(
-                &server,
-                "task_update",
-                json!({
-                    "task_id": task.id.0,
-                    "agents": [agent]
-                }),
-            )
-            .unwrap_err();
-
-            assert!(
-                error.message.contains(field),
-                "expected error for {field}, got {error}"
-            );
-            assert!(
-                error.message.contains("runtime placement field"),
-                "unclear error for {field}: {error}"
-            );
-        }
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn test_task_create_rejects_runtime_placement_fields_in_agents() {
-        let dir = unique_temp_dir("mmux-mcp-agent-fields");
-        let server = test_orchestration_server(&dir).await;
-        let project = ensure_test_project(&server).await;
-
-        for field in ["count", "profile", "node", "node_id", "bypass_permissions"] {
-            let mut agent = json!({
-                "kind": "codex",
-                "role": "implementation-worker",
-                "skills": ["rust"],
-                "prompt": "Do it."
-            });
-            agent
-                .as_object_mut()
-                .unwrap()
-                .insert(field.into(), json!("bad"));
-            let error = call_orchestration(
-                &server,
-                "task_create",
-                json!({
-                    "project_id": project.id.0,
-                    "title": "Bad Agent",
-                    "objective": "Reject placement",
-                    "agents": [agent]
-                }),
-            )
-            .unwrap_err();
-
-            assert!(
-                error.message.contains(field),
-                "expected error for {field}, got {error}"
-            );
-            assert!(
-                error.message.contains("runtime placement field"),
-                "unclear error for {field}: {error}"
-            );
-        }
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn test_task_assign_updates_owner() {
-        let dir = unique_temp_dir("mmux-mcp-task-assign");
-        let server =
-            test_orchestration_server_with_profiles(&dir, profile_registry(ready_profile())).await;
-        let task = create_test_task(&server, "Assignable").await;
-
-        let result = call_orchestration(
-            &server,
-            "task_assign",
-            json!({
-                "task_id": task.id.0,
-                "node_id": "node-a",
-                "session": "worker-a",
-                "profile": "codex",
-                "role": "implementation-worker",
-                "kind": "codex",
-                "skills": ["rust"]
-            }),
-        )
-        .unwrap();
-        let assigned: Task = result_json(&result);
-
-        let owner = assigned.owner.unwrap();
-        assert_eq!(owner.node_id.0, "node-a");
-        assert_eq!(owner.session.0, "worker-a");
-        assert_eq!(owner.profile, "codex");
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn test_task_assign_rejects_unknown_profile() {
-        let dir = unique_temp_dir("mmux-mcp-task-assign-profile");
-        let server = test_orchestration_server(&dir).await;
-        let task = create_test_task(&server, "Assignable").await;
-
         let error = call_orchestration(
             &server,
-            "task_assign",
+            "task_update",
             json!({
                 "task_id": task.id.0,
-                "node_id": "node-a",
-                "session": "worker-a",
-                "profile": "missing",
-                "role": "implementation-worker",
-                "kind": "codex"
+                "agents": []
             }),
         )
         .unwrap_err();
+        assert!(error.message.contains("unknown field"));
+        assert!(error.message.contains("agents"));
+        let _ = fs::remove_dir_all(dir);
+    }
 
-        assert!(error.message.contains("unknown profile"));
-        assert!(server
-            .orchestration
-            .snapshot()
-            .unwrap()
-            .tasks
-            .get(&task.id)
-            .unwrap()
-            .owner
-            .is_none());
+    #[tokio::test]
+    async fn test_task_create_rejects_agents_field() {
+        let dir = unique_temp_dir("mmux-mcp-agent-fields");
+        let server = test_orchestration_server(&dir).await;
+        let project = ensure_test_project(&server).await;
+        let plan = create_test_plan_in_project(&server, &project, "Agent Field Rejection").await;
+
+        let error = call_orchestration(
+            &server,
+            "task_create",
+            json!({
+                "plan_id": plan.id.0,
+                "title": "Bad Agent",
+                "objective": "Reject placement",
+                "agents": []
+            }),
+        )
+        .unwrap_err();
+        assert!(error.message.contains("unknown field"));
+        assert!(error.message.contains("agents"));
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -7552,23 +7963,101 @@ mod tests {
                 "profile": "codex",
                 "workspace_path": "/workspace/project",
                 "bypass_permissions": true,
-                "task_ids": [task.id.0],
+                "task_id": task.id.0,
                 "role": "implementation-worker",
                 "kind": "model-owner",
-                "skills": ["rust"],
-                "objective": "implement task-aware recording"
+                "skills": ["rust"]
             }),
         )
         .await
         .unwrap();
-        let record: SessionRecord = result_json(&result);
+        let record: TaskSession = result_json(&result);
 
         assert_eq!(record.node_id.0, "local");
         assert_eq!(record.session.0, "worker-a");
         assert_eq!(record.profile, "codex");
-        assert_eq!(record.task_ids, vec![task.id]);
         assert!(record.bypass_permissions);
+        assert_eq!(
+            server
+                .orchestration
+                .snapshot()
+                .unwrap()
+                .tasks
+                .get(&task.id)
+                .unwrap()
+                .session
+                .as_ref()
+                .unwrap()
+                .session
+                .0,
+            "worker-a"
+        );
         test_kill_session(&server, "worker-a").await;
+        let _ = fs::remove_dir_all(local_dir);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn test_session_record_replaces_task_session_and_stops_old_session() {
+        let dir = unique_temp_dir("mmux-mcp-session-record-replace");
+        let local_dir = unique_temp_dir("mmux-mcp-session-record-replace-local");
+        let server = test_coding_server(&dir, &local_dir, profile_registry(ready_profile())).await;
+        let task = create_test_task(&server, "Replace Record").await;
+        test_create_session(&server, "worker-old", "sleep 30").await;
+        test_create_session(&server, "worker-new", "sleep 30").await;
+
+        call_session_record(
+            &server,
+            json!({
+                "node_id": "local",
+                "session": "worker-old",
+                "profile": "codex",
+                "workspace_path": "/workspace/project",
+                "bypass_permissions": false,
+                "task_id": task.id.0,
+                "role": "implementation-worker",
+                "kind": "coder",
+                "skills": ["rust"]
+            }),
+        )
+        .await
+        .unwrap();
+
+        let result = call_session_record(
+            &server,
+            json!({
+                "node_id": "local",
+                "session": "worker-new",
+                "profile": "codex",
+                "workspace_path": "/workspace/project",
+                "bypass_permissions": false,
+                "task_id": task.id.0,
+                "role": "implementation-worker",
+                "kind": "coder",
+                "skills": ["rust"]
+            }),
+        )
+        .await
+        .unwrap();
+        let record: TaskSession = result_json(&result);
+
+        assert_eq!(record.session.0, "worker-new");
+        assert!(!test_session_exists(&server, "worker-old").await);
+        assert!(test_session_exists(&server, "worker-new").await);
+        assert_eq!(
+            server
+                .orchestration
+                .snapshot()
+                .unwrap()
+                .tasks
+                .get(&task.id)
+                .and_then(|task| task.session.as_ref())
+                .unwrap()
+                .session
+                .0,
+            "worker-new"
+        );
+        test_kill_session(&server, "worker-new").await;
         let _ = fs::remove_dir_all(local_dir);
         let _ = fs::remove_dir_all(dir);
     }
@@ -7599,25 +8088,40 @@ mod tests {
                 "project_create",
                 json!({
                     "title": "Slug Selectable",
+                    "description": "Project for slug selector tests",
                     "slug": "slug-selectable"
                 }),
             )
             .unwrap(),
         );
 
+        let plan: Plan = result_json(
+            &call_orchestration(
+                &server,
+                "plan_create",
+                json!({
+                    "project_id": "slug-selectable",
+                    "title": "Plan via slug",
+                    "brief": "Detailed plan brief selected by project slug."
+                }),
+            )
+            .unwrap(),
+        );
+        assert_eq!(plan.project_id, project.id);
+
         let task: Task = result_json(
             &call_orchestration(
                 &server,
                 "task_create",
                 json!({
-                    "project_id": "slug-selectable",
+                    "plan_id": plan.id.0,
                     "title": "Task via slug",
-                    "objective": "Use the project slug as selector"
+                    "objective": "Use the plan as selector"
                 }),
             )
             .unwrap(),
         );
-        assert_eq!(task.project_id, project.id);
+        assert_eq!(task.plan_id, plan.id);
 
         let archived: Project = result_json(
             &call_orchestration(
@@ -7666,7 +8170,6 @@ mod tests {
         for session in [
             "project-first-worker",
             "project-second-worker",
-            "project-cross-worker",
             "raw-unrecorded-worker",
         ] {
             test_create_session(&server, session, "sleep 30").await;
@@ -7674,24 +8177,17 @@ mod tests {
 
         server
             .orchestration
-            .record_session(recorded_session(
-                "project-first-worker",
-                vec![first_task.id.clone()],
-            ))
+            .record_session(
+                first_task.id.clone(),
+                recorded_session("project-first-worker"),
+            )
             .unwrap();
         server
             .orchestration
-            .record_session(recorded_session(
-                "project-second-worker",
-                vec![second_task.id.clone()],
-            ))
-            .unwrap();
-        server
-            .orchestration
-            .record_session(recorded_session(
-                "project-cross-worker",
-                vec![first_task.id.clone(), second_task.id.clone()],
-            ))
+            .record_session(
+                second_task.id.clone(),
+                recorded_session("project-second-worker"),
+            )
             .unwrap();
 
         let first_result = server
@@ -7705,10 +8201,8 @@ mod tests {
             .iter()
             .map(|session| session.session.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(
-            first_names,
-            vec!["project-cross-worker", "project-first-worker"]
-        );
+        assert_eq!(first_names, vec!["project-first-worker"]);
+        assert_eq!(first_sessions[0].task_id, first_task.id);
         assert!(first_sessions
             .iter()
             .all(|session| session.runtime_state == "running"));
@@ -7739,10 +8233,8 @@ mod tests {
             .iter()
             .map(|session| session.session.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(
-            second_names,
-            vec!["project-cross-worker", "project-second-worker"]
-        );
+        assert_eq!(second_names, vec!["project-second-worker"]);
+        assert_eq!(second_sessions[0].task_id, second_task.id);
 
         let admin_result = server
             .admin_list_node_sessions_tool(object_args(json!({})))
@@ -7756,12 +8248,10 @@ mod tests {
         assert!(raw_names.contains("raw-unrecorded-worker"));
         assert!(raw_names.contains("project-first-worker"));
         assert!(raw_names.contains("project-second-worker"));
-        assert!(raw_names.contains("project-cross-worker"));
 
         for session in [
             "project-first-worker",
             "project-second-worker",
-            "project-cross-worker",
             "raw-unrecorded-worker",
         ] {
             test_kill_session(&server, session).await;
@@ -7784,7 +8274,8 @@ mod tests {
                 "session": "missing-worker",
                 "profile": "codex",
                 "workspace_path": "/workspace/project",
-                "task_ids": [task.id.0],
+                "bypass_permissions": false,
+                "task_id": task.id.0,
                 "role": "implementation-worker",
                 "kind": "model-owner"
             }),
@@ -7798,7 +8289,15 @@ mod tests {
                 .contains("session 'missing-worker' does not exist on node 'local'"),
             "{error}"
         );
-        assert!(server.orchestration.snapshot().unwrap().sessions.is_empty());
+        assert!(server
+            .orchestration
+            .snapshot()
+            .unwrap()
+            .tasks
+            .get(&task.id)
+            .unwrap()
+            .session
+            .is_none());
         let _ = fs::remove_dir_all(local_dir);
         let _ = fs::remove_dir_all(dir);
     }
@@ -8289,7 +8788,8 @@ mod tests {
                 "session": "worker-a",
                 "profile": "codex",
                 "workspace_path": "/workspace/project",
-                "task_ids": [task.id.0],
+                "bypass_permissions": false,
+                "task_id": task.id.0,
                 "role": "implementation-worker",
                 "kind": "model-owner"
             }),
@@ -8299,7 +8799,15 @@ mod tests {
 
         assert!(error.message.contains("missing-node"), "{error}");
         assert!(error.message.contains("unreachable"), "{error}");
-        assert!(server.orchestration.snapshot().unwrap().sessions.is_empty());
+        assert!(server
+            .orchestration
+            .snapshot()
+            .unwrap()
+            .tasks
+            .get(&task.id)
+            .unwrap()
+            .session
+            .is_none());
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -8319,7 +8827,8 @@ mod tests {
                 "session": "worker-a",
                 "profile": "codex",
                 "workspace_path": "/workspace/project",
-                "task_ids": [task.id.0],
+                "bypass_permissions": false,
+                "task_id": task.id.0,
                 "role": "implementation-worker",
                 "kind": "model-owner"
             }),
@@ -8350,38 +8859,15 @@ mod tests {
                 .contains("session 'worker-a' does not exist on node 'node-a'"),
             "{error}"
         );
-        assert!(server.orchestration.snapshot().unwrap().sessions.is_empty());
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn test_session_record_without_task_ids_skips_live_validation() {
-        let dir = unique_temp_dir("mmux-mcp-session-record-empty-tasks");
-        let server = test_orchestration_server(&dir).await;
-
-        let result = call_session_record(
-            &server,
-            json!({
-                "node_id": "local",
-                "session": "unvalidated-history",
-                "profile": "missing-profile",
-                "role": "historical",
-                "kind": "manual"
-            }),
-        )
-        .await
-        .unwrap();
-        let record: SessionRecord = result_json(&result);
-
-        assert_eq!(record.node_id.0, "local");
-        assert_eq!(record.session.0, "unvalidated-history");
-        assert!(record.task_ids.is_empty());
         assert!(server
             .orchestration
             .snapshot()
             .unwrap()
-            .sessions
-            .contains_key("local:unvalidated-history"));
+            .tasks
+            .get(&task.id)
+            .unwrap()
+            .session
+            .is_none());
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -8398,7 +8884,8 @@ mod tests {
                 "session": "worker-a",
                 "profile": "missing",
                 "workspace_path": "/workspace/project",
-                "task_ids": [task.id.0],
+                "bypass_permissions": false,
+                "task_id": task.id.0,
                 "role": "implementation-worker",
                 "kind": "model-owner"
             }),
@@ -8431,17 +8918,16 @@ mod tests {
                 "node": "local",
                 "workspace_path": workspace_path.clone(),
                 "bypass_permissions": true,
-                "task_ids": [task.id.0],
+                "task_id": task.id.0,
                 "role": "implementation-worker",
                 "kind": "Model Owner",
                 "skills": ["rust", "mcp"],
-                "objective": "record exact runtime choices",
                 "generate_session_name": true
             })))
             .await
             .unwrap();
         let payload: Value = result_json(&result);
-        let record: SessionRecord =
+        let record: TaskSession =
             serde_json::from_value(payload["session_record"].clone()).unwrap();
 
         assert_eq!(payload["readiness"]["status"], "not_waited");
@@ -8453,21 +8939,67 @@ mod tests {
             .starts_with(&format!("mmux-{}-model-owner-", task.slug)));
         assert_eq!(record.node_id.0, "local");
         assert_eq!(record.profile, "codex");
-        assert_eq!(
-            record.workspace_path.as_deref(),
-            Some(workspace_path.as_str())
-        );
+        assert_eq!(record.workspace_path, workspace_path);
         assert!(record.bypass_permissions);
-        assert_eq!(record.task_ids, vec![task.id.clone()]);
         assert_eq!(record.role, "implementation-worker");
         assert_eq!(record.kind, "Model Owner");
         assert_eq!(record.skills, vec!["rust", "mcp"]);
-        assert_eq!(
-            record.objective.as_deref(),
-            Some("record exact runtime choices")
-        );
 
         test_kill_session(&server, &record.session.0).await;
+        let _ = fs::remove_dir_all(workspace_root);
+        let _ = fs::remove_dir_all(local_dir);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn test_task_aware_start_replaces_task_session_and_stops_old_session() {
+        let dir = unique_temp_dir("mmux-mcp-start-replace");
+        let local_dir = unique_temp_dir("mmux-mcp-start-replace-local");
+        let workspace_root = unique_temp_dir("mmux-mcp-start-replace-workspace");
+        fs::create_dir_all(&workspace_root).unwrap();
+        let workspace_path = workspace_root.to_string_lossy().into_owned();
+        let server = test_coding_server(&dir, &local_dir, profile_registry(ready_profile())).await;
+        let task = create_test_task(&server, "Replace Start").await;
+        test_create_session(&server, "start-old", "sleep 30").await;
+        call_session_record(
+            &server,
+            json!({
+                "node_id": "local",
+                "session": "start-old",
+                "profile": "codex",
+                "workspace_path": workspace_path.clone(),
+                "bypass_permissions": false,
+                "task_id": task.id.0,
+                "role": "implementation-worker",
+                "kind": "coder",
+                "skills": ["rust"]
+            }),
+        )
+        .await
+        .unwrap();
+
+        let result = server
+            .start_coding_session_tool(object_args(json!({
+                "profile": "codex",
+                "node": "local",
+                "session": "start-new",
+                "workspace_path": workspace_path.clone(),
+                "bypass_permissions": false,
+                "task_id": task.id.0,
+                "role": "implementation-worker",
+                "kind": "coder",
+                "skills": ["rust"]
+            })))
+            .await
+            .unwrap();
+        let payload: Value = result_json(&result);
+        let record: TaskSession =
+            serde_json::from_value(payload["session_record"].clone()).unwrap();
+
+        assert_eq!(record.session.0, "start-new");
+        assert!(!test_session_exists(&server, "start-old").await);
+        assert!(test_session_exists(&server, "start-new").await);
+        test_kill_session(&server, "start-new").await;
         let _ = fs::remove_dir_all(workspace_root);
         let _ = fs::remove_dir_all(local_dir);
         let _ = fs::remove_dir_all(dir);
@@ -8496,7 +9028,7 @@ mod tests {
             "session": "remote-worker",
             "workspace_path": backend_workspace.clone(),
             "bypass_permissions": false,
-            "task_ids": [task.id.0],
+            "task_id": task.id.0,
             "role": "implementation-worker",
             "kind": "codex",
             "skills": ["rust"]
@@ -8544,15 +9076,12 @@ mod tests {
 
         let (result, _) = tokio::join!(start, node);
         let payload: Value = result_json(&result.unwrap());
-        let record: SessionRecord =
+        let record: TaskSession =
             serde_json::from_value(payload["session_record"].clone()).unwrap();
         assert_eq!(payload["readiness"]["status"], "not_waited");
         assert_eq!(record.node_id.0, node_id);
         assert_eq!(record.session.0, "remote-worker");
-        assert_eq!(
-            record.workspace_path.as_deref(),
-            Some(backend_workspace.as_str())
-        );
+        assert_eq!(record.workspace_path, backend_workspace);
 
         let _ = fs::remove_dir_all(dir);
     }
@@ -8573,10 +9102,7 @@ mod tests {
         }
         server
             .orchestration
-            .record_session(recorded_session(
-                "mmux-recorded-cleanup",
-                vec![task.id.clone()],
-            ))
+            .record_session(task.id.clone(), recorded_session("mmux-recorded-cleanup"))
             .unwrap();
 
         let dry_run: OrchestrationCleanupZombiesResult = result_json(
@@ -8676,9 +9202,12 @@ mod tests {
             }),
         )
         .unwrap();
-        let mut record = recorded_session("mmux-reconcile-active", vec![task.id]);
-        record.workspace_path = Some(workspace_path.clone());
-        server.orchestration.record_session(record).unwrap();
+        let mut record = recorded_session("mmux-reconcile-active");
+        record.workspace_path = workspace_path.clone();
+        server
+            .orchestration
+            .record_session(task.id.clone(), record)
+            .unwrap();
 
         server.reconcile_startup_local_sessions().await;
 
@@ -8694,12 +9223,15 @@ mod tests {
                 .orchestration
                 .snapshot()
                 .unwrap()
-                .sessions
-                .get("local:mmux-reconcile-active")
+                .tasks
+                .get(&task.id)
+                .unwrap()
+                .session
+                .as_ref()
                 .unwrap()
                 .workspace_path
-                .as_deref(),
-            Some(workspace_path.as_str())
+                .as_str(),
+            workspace_path.as_str()
         );
 
         test_kill_session(&server, "mmux-reconcile-active").await;
@@ -8714,31 +9246,14 @@ mod tests {
         let server =
             test_orchestration_server_with_profiles(&dir, profile_registry(ready_profile())).await;
         let project = ensure_test_project(&server).await;
-        let result = call_orchestration(
-            &server,
-            "task_create",
-            json!({
-                "project_id": project.id.0,
-                "title": "Agent Workspace",
-                "objective": "Require explicit workspace path",
-                "agents": [{
-                    "kind": "codex",
-                    "role": "implementation-worker",
-                    "skills": ["rust"],
-                    "workspace_path": "/agent/workspace",
-                    "prompt": "work"
-                }]
-            }),
-        )
-        .unwrap();
-        let task: Task = result_json(&result);
+        let task = create_test_task_in_project(&server, &project, "Workspace Required").await;
 
         let error = server
             .start_coding_session_tool(object_args(json!({
                 "profile": "codex",
                 "node": "local",
                 "bypass_permissions": false,
-                "task_ids": [task.id.0],
+                "task_id": task.id.0,
                 "role": "implementation-worker",
                 "kind": "model-owner",
                 "generate_session_name": true
@@ -8747,37 +9262,15 @@ mod tests {
             .unwrap_err();
 
         assert!(error.message.contains("explicit workspace_path"), "{error}");
-        assert!(server.orchestration.snapshot().unwrap().sessions.is_empty());
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[tokio::test]
-    async fn test_task_agents_do_not_create_session_records_without_start_or_attach() {
-        let dir = unique_temp_dir("mmux-mcp-no-auto-agent");
-        let server = test_orchestration_server(&dir).await;
-        let project = ensure_test_project(&server).await;
-
-        call_orchestration(
-            &server,
-            "task_create",
-            json!({
-                "project_id": project.id.0,
-                "title": "Intended Agents Only",
-                "objective": "No auto spawn",
-                "agents": [{
-                    "kind": "codex",
-                    "role": "implementation-worker",
-                    "skills": ["rust"],
-                    "workspace_path": "/workspace",
-                    "prompt": "work"
-                }]
-            }),
-        )
-        .unwrap();
-
-        let state = server.orchestration.snapshot().unwrap();
-        assert_eq!(state.tasks.len(), 1);
-        assert!(state.sessions.is_empty());
+        assert!(server
+            .orchestration
+            .snapshot()
+            .unwrap()
+            .tasks
+            .get(&task.id)
+            .unwrap()
+            .session
+            .is_none());
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -8805,7 +9298,13 @@ mod tests {
         assert_eq!(payload["readiness"]["status"], "not_waited");
         assert_eq!(payload["readiness"]["next_tool"], "wait_start");
         assert!(payload["session_record"].is_null());
-        assert!(server.orchestration.snapshot().unwrap().sessions.is_empty());
+        assert!(server
+            .orchestration
+            .snapshot()
+            .unwrap()
+            .tasks
+            .values()
+            .all(|task| task.session.is_none()));
         test_kill_session(&server, "plain-start").await;
         let _ = fs::remove_dir_all(workspace);
         let _ = fs::remove_dir_all(local_dir);
@@ -8862,7 +9361,7 @@ mod tests {
                 "profile": "codex",
                 "workspace_path": backend_workspace.clone(),
                 "bypass_permissions": false,
-                "task_ids": [task.id.0],
+                "task_id": task.id.0,
                 "role": "implementation-worker",
                 "kind": "validator",
                 "skills": ["rust"]
@@ -8874,16 +9373,13 @@ mod tests {
         let reloaded = orchestration_actor::OrchestrationHandle::open(Some(&dir)).unwrap();
         let state = reloaded.snapshot().unwrap();
         let record = state
-            .sessions
-            .get("local:roundtrip-worker")
-            .expect("persisted session record");
+            .tasks
+            .get(&task.id)
+            .and_then(|task| task.session.as_ref())
+            .expect("persisted task session");
         assert_eq!(record.profile, "codex");
         assert_eq!(record.kind, "validator");
-        assert_eq!(record.task_ids, vec![task.id]);
-        assert_eq!(
-            record.workspace_path.as_deref(),
-            Some(backend_workspace.as_str())
-        );
+        assert_eq!(record.workspace_path, backend_workspace);
         test_kill_session(&server, "roundtrip-worker").await;
         let _ = fs::remove_dir_all(local_dir);
         let _ = fs::remove_dir_all(dir);
@@ -8893,8 +9389,10 @@ mod tests {
     async fn test_task_edge_add_rejects_cyclic_dependency() {
         let dir = unique_temp_dir("mmux-mcp-edge-cycle");
         let server = test_orchestration_server(&dir).await;
-        let a = create_test_task(&server, "A").await;
-        let b = create_test_task(&server, "B").await;
+        let project = ensure_test_project(&server).await;
+        let plan = create_test_plan_in_project(&server, &project, "Edge Cycle Plan").await;
+        let a = create_test_task_in_plan(&server, &plan, "A").await;
+        let b = create_test_task_in_plan(&server, &plan, "B").await;
 
         let edge: TaskEdge = result_json(
             &call_orchestration(
@@ -8931,20 +9429,20 @@ mod tests {
             .create_project(
                 CreateProject {
                     title: "MMUX".into(),
-                    description: None,
+                    description: "Test project".into(),
                     slug: None,
                 },
                 100,
             )
             .unwrap();
+        let plan = create_state_plan(&mut state, &project);
         let dependency = state
             .create_task(
                 CreateTask {
-                    project_id: project.id.clone(),
+                    plan_id: plan.id.clone(),
                     title: "Dependency".into(),
                     objective: "Finish dependency".into(),
                     scope: TaskScope::default(),
-                    agents: Vec::new(),
                     gates: Vec::new(),
                     slug: None,
                 },
@@ -8954,7 +9452,7 @@ mod tests {
         let task = state
             .create_task(
                 CreateTask {
-                    project_id: project.id.clone(),
+                    plan_id: plan.id.clone(),
                     title: "Prompt Context".into(),
                     objective: "Build deterministic context".into(),
                     scope: TaskScope {
@@ -8962,7 +9460,6 @@ mod tests {
                         exclude_paths: vec!["target".into()],
                         notes: Some("Controller-only change.".into()),
                     },
-                    agents: Vec::new(),
                     gates: vec!["Context includes task identity".into()],
                     slug: None,
                 },
@@ -8988,6 +9485,8 @@ mod tests {
         assert!(prompt.contains("Task: task-2"));
         assert!(prompt.contains("Slug: prompt-context"));
         assert!(prompt.contains(&format!("Project: {} / mmux", project.id.0)));
+        assert!(prompt.contains(&format!("Plan: {} / plan", plan.id.0)));
+        assert!(prompt.contains("Plan Brief:\nDetailed plan brief for test task derivation."));
         assert!(prompt.contains("Objective:\nBuild deterministic context"));
         assert!(prompt.contains("Include paths:\n- crates/mmux-controller/src/lib.rs"));
         assert!(prompt.contains("Gates:\n- Context includes task identity"));
@@ -9003,16 +9502,17 @@ mod tests {
             .create_project(
                 CreateProject {
                     title: "MMUX".into(),
-                    description: None,
+                    description: "Test project".into(),
                     slug: None,
                 },
                 100,
             )
             .unwrap();
+        let plan = create_state_plan(&mut state, &project);
         let task = state
             .create_task(
                 CreateTask {
-                    project_id: project.id,
+                    plan_id: plan.id,
                     title: "Prompt Context".into(),
                     objective: "Build deterministic context".into(),
                     scope: TaskScope {
@@ -9020,7 +9520,6 @@ mod tests {
                         exclude_paths: Vec::new(),
                         notes: None,
                     },
-                    agents: Vec::new(),
                     gates: vec!["Review docs".into()],
                     slug: None,
                 },
@@ -9047,20 +9546,20 @@ mod tests {
             .create_project(
                 CreateProject {
                     title: "MMUX".into(),
-                    description: None,
+                    description: "Test project".into(),
                     slug: None,
                 },
                 100,
             )
             .unwrap();
+        let plan = create_state_plan(&mut state, &project);
         let task = state
             .create_task(
                 CreateTask {
-                    project_id: project.id,
+                    plan_id: plan.id,
                     title: "Prompt Context".into(),
                     objective: "Build deterministic context".into(),
                     scope: TaskScope::default(),
-                    agents: Vec::new(),
                     gates: vec!["Review docs".into()],
                     slug: None,
                 },
@@ -9091,6 +9590,128 @@ mod tests {
         assert!(quality_guard_prompt.contains("operator_supplied_guard_point_results"));
         assert!(quality_guard_prompt
             .contains("Quality Guard Instruction:\nCheck for hidden runtime assumptions."));
+    }
+
+    #[test]
+    fn test_coding_task_prompt_renders_context_task_cards_for_validation() {
+        let mut state = OrchestrationState::new();
+        let project = state
+            .create_project(
+                CreateProject {
+                    title: "MMUX".into(),
+                    description: "Test project".into(),
+                    slug: None,
+                },
+                100,
+            )
+            .unwrap();
+        let plan = create_state_plan(&mut state, &project);
+        let prerequisite = state
+            .create_task(
+                CreateTask {
+                    plan_id: plan.id.clone(),
+                    title: "Prerequisite Evidence".into(),
+                    objective: "Produce evidence for the validator.".into(),
+                    scope: TaskScope {
+                        include_paths: vec!["src/lib.rs".into()],
+                        exclude_paths: vec!["target".into()],
+                        notes: Some("Operator-card source.".into()),
+                    },
+                    gates: vec!["Unit tests pass".into(), "Outcome names evidence".into()],
+                    slug: None,
+                },
+                110,
+            )
+            .unwrap();
+        state
+            .record_session(
+                &prerequisite.id,
+                recorded_session("mmux-prerequisite-worker"),
+                120,
+            )
+            .unwrap();
+        state
+            .update_task_status(&prerequisite.id, TaskStatus::Passed, 130)
+            .unwrap();
+        state.tasks.get_mut(&prerequisite.id).unwrap().outcome =
+            Some("Evidence: cargo test -p mmux-controller passed.".into());
+        let validator = state
+            .create_task(
+                CreateTask {
+                    plan_id: plan.id,
+                    title: "Validate Evidence".into(),
+                    objective: "Validate the prerequisite task card.".into(),
+                    scope: TaskScope::default(),
+                    gates: vec!["Prerequisite card was checked".into()],
+                    slug: None,
+                },
+                140,
+            )
+            .unwrap();
+        state
+            .add_task_edge(
+                CreateTaskEdge {
+                    from: validator.id.clone(),
+                    to: prerequisite.id.clone(),
+                    kind: TaskEdgeKind::DependsOn,
+                    note: Some("Validator consumes prerequisite evidence.".into()),
+                },
+                150,
+            )
+            .unwrap();
+
+        let mut args = coding_task_send_args(validator.id.0, "Check the supplied cards.");
+        args.template = Some(CodingTaskSendTemplate::Validate);
+        args.context_task_ids = Some(vec![prerequisite.id.0.clone()]);
+        let prompt = build_coding_task_prompt(&state, &args).unwrap();
+
+        assert!(prompt.contains("Operator Task Card Bundle:"));
+        assert!(prompt.contains("Field checklist for each card:"));
+        assert!(prompt.contains("Task Card: task-1"));
+        assert!(prompt.contains("Status: Passed"));
+        assert!(prompt.contains("Objective:\nProduce evidence for the validator."));
+        assert!(prompt.contains("Include paths:\n- src/lib.rs"));
+        assert!(prompt.contains("Gates:\n- Unit tests pass\n- Outcome names evidence"));
+        assert!(prompt.contains("Outcome:\nEvidence: cargo test -p mmux-controller passed."));
+        assert!(prompt.contains("Outgoing edges:\n- none"));
+        assert!(prompt.contains("Session:\n- node=local session=mmux-prerequisite-worker"));
+        assert!(prompt.contains("field_coverage_table"));
+        assert!(prompt.contains("do not infer prior task results from local files alone"));
+    }
+
+    #[test]
+    fn test_coding_task_prompt_rejects_duplicate_context_task_cards() {
+        let mut state = OrchestrationState::new();
+        let project = state
+            .create_project(
+                CreateProject {
+                    title: "MMUX".into(),
+                    description: "Test project".into(),
+                    slug: None,
+                },
+                100,
+            )
+            .unwrap();
+        let plan = create_state_plan(&mut state, &project);
+        let task = state
+            .create_task(
+                CreateTask {
+                    plan_id: plan.id,
+                    title: "Task".into(),
+                    objective: "Do work.".into(),
+                    scope: TaskScope::default(),
+                    gates: Vec::new(),
+                    slug: None,
+                },
+                110,
+            )
+            .unwrap();
+
+        let mut args = coding_task_send_args(task.id.0.clone(), "Validate.");
+        args.context_task_ids = Some(vec![task.id.0.clone(), task.slug]);
+        let error = build_coding_task_prompt(&state, &args).unwrap_err();
+
+        assert!(error.contains("duplicate task 'task-1'"), "{error}");
     }
 
     #[test]
@@ -9130,7 +9751,7 @@ mod tests {
             .create_project(
                 CreateProject {
                     title: "First".into(),
-                    description: None,
+                    description: "Test project".into(),
                     slug: None,
                 },
                 100,
@@ -9140,21 +9761,21 @@ mod tests {
             .create_project(
                 CreateProject {
                     title: "Second".into(),
-                    description: None,
+                    description: "Test project".into(),
                     slug: None,
                 },
                 101,
             )
             .unwrap();
-        for project_id in [first_project.id, second_project.id] {
+        for project in [&first_project, &second_project] {
+            let plan = create_state_plan(&mut state, project);
             state
                 .create_task(
                     CreateTask {
-                        project_id,
+                        plan_id: plan.id,
                         title: "Same Slug".into(),
                         objective: "Create ambiguity".into(),
                         scope: TaskScope::default(),
-                        agents: Vec::new(),
                         gates: Vec::new(),
                         slug: None,
                     },
@@ -9219,13 +9840,12 @@ mod tests {
             status.tasks,
             vec![TaskSummary {
                 id: active.id,
-                project_id: active.project_id,
+                plan_id: active.plan_id,
                 slug: active.slug,
                 title: active.title,
                 status: TaskStatus::Backlog,
-                summary: None,
-                owner: None,
-                agents: Vec::new(),
+                outcome: None,
+                session: None,
                 parent: None,
                 child_count: 0,
                 dependency_count: 0,
@@ -9241,21 +9861,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_missing_task_ids_return_mcp_errors() {
+    async fn test_missing_task_selectors_return_mcp_errors() {
         let dir = unique_temp_dir("mmux-mcp-missing-task");
         let server =
             test_orchestration_server_with_profiles(&dir, profile_registry(ready_profile())).await;
 
         let error = call_orchestration(
             &server,
-            "task_assign",
+            "task_status_update",
             json!({
                 "task_id": "task-missing",
-                "node_id": "node-a",
-                "session": "worker-a",
-                "profile": "codex",
-                "role": "implementation-worker",
-                "kind": "codex"
+                "status": "Running"
             }),
         )
         .unwrap_err();
@@ -9272,15 +9888,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_orchestration_status_update_requires_summary_for_gated_passed_or_delivered() {
+    async fn test_orchestration_status_update_requires_outcome_for_gated_passed_or_delivered() {
         let dir = unique_temp_dir("mmux-mcp-status-gates");
         let server = test_orchestration_server(&dir).await;
         let project = ensure_test_project(&server).await;
+        let plan = create_test_plan_in_project(&server, &project, "Gated Plan").await;
         let result = call_orchestration(
             &server,
             "task_create",
             json!({
-                "project_id": project.id.0,
+                "plan_id": plan.id.0,
                 "title": "Gated",
                 "objective": "Needs evidence",
                 "gates": ["tests pass"]
@@ -9296,13 +9913,13 @@ mod tests {
                 json!({
                     "task_id": task.id.0,
                     "status": "Running",
-                    "summary": "worker started"
+                    "outcome": "worker started"
                 }),
             )
             .unwrap(),
         );
         assert_eq!(running.status, TaskStatus::Running);
-        assert_eq!(running.summary.as_deref(), Some("worker started"));
+        assert_eq!(running.outcome.as_deref(), Some("worker started"));
 
         let error = call_orchestration(
             &server,
@@ -9313,7 +9930,7 @@ mod tests {
             }),
         )
         .unwrap_err();
-        assert!(error.message.contains("summary is required"));
+        assert!(error.message.contains("outcome is required"));
 
         let result = call_orchestration(
             &server,
@@ -9321,14 +9938,14 @@ mod tests {
             json!({
                 "task_id": task.id.0,
                 "status": "Passed",
-                "summary": "cargo test -p mmux-controller passed"
+                "outcome": "cargo test -p mmux-controller passed"
             }),
         )
         .unwrap();
         let task: Task = result_json(&result);
         assert_eq!(task.status, TaskStatus::Passed);
         assert_eq!(
-            task.summary.as_deref(),
+            task.outcome.as_deref(),
             Some("cargo test -p mmux-controller passed")
         );
         let status: OrchestrationStatus = result_json(
@@ -9340,7 +9957,7 @@ mod tests {
             .unwrap(),
         );
         assert_eq!(
-            status.tasks[0].summary.as_deref(),
+            status.tasks[0].outcome.as_deref(),
             Some("cargo test -p mmux-controller passed")
         );
         assert!(status.tasks[0].blockers.is_empty());
@@ -9351,16 +9968,16 @@ mod tests {
             json!({
                 "task_id": task.id.0,
                 "status": "Delivered",
-                "summary": "   "
+                "outcome": "   "
             }),
         )
         .unwrap_err();
-        assert!(error.message.contains("summary must not be empty"));
+        assert!(error.message.contains("outcome must not be empty"));
         let state = server.orchestration.snapshot().unwrap();
         let persisted = state.tasks.get(&task.id).unwrap();
         assert_eq!(persisted.status, TaskStatus::Passed);
         assert_eq!(
-            persisted.summary.as_deref(),
+            persisted.outcome.as_deref(),
             Some("cargo test -p mmux-controller passed")
         );
 
@@ -9370,14 +9987,14 @@ mod tests {
             json!({
                 "task_id": task.id.0,
                 "status": "Delivered",
-                "summary": "review evidence accepted"
+                "outcome": "review evidence accepted"
             }),
         )
         .unwrap();
         let delivered: Task = result_json(&result);
         assert_eq!(delivered.status, TaskStatus::Delivered);
         assert_eq!(
-            delivered.summary.as_deref(),
+            delivered.outcome.as_deref(),
             Some("review evidence accepted")
         );
         let _ = fs::remove_dir_all(dir);
@@ -9765,20 +10382,16 @@ mod tests {
     }
 
     #[test]
-    fn test_session_list_format_exposes_objective() {
+    fn test_session_list_format_exposes_basic_runtime_fields() {
         assert!(SESSION_LIST_FORMAT.contains("#{session_name}"));
         assert!(SESSION_LIST_FORMAT.contains("#{session_windows}"));
         assert!(SESSION_LIST_FORMAT.contains("#{session_attached}"));
         assert!(SESSION_LIST_FORMAT.contains("#{session_created}"));
-        assert!(SESSION_LIST_FORMAT.contains("#{@mmux_objective}"));
     }
 
     #[test]
     fn test_parse_session_list_returns_structured_entries() {
-        let sessions = parse_session_list(
-            "local",
-            "codex|1|0|1780500000|work on docs\nempty|2|1|1780500010|\n",
-        );
+        let sessions = parse_session_list("local", "codex|1|0|1780500000\nempty|2|1|1780500010\n");
         assert_eq!(
             sessions,
             vec![
@@ -9788,7 +10401,6 @@ mod tests {
                     windows: Some(1),
                     attached: Some(0),
                     created_at_seconds: Some(1780500000),
-                    objective: Some("work on docs".into()),
                 },
                 SessionListEntry {
                     node: "local".into(),
@@ -9796,7 +10408,6 @@ mod tests {
                     windows: Some(2),
                     attached: Some(1),
                     created_at_seconds: Some(1780500010),
-                    objective: None,
                 },
             ]
         );

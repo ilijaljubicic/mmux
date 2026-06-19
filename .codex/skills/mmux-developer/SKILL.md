@@ -5,9 +5,67 @@ description: Use when changing mmux source code, tests, controller/node/runtime 
 
 # mmux Developer
 
+## Skill Definition
+
 Use this skill when implementing or reviewing mmux code. mmux is an MCP
 controller plus execution-node system around tmux, coder CLIs, durable
 orchestration state, and local/remote backends.
+
+Primary use cases:
+
+- Change mmux source code, tests, CLI behavior, MCP tools, prompt templates, or
+  orchestration state.
+- Change local, Microsandbox, or distributed node backend behavior.
+- Change coder profile send/read/wait behavior for codex, opencode, kimi, or
+  claude.
+- Update user-facing docs, AGENTS.md guidance, skills, recipes, or smoke tests
+  for changed mmux behavior.
+
+## Catalog
+
+Code areas:
+
+- `crates/mmux-controller-core`: runtime-neutral orchestration and auth model.
+- `crates/mmux-controller`: MCP server, tool schemas/handlers, local runtime
+  integration, actor orchestration, prompt templates, store glue.
+- `crates/mmux-node`: execution backends, tmux process control, local and
+  Microsandbox node behavior.
+- `crates/mmux-shared`: profile/config shapes shared across controller/node.
+- `crates/mmux-wire`: generated wire RPC bindings.
+- `src/main.rs`: root CLI commands and local tmux proxy helpers.
+- `crates/mmux-controller/src/prompts`: compile-time prompt templates used by
+  MCP tools.
+
+Primary commands:
+
+- `rg`: inspect existing structs, helpers, tests, and docs before editing.
+- `cargo fmt --check`, `cargo fmt`: check or apply Rust formatting.
+- `git diff --check`: catch whitespace problems.
+- `cargo test -p mmux-controller <filter>`: focused controller tests.
+- `cargo test -p mmux-controller-core <filter>`: focused orchestration/core
+  tests.
+- `cargo test -p mmux-node <filter>`: focused node/backend tests.
+- `cargo test --workspace`: full workspace test suite.
+- `cargo run -- ...`: isolated controller smoke tests.
+
+User-facing surfaces to keep aligned:
+
+- MCP tool schemas and handlers.
+- CLI flags and proxy helpers.
+- README and `AGENTS.md`.
+- `.codex/skills/mmux-*` skills and `references/mcp-recipes.md`.
+- Prompt templates under `crates/mmux-controller/src/prompts`.
+
+## Bootstrap
+
+1. Run `git status --short` and preserve unrelated user changes.
+2. Use `rg` to inspect the current implementation, tests, docs, and prompt
+   templates before designing changes.
+3. Identify the affected boundary: controller core, controller MCP/runtime,
+   node backend, shared profile config, wire bindings, CLI, docs, or skills.
+4. Pick the smallest change that preserves the current module boundary.
+5. Choose focused tests before editing so validation matches the behavioral
+   risk.
 
 ## Development Rules
 
@@ -34,28 +92,13 @@ orchestration state, and local/remote backends.
   opencode profiles. Profile-specific behavior should live in
   canonical built-in profile modules, not scattered special cases.
 
-## Code Areas
-
-- `crates/mmux-controller-core`: runtime-neutral orchestration and auth model.
-- `crates/mmux-controller`: MCP server, tool schemas/handlers, local runtime
-  integration, actor orchestration, prompt templates, store glue.
-- `crates/mmux-node`: execution backends, tmux process control, local and
-  Microsandbox node behavior.
-- `crates/mmux-shared`: profile/config shapes shared across controller/node.
-- `crates/mmux-wire`: generated wire RPC bindings.
-- `src/main.rs`: root CLI commands and local tmux proxy helpers.
-- `crates/mmux-controller/src/prompts`: compile-time prompt templates used by
-  MCP tools.
-
 ## Implementation Checklist
 
-1. Inspect existing structs, helpers, tests, and docs with `rg` before editing.
-2. Choose the smallest change that preserves current module boundaries.
-3. Add or update focused tests for the behavior, not only parsing.
-4. Update docs and skills when the user-facing MCP surface, CLI flags, session
+1. Add or update focused tests for the behavior, not only parsing.
+2. Update docs and skills when the user-facing MCP surface, CLI flags, session
    semantics, profiles, or orchestration behavior changes.
-5. Run focused tests first, then workspace tests.
-6. Smoke test real MCP behavior when the change touches tool schemas, tool
+3. Run focused tests first, then workspace tests.
+4. Smoke test real MCP behavior when the change touches tool schemas, tool
    handlers, sessions, tmux/node behavior, profile send/read/wait paths, or
    persistent orchestration state.
 
@@ -106,7 +149,8 @@ env -u MMUX_MCP_TOKEN -u MMUX_WIRE_TOKEN \
 
 Then call `http://127.0.0.1:3197/mcp` with JSON-RPC. Include:
 
-- `project_create` and `task_create` when testing project/task-scoped behavior.
+- `project_create`, `plan_create`, and `task_create` when testing
+  project/plan/task-scoped behavior.
 - `start_coding_session` or `exec` plus `session_record` when testing recorded
   sessions.
 - The changed tool with both positive and negative cases.

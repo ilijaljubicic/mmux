@@ -5,14 +5,17 @@ Slug: {{task_slug}}
 Title: {{task_title}}
 Status: {{task_status}}
 Project: {{project}}
+Plan: {{plan}}
 
 Objective:
 {{objective}}
 
+{{plan_brief_section}}
 {{scope_section}}
 {{gates_section}}
 {{dependencies_section}}
 {{blockers_section}}
+{{task_card_context_section}}
 {{extra_context_section}}
 Quality Guard Role:
 - You are acting as a code quality guard for this task.

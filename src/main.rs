@@ -26,6 +26,9 @@ fn main() {
         Some("list-projects") => {
             std::process::exit(run_list_projects(None));
         }
+        Some("create-project") => {
+            std::process::exit(run_create_project(None, &args[2..]));
+        }
         Some("prune-store") => {
             std::process::exit(run_prune_store(None, &args[2..]));
         }
@@ -46,6 +49,14 @@ fn main() {
         {
             std::process::exit(run_list_projects(args.get(2).map(PathBuf::from)));
         }
+        Some("--store-path")
+            if args.get(3).and_then(|arg| arg.to_str()) == Some("create-project") =>
+        {
+            std::process::exit(run_create_project(
+                args.get(2).map(PathBuf::from),
+                &args[4..],
+            ));
+        }
         Some("--store-path") if args.get(3).and_then(|arg| arg.to_str()) == Some("prune-store") => {
             std::process::exit(run_prune_store(args.get(2).map(PathBuf::from), &args[4..]));
         }
@@ -59,6 +70,9 @@ fn main() {
                     std::process::exit(run_attach_proxy_with_store(Some(store_path), &args[3..]))
                 }
                 Some("list-projects") => std::process::exit(run_list_projects(Some(store_path))),
+                Some("create-project") => {
+                    std::process::exit(run_create_project(Some(store_path), &args[3..]))
+                }
                 Some("prune-store") => {
                     std::process::exit(run_prune_store(Some(store_path), &args[3..]))
                 }
@@ -89,8 +103,133 @@ fn print_root_help() {
     println!("  node                    Run a standalone execution node");
     println!("  tmux -- <args>          Run tmux against mmux's private local-node socket");
     println!("  attach <session>        Attach to a private local-node tmux session");
+    println!(
+        "  create-project <title> --description <text>  Create a durable orchestration project in mmux.db"
+    );
     println!("  list-projects           List durable orchestration projects from mmux.db");
-    println!("  prune-store             Prune stale durable session records from mmux.db");
+    println!("  prune-store             Prune stale task sessions and finished plans from mmux.db");
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct CreateProjectArgs {
+    title: String,
+    description: String,
+    slug: Option<String>,
+}
+
+fn run_create_project(store_path: Option<PathBuf>, raw_args: &[OsString]) -> i32 {
+    if raw_args
+        .iter()
+        .any(|arg| matches!(arg.to_str(), Some("-h" | "--help")))
+    {
+        print_create_project_help();
+        return 0;
+    }
+    let args = match parse_create_project_args(raw_args) {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("mmux create-project: {error}");
+            return 2;
+        }
+    };
+    let store_path = match mmux_node::resolve_store_path(store_path.as_deref()) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("mmux create-project: {error}");
+            return 2;
+        }
+    };
+    let project = match mmux_controller::local_create_project(
+        Some(&store_path),
+        args.title,
+        args.description,
+        args.slug,
+    ) {
+        Ok(project) => project,
+        Err(error) => {
+            eprintln!("mmux create-project: {error}");
+            return 1;
+        }
+    };
+    println!(
+        "{}\t{}\t{}\t{}/{}\t{}",
+        project.id,
+        project.slug,
+        project.status,
+        project.active_task_count,
+        project.task_count,
+        project.title
+    );
+    0
+}
+
+fn print_create_project_help() {
+    println!("usage: mmux create-project <title> --description <text> [--slug <slug>]");
+    println!();
+    println!("Creates a durable orchestration project in mmux.db.");
+}
+
+fn parse_create_project_args(raw_args: &[OsString]) -> Result<CreateProjectArgs, String> {
+    let mut title = None;
+    let mut description = None;
+    let mut slug = None;
+    let mut index = 0;
+
+    while index < raw_args.len() {
+        let text = raw_args[index]
+            .to_str()
+            .ok_or_else(|| "arguments must be valid UTF-8".to_owned())?;
+        match text {
+            "--description" => {
+                let value = raw_args
+                    .get(index + 1)
+                    .ok_or_else(|| "--description requires a value".to_owned())?
+                    .to_str()
+                    .ok_or_else(|| "--description value must be valid UTF-8".to_owned())?;
+                description = Some(value.to_owned());
+                index += 2;
+            }
+            "--slug" => {
+                let value = raw_args
+                    .get(index + 1)
+                    .ok_or_else(|| "--slug requires a value".to_owned())?
+                    .to_str()
+                    .ok_or_else(|| "--slug value must be valid UTF-8".to_owned())?;
+                slug = Some(value.to_owned());
+                index += 2;
+            }
+            _ => {
+                if let Some(value) = text.strip_prefix("--description=") {
+                    description = Some(value.to_owned());
+                    index += 1;
+                } else if let Some(value) = text.strip_prefix("--slug=") {
+                    slug = Some(value.to_owned());
+                    index += 1;
+                } else if text.starts_with('-') {
+                    return Err(format!("unknown argument '{text}'"));
+                } else if title.is_some() {
+                    return Err("project title may only be provided once".into());
+                } else {
+                    title = Some(text.to_owned());
+                    index += 1;
+                }
+            }
+        }
+    }
+
+    let title = title.ok_or_else(|| "project title is required".to_owned())?;
+    if title.trim().is_empty() {
+        return Err("project title must not be empty".into());
+    }
+    let description = description.ok_or_else(|| "project description is required".to_owned())?;
+    if description.trim().is_empty() {
+        return Err("project description must not be empty".into());
+    }
+    Ok(CreateProjectArgs {
+        title,
+        description,
+        slug,
+    })
 }
 
 fn run_list_projects(store_path: Option<PathBuf>) -> i32 {
@@ -173,19 +312,19 @@ fn run_prune_store(store_path: Option<PathBuf>, raw_args: &[OsString]) -> i32 {
     };
     if report.dry_run {
         println!(
-            "dry-run: would prune {} stale session record(s)",
-            report.pruned_count
+            "dry-run: would prune {} stale session record(s) and {} finished plan(s)",
+            report.pruned_session_count, report.pruned_plan_count
         );
     } else {
-        println!("pruned {} stale session record(s)", report.pruned_count);
+        println!(
+            "pruned {} stale session record(s) and {} finished plan(s)",
+            report.pruned_session_count, report.pruned_plan_count
+        );
     }
     for candidate in report.candidates {
         println!(
-            "{}\tlast_seen_ms={}\ttasks={}\t{}",
-            candidate.session,
-            candidate.last_seen_ms,
-            candidate.task_ids.join(","),
-            candidate.reason
+            "{}\tlast_seen_ms={}\ttask={}\t{}",
+            candidate.session, candidate.last_seen_ms, candidate.task_id, candidate.reason
         );
     }
     0
@@ -194,8 +333,10 @@ fn run_prune_store(store_path: Option<PathBuf>, raw_args: &[OsString]) -> i32 {
 fn print_prune_store_help() {
     println!("usage: mmux prune-store [--dry-run] [--sessions-only] [--older-than-days <days>]");
     println!();
-    println!("Prunes stale durable session records from mmux.db.");
+    println!("Prunes stale durable task sessions and finished plans from mmux.db.");
     println!("Only missing local sessions attached exclusively to finished tasks are eligible.");
+    println!("Finished plans are pruned only when all contained tasks are finished.");
+    println!("Use --sessions-only to skip finished plan pruning.");
 }
 
 fn parse_prune_store_args(raw_args: &[OsString]) -> Result<PruneStoreArgs, String> {
@@ -512,6 +653,40 @@ mod tests {
 
     fn os_args(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn create_project_args_accept_title_description_and_optional_slug() {
+        let args = parse_create_project_args(&os_args(&[
+            "My Project",
+            "--description",
+            "Long-running work",
+            "--slug=custom-project",
+        ]))
+        .expect("create project args");
+
+        assert_eq!(
+            args,
+            CreateProjectArgs {
+                title: "My Project".into(),
+                description: "Long-running work".into(),
+                slug: Some("custom-project".into()),
+            }
+        );
+    }
+
+    #[test]
+    fn create_project_args_require_title_and_description() {
+        let error = parse_create_project_args(&os_args(&[])).expect_err("missing title");
+        assert_eq!(error, "project title is required");
+
+        let error =
+            parse_create_project_args(&os_args(&["My Project"])).expect_err("missing description");
+        assert_eq!(error, "project description is required");
+
+        let error =
+            parse_create_project_args(&os_args(&["One", "Two"])).expect_err("duplicate title");
+        assert_eq!(error, "project title may only be provided once");
     }
 
     #[test]

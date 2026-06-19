@@ -4,13 +4,13 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use mmux_controller_core::orchestration::{
-    CreateProject, CreateTask, CreateTaskEdge, OrchestrationState, OrchestrationStatus, Project,
-    ProjectId, ProjectStatus, SessionRecord, Task, TaskEdge, TaskEdgeKind, TaskId, TaskParticipant,
-    TaskStatus, UpdateTask,
+    CreatePlan, CreateProject, CreateTask, CreateTaskEdge, OrchestrationState, OrchestrationStatus,
+    Plan, PlanId, PlanStatus, Project, ProjectId, ProjectStatus, Task, TaskEdge, TaskEdgeKind,
+    TaskId, TaskSession, TaskStatus, UpdatePlan, UpdateTask,
 };
 
 use crate::store::OrchestrationStore;
-use crate::{LocalPruneSessionCandidate, LocalPruneStoreReport};
+use crate::{prune_finished_plans, LocalPruneSessionCandidate, LocalPruneStoreReport};
 
 #[derive(Clone)]
 pub(crate) struct OrchestrationHandle {
@@ -55,6 +55,23 @@ impl OrchestrationHandle {
         self.mutate(|state, now_ms| state.update_project_status(&project_id, status, now_ms))
     }
 
+    pub(crate) fn create_plan(&self, input: CreatePlan) -> Result<Plan, String> {
+        self.mutate(|state, now_ms| state.create_plan(input, now_ms))
+    }
+
+    pub(crate) fn update_plan(&self, plan_id: PlanId, update: UpdatePlan) -> Result<Plan, String> {
+        self.mutate(|state, now_ms| state.update_plan(&plan_id, update, now_ms))
+    }
+
+    pub(crate) fn update_plan_status(
+        &self,
+        plan_id: PlanId,
+        status: PlanStatus,
+        outcome: Option<String>,
+    ) -> Result<Plan, String> {
+        self.mutate(|state, now_ms| state.update_plan_status(&plan_id, status, outcome, now_ms))
+    }
+
     pub(crate) fn create_task(&self, input: CreateTask) -> Result<Task, String> {
         self.mutate(|state, now_ms| state.create_task(input, now_ms))
     }
@@ -63,16 +80,12 @@ impl OrchestrationHandle {
         self.mutate(|state, now_ms| state.update_task(&task_id, update, now_ms))
     }
 
-    pub(crate) fn assign_task(
+    pub(crate) fn record_session(
         &self,
         task_id: TaskId,
-        owner: TaskParticipant,
-    ) -> Result<Task, String> {
-        self.mutate(|state, now_ms| state.assign_task(&task_id, owner, now_ms))
-    }
-
-    pub(crate) fn record_session(&self, session: SessionRecord) -> Result<SessionRecord, String> {
-        self.mutate(|state, now_ms| state.record_session(session, now_ms))
+        session: TaskSession,
+    ) -> Result<TaskSession, String> {
+        self.mutate(|state, now_ms| state.record_session(&task_id, session, now_ms))
     }
 
     pub(crate) fn add_task_edge(&self, input: CreateTaskEdge) -> Result<TaskEdge, String> {
@@ -100,7 +113,7 @@ impl OrchestrationHandle {
         &self,
         task_id: TaskId,
         status: TaskStatus,
-        summary: Option<String>,
+        outcome: Option<String>,
         blockers: Option<Vec<String>>,
     ) -> Result<Task, String> {
         self.mutate(|state, now_ms| {
@@ -109,24 +122,24 @@ impl OrchestrationHandle {
                 .get(&task_id)
                 .ok_or_else(|| format!("task '{}' not found", task_id.0))?;
 
-            let summary = summary.map(|summary| summary.trim().to_owned());
+            let outcome = outcome.map(|outcome| outcome.trim().to_owned());
             let gated_passed_or_delivered = !task.gates.is_empty()
                 && matches!(status, TaskStatus::Passed | TaskStatus::Delivered);
             if gated_passed_or_delivered
-                && summary.as_deref().is_some_and(|summary| summary.is_empty())
+                && outcome.as_deref().is_some_and(|outcome| outcome.is_empty())
             {
                 return Err(format!(
-                    "task '{}' has gates; summary must not be empty before setting status to {:?}",
+                    "task '{}' has gates; outcome must not be empty before setting status to {:?}",
                     task_id.0, status
                 ));
             }
 
-            let has_operator_summary = summary
+            let has_operator_outcome = outcome
                 .as_deref()
-                .is_some_and(|summary| !summary.trim().is_empty());
-            if gated_passed_or_delivered && !has_operator_summary {
+                .is_some_and(|outcome| !outcome.trim().is_empty());
+            if gated_passed_or_delivered && !has_operator_outcome {
                 return Err(format!(
-                    "task '{}' has gates; summary is required before setting status to {:?}",
+                    "task '{}' has gates; outcome is required before setting status to {:?}",
                     task_id.0, status
                 ));
             }
@@ -136,8 +149,8 @@ impl OrchestrationHandle {
                 .tasks
                 .get_mut(&task_id)
                 .ok_or_else(|| format!("task '{}' not found", task_id.0))?;
-            if let Some(summary) = summary {
-                task.summary = Some(summary.trim().to_owned());
+            if let Some(outcome) = outcome {
+                task.outcome = Some(outcome.trim().to_owned());
             }
             if let Some(blockers) = blockers {
                 task.blockers = blockers;
@@ -165,10 +178,18 @@ impl OrchestrationHandle {
         if dry_run {
             let guard = self.lock()?;
             let candidates = stale_session_candidates(&guard.state, live_local_sessions, cutoff_ms);
+            let mut preview = guard.state.clone();
+            for candidate in &candidates {
+                if let Some(task) = preview.tasks.get_mut(&TaskId(candidate.task_id.clone())) {
+                    task.session = None;
+                }
+            }
+            let pruned_plan_count = prune_finished_plans(&mut preview, sessions_only, cutoff_ms);
             return Ok(LocalPruneStoreReport {
                 dry_run,
                 sessions_only,
-                pruned_count: candidates.len(),
+                pruned_session_count: candidates.len(),
+                pruned_plan_count,
                 candidates,
             });
         }
@@ -176,12 +197,16 @@ impl OrchestrationHandle {
         self.mutate(|state, _now_ms| {
             let candidates = stale_session_candidates(state, live_local_sessions, cutoff_ms);
             for candidate in &candidates {
-                state.sessions.remove(&candidate.key);
+                if let Some(task) = state.tasks.get_mut(&TaskId(candidate.task_id.clone())) {
+                    task.session = None;
+                }
             }
+            let pruned_plan_count = prune_finished_plans(state, sessions_only, cutoff_ms);
             Ok(LocalPruneStoreReport {
                 dry_run,
                 sessions_only,
-                pruned_count: candidates.len(),
+                pruned_session_count: candidates.len(),
+                pruned_plan_count,
                 candidates,
             })
         })
@@ -213,38 +238,26 @@ fn stale_session_candidates(
     cutoff_ms: Option<u64>,
 ) -> Vec<LocalPruneSessionCandidate> {
     let mut candidates = state
-        .sessions
-        .iter()
-        .filter_map(|(key, session)| {
+        .tasks
+        .values()
+        .filter_map(|task| {
+            let session = task.session.as_ref()?;
             if session.node_id.0 != "local" {
                 return None;
             }
             if live_local_sessions.contains(&session.session.0) {
                 return None;
             }
-            if session.task_ids.is_empty() {
-                return None;
-            }
             if cutoff_ms.is_some_and(|cutoff_ms| session.last_seen_ms > cutoff_ms) {
                 return None;
             }
-            let all_tasks_finished = session.task_ids.iter().all(|task_id| {
-                state
-                    .tasks
-                    .get(task_id)
-                    .is_some_and(|task| task.status.is_finished())
-            });
-            if !all_tasks_finished {
+            if !task.status.is_finished() {
                 return None;
             }
             Some(LocalPruneSessionCandidate {
-                key: key.clone(),
+                key: session.key(),
                 session: session.session.0.clone(),
-                task_ids: session
-                    .task_ids
-                    .iter()
-                    .map(|task_id| task_id.0.clone())
-                    .collect(),
+                task_id: task.id.0.clone(),
                 last_seen_ms: session.last_seen_ms,
                 reason: "missing local tmux session attached only to finished tasks".into(),
             })
@@ -261,7 +274,7 @@ fn stale_session_candidates(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use mmux_controller_core::orchestration::{NodeId, SessionId, TaskAgent, TaskScope};
+    use mmux_controller_core::orchestration::{NodeId, SessionId, TaskScope};
     use std::collections::HashSet;
     use std::fs;
     use std::path::PathBuf;
@@ -276,13 +289,21 @@ mod tests {
         std::env::temp_dir().join(format!("{prefix}-{}-{unique}", std::process::id()))
     }
 
-    fn create_task(project_id: ProjectId, title: &str) -> CreateTask {
-        CreateTask {
+    fn create_plan(project_id: ProjectId) -> CreatePlan {
+        CreatePlan {
             project_id,
+            title: "Plan".into(),
+            brief: "Detailed test plan brief.".into(),
+            slug: None,
+        }
+    }
+
+    fn create_task(plan_id: PlanId, title: &str) -> CreateTask {
+        CreateTask {
+            plan_id,
             title: title.into(),
             objective: format!("Objective for {title}"),
             scope: TaskScope::default(),
-            agents: Vec::new(),
             gates: Vec::new(),
             slug: None,
         }
@@ -291,37 +312,21 @@ mod tests {
     fn create_project() -> CreateProject {
         CreateProject {
             title: "Project".into(),
-            description: None,
+            description: "Actor test project".into(),
             slug: None,
         }
     }
 
-    fn create_task_with_agent(project_id: ProjectId, title: &str) -> CreateTask {
-        CreateTask {
-            agents: vec![TaskAgent {
-                kind: "codex".into(),
-                role: "implementation-worker".into(),
-                skills: vec!["rust".into()],
-                workspace_path: Some("/workspace".into()),
-                objective: Some("implement task".into()),
-                prompt: "work on this".into(),
-            }],
-            ..create_task(project_id, title)
-        }
-    }
-
-    fn session(task_ids: Vec<TaskId>) -> SessionRecord {
-        SessionRecord {
+    fn session(session: &str) -> TaskSession {
+        TaskSession {
             node_id: NodeId("local".into()),
-            session: SessionId("worker-a".into()),
+            session: SessionId(session.into()),
             profile: "codex".into(),
-            workspace_path: Some("/workspace/project".into()),
+            workspace_path: "/workspace/project".into(),
             bypass_permissions: false,
-            task_ids,
             role: "implementation-worker".into(),
             kind: "codex".into(),
             skills: vec!["rust".into()],
-            objective: Some("work on a task".into()),
             created_at_ms: 0,
             updated_at_ms: 0,
             last_seen_ms: 0,
@@ -337,7 +342,6 @@ mod tests {
 
         assert!(state.tasks.is_empty());
         assert!(state.task_edges.is_empty());
-        assert!(state.sessions.is_empty());
         assert_eq!(state.next_task_id, 1);
         let _ = fs::remove_dir_all(dir);
     }
@@ -348,11 +352,12 @@ mod tests {
         let store = OrchestrationStore::open(dir.clone()).unwrap();
         let mut state = OrchestrationState::new();
         let project = state.create_project(create_project(), 99).unwrap();
+        let plan = state.create_plan(create_plan(project.id), 100).unwrap();
         let task = state
-            .create_task(create_task(project.id, "Persisted"), 100)
+            .create_task(create_task(plan.id, "Persisted"), 101)
             .unwrap();
         state
-            .record_session(session(vec![task.id.clone()]), 200)
+            .record_session(&task.id, session("worker-a"), 200)
             .unwrap();
         store.save(&state, 300).unwrap();
 
@@ -361,7 +366,7 @@ mod tests {
 
         assert_eq!(loaded.tasks.len(), 1);
         assert!(loaded.tasks.contains_key(&task.id));
-        assert_eq!(loaded.sessions.len(), 1);
+        assert!(loaded.tasks.get(&task.id).unwrap().session.is_some());
         assert_eq!(loaded.next_task_id, state.next_task_id);
         let _ = fs::remove_dir_all(dir);
     }
@@ -372,9 +377,8 @@ mod tests {
         let handle = OrchestrationHandle::open(Some(&dir)).unwrap();
 
         let project = handle.create_project(create_project()).unwrap();
-        let task = handle
-            .create_task(create_task(project.id, "Saved"))
-            .unwrap();
+        let plan = handle.create_plan(create_plan(project.id)).unwrap();
+        let task = handle.create_task(create_task(plan.id, "Saved")).unwrap();
         let reloaded = OrchestrationHandle::open(Some(&dir)).unwrap();
         let state = reloaded.snapshot().unwrap();
 
@@ -388,22 +392,12 @@ mod tests {
         let dir = unique_temp_dir("mmux-orchestration-mutations");
         let handle = OrchestrationHandle::open(Some(&dir)).unwrap();
         let project = handle.create_project(create_project()).unwrap();
+        let plan = handle.create_plan(create_plan(project.id)).unwrap();
         let parent = handle
-            .create_task(create_task(project.id.clone(), "Parent"))
+            .create_task(create_task(plan.id.clone(), "Parent"))
             .unwrap();
-        let child = handle
-            .create_task(create_task(project.id, "Child"))
-            .unwrap();
-        let owner = TaskParticipant {
-            node_id: NodeId("local".into()),
-            session: SessionId("worker-a".into()),
-            profile: "codex".into(),
-            role: "implementation-worker".into(),
-            kind: "codex".into(),
-            skills: vec!["rust".into()],
-        };
+        let child = handle.create_task(create_task(plan.id, "Child")).unwrap();
 
-        handle.assign_task(child.id.clone(), owner.clone()).unwrap();
         handle
             .add_task_edge(CreateTaskEdge {
                 from: parent.id.clone(),
@@ -416,7 +410,7 @@ mod tests {
             .update_task_status(child.id.clone(), TaskStatus::Running)
             .unwrap();
         handle
-            .record_session(session(vec![child.id.clone()]))
+            .record_session(child.id.clone(), session("worker-a"))
             .unwrap();
         handle
             .remove_task_edge(parent.id.clone(), child.id.clone(), TaskEdgeKind::ParentOf)
@@ -426,10 +420,9 @@ mod tests {
         let state = reloaded.snapshot().unwrap();
         let loaded_child = state.tasks.get(&child.id).unwrap();
 
-        assert_eq!(loaded_child.owner, Some(owner));
         assert_eq!(loaded_child.status, TaskStatus::Running);
+        assert!(loaded_child.session.is_some());
         assert!(state.task_edges.is_empty());
-        assert_eq!(state.sessions.len(), 1);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -438,12 +431,13 @@ mod tests {
         let dir = unique_temp_dir("mmux-orchestration-failed");
         let handle = OrchestrationHandle::open(Some(&dir)).unwrap();
         let project = handle.create_project(create_project()).unwrap();
+        let plan = handle.create_plan(create_plan(project.id)).unwrap();
         let task = handle
-            .create_task(create_task(project.id, "Only Task"))
+            .create_task(create_task(plan.id, "Only Task"))
             .unwrap();
 
         let error = handle
-            .record_session(session(vec![TaskId("missing".into())]))
+            .record_session(TaskId("missing".into()), session("worker-a"))
             .unwrap_err();
         let reloaded = OrchestrationHandle::open(Some(&dir)).unwrap();
         let state = reloaded.snapshot().unwrap();
@@ -451,8 +445,62 @@ mod tests {
         assert!(error.contains("task 'missing' not found"));
         assert_eq!(state.tasks.len(), 1);
         assert!(state.tasks.contains_key(&task.id));
-        assert!(state.sessions.is_empty());
+        assert!(state.tasks.get(&task.id).unwrap().session.is_none());
         assert_eq!(state.next_task_id, 2);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn prune_stale_store_records_prunes_finished_plans_and_contained_tasks() {
+        let dir = unique_temp_dir("mmux-orchestration-prune-plans");
+        let handle = OrchestrationHandle::open(Some(&dir)).unwrap();
+        let project = handle.create_project(create_project()).unwrap();
+        let plan = handle.create_plan(create_plan(project.id.clone())).unwrap();
+        let parent = handle
+            .create_task(create_task(plan.id.clone(), "Parent"))
+            .unwrap();
+        let child = handle
+            .create_task(create_task(plan.id.clone(), "Child"))
+            .unwrap();
+        handle
+            .add_task_edge(CreateTaskEdge {
+                from: parent.id.clone(),
+                to: child.id.clone(),
+                kind: TaskEdgeKind::Related,
+                note: None,
+            })
+            .unwrap();
+        handle
+            .record_session(child.id.clone(), session("worker-a"))
+            .unwrap();
+        handle
+            .update_task_status(parent.id.clone(), TaskStatus::Delivered)
+            .unwrap();
+        handle
+            .update_task_status(child.id.clone(), TaskStatus::Delivered)
+            .unwrap();
+        handle
+            .update_plan_status(plan.id.clone(), PlanStatus::Delivered, Some("done".into()))
+            .unwrap();
+
+        let live = HashSet::new();
+        let dry_run = handle
+            .prune_stale_session_records(&live, true, false, None)
+            .unwrap();
+        assert_eq!(dry_run.pruned_session_count, 1);
+        assert_eq!(dry_run.pruned_plan_count, 1);
+        assert_eq!(handle.snapshot().unwrap().plans.len(), 1);
+
+        let pruned = handle
+            .prune_stale_session_records(&live, false, false, None)
+            .unwrap();
+        assert_eq!(pruned.pruned_session_count, 1);
+        assert_eq!(pruned.pruned_plan_count, 1);
+        let state = handle.snapshot().unwrap();
+        assert!(state.projects.contains_key(&project.id));
+        assert!(state.plans.is_empty());
+        assert!(state.tasks.is_empty());
+        assert!(state.task_edges.is_empty());
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -461,14 +509,15 @@ mod tests {
         let dir = unique_temp_dir("mmux-orchestration-concurrent");
         let handle = OrchestrationHandle::open(Some(&dir)).unwrap();
         let project = handle.create_project(create_project()).unwrap();
+        let plan = handle.create_plan(create_plan(project.id)).unwrap();
 
         let threads = (0..12)
             .map(|_| {
                 let handle = handle.clone();
-                let project_id = project.id.clone();
+                let plan_id = plan.id.clone();
                 thread::spawn(move || {
                     handle
-                        .create_task(create_task(project_id, "Same Title"))
+                        .create_task(create_task(plan_id, "Same Title"))
                         .unwrap()
                 })
             })
@@ -492,29 +541,6 @@ mod tests {
         assert_eq!(slugs.len(), 12);
         assert_eq!(state.tasks.len(), 12);
         assert_eq!(state.next_task_id, 13);
-        let _ = fs::remove_dir_all(dir);
-    }
-
-    #[test]
-    fn startup_with_task_agents_does_not_create_sessions() {
-        let dir = unique_temp_dir("mmux-orchestration-agents");
-        let store = OrchestrationStore::open(dir.clone()).unwrap();
-        let mut state = OrchestrationState::new();
-        let project = state.create_project(create_project(), 99).unwrap();
-        let task = state
-            .create_task(
-                create_task_with_agent(project.id, "Task With Intended Agent"),
-                100,
-            )
-            .unwrap();
-        store.save(&state, 200).unwrap();
-
-        let handle = OrchestrationHandle::open(Some(&dir)).unwrap();
-        let loaded = handle.snapshot().unwrap();
-
-        assert_eq!(loaded.tasks.get(&task.id).unwrap().agents.len(), 1);
-        assert!(loaded.sessions.is_empty());
-        assert_eq!(handle.status().unwrap().sessions.len(), 0);
         let _ = fs::remove_dir_all(dir);
     }
 }

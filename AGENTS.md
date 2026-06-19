@@ -38,7 +38,7 @@ Do you need to drive a coding CLI (codex, opencode, kimi, claude)?
   └─ Use list_coder_profiles → start_coding_session → coding_send or coding_task_send → wait_start(kind=coding-ready) → wait_status → coding_read → coding_action
 
 Do you need to coordinate task work across coder sessions?
-  └─ Use tools/list → orchestration_status → project_create/project_list → task_create/task_update/task_assign/edges → start_coding_session or session_record → coding_task_send → task_status_update
+  └─ Use tools/list → orchestration_status → project_create/project_list → plan_create/plan_list → task_create/task_update/edges → start_coding_session or session_record → coding_task_send → task_status_update
 
 Do you need to check what's happening without waiting?
   └─ Use check_state or capture_output
@@ -50,9 +50,8 @@ Do you need to transfer a file to or from a backend node?
 ## Session Lifecycle Best Practices
 
 mmux has generic tmux sessions and profile-driven coder sessions. A coder
-session is still a tmux session; it is identified by `node`, `session`, the
-`profile` used by coding tools, and an optional `objective` describing what the
-session is about.
+session is still a tmux session; it is identified by `node`, `session`, and the
+`profile` used by coding tools.
 
 For the built-in local backend, mmux uses its own tmux server socket. The socket
 is a deterministic short runtime path derived from the store path, not a file
@@ -60,6 +59,7 @@ inside the store directory. Do not use plain `tmux` to inspect local mmux
 sessions. Use MCP tools, or use the CLI proxy:
 
 ```
+mmux create-project "Release hardening" --slug release-hardening
 mmux list-projects
 mmux prune-store --dry-run
 mmux prune-store --sessions-only --older-than-days 7
@@ -79,6 +79,7 @@ If the controller was started with a custom store path, use the same path with
 the proxy:
 
 ```
+mmux --store-path /tmp/mmux-dev create-project "Release hardening" --slug release-hardening
 mmux --store-path /tmp/mmux-dev list-projects
 mmux --store-path /tmp/mmux-dev prune-store --dry-run
 mmux --store-path /tmp/mmux-dev tmux -- list-sessions
@@ -88,9 +89,10 @@ mmux --store-path /tmp/mmux-dev attach codex
 Plain `tmux` talks to the user's default tmux server, not mmux's local-node
 tmux server.
 For orchestration work, project ids are UUIDs and project slugs are globally
-unique aliases. Use `mmux list-projects` to discover project ids/slugs, then
-`mmux tmux -- list-sessions --project <project-id-or-slug>` to filter live local
-sessions recorded against tasks in that project.
+unique aliases. Use `mmux create-project` for offline store setup, use
+`mmux list-projects` to discover project ids/slugs, then `mmux tmux --
+list-sessions --project <project-id-or-slug>` to filter live local sessions
+recorded against tasks in that project.
 
 If a running controller was upgraded in place and new orchestration tools are
 missing from discovery, restart `mmux controller` and run `tools/list` again.
@@ -107,7 +109,7 @@ check_state    → quick JSON check (has_prompt, promptable, busy, turn_idle)
 
 ### 2. Start profile-driven sessions explicitly
 ```
-start_coding_session(profile="codex", session="codex", node="msb-mmux-1", objective="work on release docs")
+start_coding_session(profile="codex", session="codex", node="msb-mmux-1", workspace_path="/path/to/project")
 ```
 
 The public MCP surface does not expose raw generic session creation. Use
@@ -152,47 +154,53 @@ can update task state unless the operator explicitly delegates that authority.
 1. Discover the loaded surface with `tools/list`, then call
    `list_coder_profiles`.
 2. Inspect durable state with `orchestration_status`; use it for compact
-   project, task, summary, blocker, owner/session, cleanup candidate, warning,
-   task-agent, and runtime-state data. Task summaries include `agents`, so the
-   selected `TaskAgent.prompt` can be copied from status when needed. Pass
-   `include_completed=true` when delivered, canceled, or failed tasks matter.
-3. Create or select a project with `project_create`/`project_list`. Projects
-   are required boundaries and do not own workspace paths, nodes, or profiles.
-   Project summaries include total, active, and `task_status_counts` entries
-   for every task status, including zero counts.
-4. Create tasks with `task_create` and required `project_id`, which accepts the
-   project UUID id or globally unique slug. Each `TaskAgent` may contain only
-   `kind`, `role`, `skills`, `workspace_path`, `objective`, and `prompt`; do
-   not put `count`, `profile`, `node`, `node_id`, or `bypass_permissions` there.
+   project, plan, task, outcome, blocker, task session, cleanup candidate,
+   warning, and runtime-state data. Pass `include_completed=true` when
+   delivered, canceled, or failed tasks matter.
+3. Create or select a project with CLI
+   `mmux create-project <title> --description <text>` for offline setup or MCP
+   `project_create`/`project_list` through a running controller. Projects are
+   required boundaries with required descriptions and do not own workspace
+   paths, nodes, or profiles.
+   Project summaries include total, active, and per-status plan/task counts.
+   MCP `project_create` and `project_status_update` are only advertised and
+   callable when the controller starts with `--enable-admin-tools`;
+   `project_list` is always available.
+4. Create a plan with `plan_create` and required `project_id`, then create
+   tasks with `task_create` and required `plan_id`, which accepts the plan id
+   or unique slug. `Plan.brief` is the Markdown work-package document with
+   enough context and detail to derive tasks.
    `task_create` returns the created task object directly; read its id from the
    top-level `id` field. Created tasks start in `Backlog`; move them to
    `Planned` when scope/dependencies are ready.
 5. Correct mutable task metadata with `task_update`: `title`, `objective`,
-   scope fields (`include_paths`, `exclude_paths`, `notes`), `agents`,
-   and `gates`. Scalar and scope fields are partial updates; `agents` and
-   `gates` replace the whole list. Do not use `task_update` for project
+   scope fields (`include_paths`, `exclude_paths`, `notes`), and `gates`.
+   Scalar and scope fields are partial updates; `gates` replaces the whole list.
+   Do not use `task_update` for plan
    membership, status, edges, session runtime metadata, task id, or completion
    time.
-6. Assign owners with `task_assign` using actual runtime choices:
-   `task_id`, `node_id`, `session`, `profile`, `role`, `kind`, and `skills`.
-7. Add or remove relationships with `task_edge_add` and `task_edge_remove`
+6. Add or remove relationships with `task_edge_add` and `task_edge_remove`
    using `from_task_id`, `to_task_id`, `kind`, and optional `note` on add.
-8. Start a task-aware coder with `start_coding_session`, or adopt an existing
+7. Start a task-aware coder with `start_coding_session`, or adopt an existing
    coder with `session_record`. Task-aware starts require explicit `node`,
-   `profile`, `workspace_path`, boolean `bypass_permissions`, `task_ids`,
-   `role`, `kind`, `skills`, and `objective`; use `session` or
+   `profile`, `workspace_path`, boolean `bypass_permissions`, `task_id`,
+   `role`, `kind`, and `skills`; use `session` or
    `generate_session_name=true`.
-   If `task_ids` is present, do not rely on `TaskAgent` metadata for runtime
-   placement. Pass the selected node explicitly, for example `node="local"` for
-   the embedded local node. The controller intentionally errors with
+   If `task_id` is present, pass the selected node explicitly, for example
+   `node="local"` for the embedded local node. The controller intentionally errors with
    `task-aware start_coding_session requires explicit node` when this is
    omitted.
    For task-attached `session_record` calls, the controller validates that the
    selected node is reachable and the tmux session already exists before it
-   writes durable state.
+   writes durable state. If a task already has a different recorded session,
+   task-aware `start_coding_session` and `session_record` replace it
+   canonically and stop the previous live session with `tmux kill-session`
+   through the previous session's recorded node when it still exists. The same
+   `node_id`/`session` is a metadata refresh, not a replacement.
    Treat `workspace_path` as the backend-owned workspace/start directory for
    the selected node/backend. Pass the explicit string through without
-   controller-side canonicalization.
+   controller-side canonicalization. Do not treat later live cwd changes inside
+   the session as invalid orchestration state.
 8. For initial task delegation, use `coding_task_send` with `task_id_or_slug`
    and a concrete instruction. It builds deterministic task context from
    orchestration state and sends it with profile-aware coding behavior. Use
@@ -200,6 +208,13 @@ can update task state unless the operator explicitly delegates that authority.
    gate validation, `template="review"` for bug/risk review, and
    `template="quality-guard"` for maintainability, architecture fit, naming,
    boundaries, lifecycle, API shape, and operator/project quality preferences.
+   For validation or review of more than the primary task, pass
+   `context_task_ids` with every task id/slug being validated or reviewed. mmux
+   renders those tasks as an operator-supplied task-card bundle with status,
+   gates, outcome/evidence, scope, blockers, edges, and session.
+   If you use a separate export file instead, the prompt must name that file
+   and include the same field checklist. Do not ask a validator worker to call
+   mmux to reconstruct missing task cards.
    Use `coding_send` only for follow-up prompts, steering, corrections, or
    non-task sessions.
    Never send a prompt that is empty or the literal placeholder text `null` or
@@ -210,7 +225,9 @@ can update task state unless the operator explicitly delegates that authority.
    - `task`: "What work should this agent perform for this task?" Use for
      initial implementation/delegation.
    - `validate`: "Does the result satisfy the task gates and objective?" Use
-     for validator sessions.
+     for validator sessions. For task-set validation, require a
+     `field_coverage_table` over the operator-supplied task cards; missing
+     cards or missing fields make the validation inconclusive, not passed.
    - `review`: "Are there correctness risks, regressions, missing tests,
      contract breaks, or scope drift?" Use for reviewer/auditor sessions.
    - `quality-guard`: "Does the change conform to the project/operator quality
@@ -220,36 +237,39 @@ can update task state unless the operator explicitly delegates that authority.
    supply the concrete focus, such as scope, evidence to inspect, review angle,
    or operator-specific guard points.
 9. Record accepted progress with `task_status_update`. Include a concise
-   `summary`; include `blockers` when blocked. For gated moves to `Passed` or
-   `Delivered`, the summary must include validation or review evidence.
+   `outcome`; include `blockers` when blocked. For gated moves to `Passed` or
+   `Delivered`, the outcome must include validation or review evidence.
 10. Before destructive cleanup, call `orchestration_cleanup_zombies` without
    arguments. Explicit cleanup requires `dry_run=false` and can kill only live
-   local `mmux-*` sessions absent from durable session records.
+   local `mmux-*` sessions absent from durable task sessions.
    Cleanup candidates report tmux creation time as `created_at_ms` when
-   available; this is distinct from durable `SessionRecord.last_seen_ms`.
-   Use `orchestration_prune_store` for online durable stale session records
-   through the running controller; use `mmux prune-store --dry-run` for offline
-   local SQLite maintenance. Pruning only removes missing local `SessionRecord`s
-   whose attached tasks are all finished; it does not remove projects, tasks,
-   active task sessions, remote sessions, or live local sessions.
+   available; this is distinct from durable `TaskSession.last_seen_ms`.
+   Use `orchestration_prune_store` for online durable stale task sessions and
+   finished plans through the running controller; use `mmux prune-store
+   --dry-run` for offline local SQLite maintenance. Pruning removes missing
+   local task sessions whose tasks are finished, and removes
+   finished plans only when every contained task is finished. Plan pruning also
+   removes the contained tasks, their task edges, and their task sessions.
+   It does not remove projects, active plans/tasks, active task sessions,
+   remote sessions, or live local sessions.
 
 The `mmux-*` prefix is reserved for mmux-owned orchestration sessions generated
-from task slug, agent kind, and a short suffix. Never treat arbitrary tmux
+from task slug, session kind, and a short suffix. Never treat arbitrary tmux
 sessions or non-`mmux-*` sessions as orchestration cleanup candidates.
 
-Startup reconciliation loads durable `SessionRecord`s and compares them with
+Startup reconciliation loads durable task sessions and compares them with
 live local `mmux-*` sessions. It may recreate missing active stored sessions
-only from recorded runtime choices. Unrecorded task-agent metadata does not
-start sessions. Missing individual sessions can produce reconciliation
-warnings; missing `tmux` with `--enable-local-node` fails local backend startup
-early.
+only from recorded runtime choices. It does not recreate a live session because
+its current working directory differs from `TaskSession.workspace_path`.
+Missing individual sessions can produce reconciliation warnings; missing
+`tmux` with `--enable-local-node` fails local backend startup early.
 
 ## Driving a Coding CLI (Profile-Aware Workflow)
 
 ### Step 1: Ensure the session exists
 ```
 list_coder_profiles
-start_coding_session(profile="codex", session="codex", node="msb-mmux-1", workspace_path="/path/to/project", objective="fix tests for project X")
+start_coding_session(profile="codex", session="codex", node="msb-mmux-1", workspace_path="/path/to/project")
 ```
 `start_coding_session` creates or adopts the tmux session and returns without
 waiting for the coding CLI to become ready.
@@ -348,7 +368,9 @@ Use `list_coder_profiles` to inspect the enabled built-in runtime profiles.
   profile-aware send behavior. Use `template="quality-guard"` when the worker
   should check project/operator quality preferences rather than validate gates
   or perform a general review. Use `template="validate"` for gate/objective
-  validation and `template="review"` for correctness/risk review.
+  validation and `template="review"` for correctness/risk review. Use
+  `context_task_ids` whenever validation/review spans multiple tasks so the
+  worker receives field-complete operator task cards.
 
 ### `capture_output` vs `coding_read`
 - `capture_output` — any session. Can capture scrollback.
