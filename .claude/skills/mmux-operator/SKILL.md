@@ -142,7 +142,7 @@ or troubleshooting examples are needed.
    report.
 6. Kill only disposable sessions. Leave requested long-lived sessions running.
 
-## Orchestration V1 Workflow
+## Orchestration Workflow
 
 Use this flow when coordinating tasks through the orchestration tools:
 

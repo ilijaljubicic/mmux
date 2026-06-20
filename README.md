@@ -1,15 +1,19 @@
 # MCP + tmux = mmux
 
-mmux is a Rust MCP server that lets agents operate coding harnesses and other
-tmux-backed terminal workflows across local or remote execution nodes. Agents
-can inspect sessions, drive interactive shells and coding CLIs, read and write
-files, and route terminal work to sandboxed environments.
+mmux is a Rust MCP server for durable agent orchestration and tmux-backed
+terminal control across local or remote execution nodes. It gives operators a
+project -> plan -> task model for coordinating work, attaching coder sessions
+to tasks, recording outcomes and blockers, and pruning finished orchestration
+state. Agents can also inspect sessions, drive interactive shells and coding
+CLIs, read and write files, and route terminal work to sandboxed environments.
 
 The core idea is simple:
 
 - `mmux controller` exposes the MCP HTTP endpoint and the controller/node wire
   endpoint.
 - `mmux node` owns tmux and filesystem access in the environment where it runs.
+- Durable orchestration state groups work as projects, Markdown plan briefs,
+  and executable tasks with task-owned runtime sessions.
 - mmux can run as one process for local convenience, or as a distributed
   controller plus one or more node processes. In single-process mode, the
   controller embeds a node backend and exposes it as the reserved `local` node.
@@ -477,8 +481,8 @@ See `MTSL.md` for OpenSSL commands.
 
 ## Coder Profiles
 
-Coder profiles are built into mmux as canonical Rust adapters. There is no
-profile TOML overlay and no runtime profile loading. Supported profiles are:
+Coder profiles are built into mmux as canonical Rust adapters. Supported
+profiles are:
 
 - `codex`
 - `opencode`
@@ -559,137 +563,28 @@ environment. Reconciliation does not compare a live session's current working
 directory to `TaskSession.workspace_path`; the recorded path is the session's
 startup/adoption placement, and the session may change directories during work.
 
-## Orchestration V1
+## Orchestration
 
-Orchestration lets an operator track intended work, assign it to coder
-sessions, record runtime placement, and inspect compact task/session state.
-After upgrading mmux, restart any already-running `mmux controller`; old
-processes cannot expose newly added MCP tools until restarted and rediscovered
-with `tools/list`.
+mmux includes a durable orchestration layer for coordinating agent work:
+projects contain Markdown plan briefs, plans contain executable tasks, and each
+task can own one recorded coder session. Projects are long-lived boundaries
+with required descriptions. Plans carry enough context to derive tasks. Tasks
+carry objective, scope, gates, outcome, blockers, dependency edges, and runtime
+placement for the attached session.
 
-Projects are required orchestration boundaries with required descriptions. Plans are required work-package
-documents inside a project; each plan has a required Markdown `brief` with
-enough context and detail to derive tasks. Create projects with
-`mmux create-project <title> --description <text>` for offline store setup or
-MCP `project_create` with required `title` and `description` through a running
-controller, create plans with `plan_create`, inspect them with
-`project_list`, `plan_list`, or `orchestration_status`, and archive/reactivate
-projects with `project_status_update`. Project summaries include total, active,
-and per-status plan/task counts, including zero counts. Projects and plans do
-not own workspace paths, nodes, or profiles; those remain task/session runtime
-metadata so one project can cover multiple repositories.
-MCP `project_create` and `project_status_update` are admin operations that are
-only advertised and callable when the controller starts with
-`--enable-admin-tools`; `project_list` remains available without that flag.
+Operators create or select a project, create a plan, derive tasks from that
+plan, then start or record coder sessions against individual tasks. Initial
+delegation uses `coding_task_send`, which renders deterministic task context
+before sending the operator's instruction to the coding CLI. Follow-up steering
+uses `coding_send`.
 
-Tasks define executable work inside exactly one plan. A task may have at most
-one durable task session. The task owns that session record, and the session
-owns runtime placement: `node_id`, `session`, `profile`, `workspace_path`,
-`bypass_permissions`, `role`, `kind`, and `skills`. Runtime placement is written
-only by task-aware `start_coding_session` or `session_record`. Recording a
-different `node_id`/`session` for a task replaces the task session
-canonically; when the previous live session still exists, the controller stops
-it by issuing `tmux kill-session` through that session's recorded node backend.
-Recording the same `node_id`/`session` refreshes that session metadata and
-preserves its original `created_at_ms`.
+`orchestration_status` is the compact source of truth for current project,
+plan, task, edge, outcome, blocker, task-session, cleanup, warning, and runtime
+state. `orchestration_cleanup_zombies` and `orchestration_prune_store` are
+dry-run by default; destructive cleanup/pruning requires explicit opt-in.
 
-Operators create tasks with `task_create` using required `plan_id` set to a
-plan id or unique plan slug, and correct mutable metadata with `task_update`:
-`title`, `objective`, `include_paths`, `exclude_paths`, `notes`, and `gates`.
-Scalar and scope fields are partial updates; `gates` replaces the whole list
-when present. `task_update` does not change plan membership, status, edges,
-task session, task id, workspace placement, or completion time. Operators
-maintain dependencies with `task_edge_add` and `task_edge_remove`, then start a
-task-aware coder session or adopt an existing one with `session_record`.
-`session_record` requires `task_id` and validates that the selected node is
-reachable and the tmux session already exists before writing durable state.
-If the task already points at a different live session, `session_record` stops
-the previous tmux session before replacing the task's recorded runtime
-placement.
-Workers should report summaries, evidence, blockers, and proposed next actions;
-the operator records accepted task mutations.
-
-For initial task delegation, prefer `coding_task_send`. It resolves a task by
-id or unique slug, builds deterministic context from the task, scope, gates,
-blockers, and dependencies, appends the provided instruction, and sends it with
-the same profile-aware mechanics as `coding_send`. For validation or review of
-more than one task, pass `context_task_ids` so mmux renders an operator-supplied
-task-card bundle containing each referenced task's id, slug, title, objective,
-status, outcome, gates, scope, blockers, edges, and session.
-Do not rely on a validator to reconstruct prior task results from local files
-or by calling mmux from inside the worker session. It supports compile-time
-templates: `task` for implementation/delegation, `validate` for gate
-validation, `review` for bug/risk review, and `quality-guard` for
-maintainability, architecture fit, naming, boundaries, lifecycle, API shape,
-and operator/project quality preferences. Use `coding_send` for follow-up
-prompts, steering, corrections, or non-task sessions.
-
-Use templates by the question the worker should answer:
-
-- `task`: "What work should this agent perform for this task?" Use for initial
-  implementation or delegation. Put scope, constraints, expected report, and
-  forbidden mutations in the instruction.
-- `validate`: "Does the result satisfy the task gates and objective?" Use for
-  validator sessions. Put the validation focus, evidence, commands, files, or
-  reports to inspect in the instruction. For task-set validation, include every
-  task being validated in `context_task_ids`; the validator must report a
-  `field_coverage_table` and mark validation inconclusive if any required task
-  card field is missing.
-- `review`: "Are there correctness risks, regressions, missing tests, contract
-  breaks, or scope drift?" Use for reviewer/auditor sessions. Put changed
-  files, suspected risks, or the review angle in the instruction.
-- `quality-guard`: "Does the change conform to the project/operator quality
-  bar?" Use for maintainability and design-quality checks. Put
-  operator-specific guard points such as architecture boundaries, naming,
-  lifecycle clarity, API shape, canonical-only policy, or abstraction discipline
-  in the instruction.
-
-`task_status_update` records status, optional `outcome`, and optional
-`blockers`. Task status is a Kanban-style workflow: `Backlog`, `Planned`,
-`Running`, `WaitingForValidation`, `Blocked`, `Passed`, `Delivered`, `Failed`,
-or `Canceled`. Created tasks start in `Backlog`; moving to `Planned` checks
-dependencies. For tasks with gates, moving to `Passed` or `Delivered` requires
-an operator-recorded outcome with evidence, such as the validation command or
-review finding. Use `orchestration_status` as the compact source of current
-plan/task graph, task outcomes, blockers, task sessions, cleanup candidates,
-warnings, and runtime states instead of scraping tmux output. Completed tasks
-are hidden by default; pass
-`include_completed=true` when you need delivered, canceled, or failed tasks.
-
-Zombie cleanup is non-destructive by default. `orchestration_cleanup_zombies`
-without arguments is a dry run; destructive cleanup requires explicit
-`dry_run = false`. Cleanup may kill only live local `mmux-*` sessions that are
-absent from durable task session storage. Recorded task sessions and all
-non-`mmux-*` sessions are protected. Cleanup candidates report tmux creation
-time as `created_at_ms` when available; this is distinct from durable
-`TaskSession.last_seen_ms`.
-
-Durable store pruning is explicit. `orchestration_prune_store` is the online
-MCP tool for pruning through a running controller; `mmux prune-store` is the
-offline CLI maintenance command for the local SQLite store. Pruning removes
-missing local task sessions whose tasks are finished, and
-removes finished plans only when every contained task is finished. Plan pruning
-also removes the contained tasks, their task edges, and their task sessions.
-Projects, active plans/tasks, active task sessions, remote sessions,
-and live local sessions are retained. Preview first:
-
-```bash
-mmux prune-store --dry-run
-mmux prune-store --sessions-only --older-than-days 7
-```
-
-For MCP clients, call `orchestration_prune_store` with `dry_run=true` first;
-destructive pruning requires `dry_run=false`.
-
-On startup, the controller loads durable orchestration state from SQLite under
-`<store-path>/mmux.db`. With the local node enabled, startup reconciliation
-compares stored task sessions with live local `mmux-*` sessions. Missing
-active stored sessions may be recreated only from their recorded runtime
-choices. A live session with a different current working directory is not
-invalidated or recreated from orchestration state. Stored sessions
-attached only to finished tasks remain history if missing, and live unrecorded
-`mmux-*` sessions appear as zombie candidates. These reconciliation warnings
-are distinct from local backend startup failure when `tmux` itself is missing.
+For the full operator workflow, use `AGENTS.md` or the bundled
+`mmux-operator` skill.
 
 ## MCP Surface
 
