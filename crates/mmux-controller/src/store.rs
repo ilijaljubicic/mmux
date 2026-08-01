@@ -144,6 +144,7 @@ fn migrate_orchestration_snapshot_json(state_json: &str) -> Result<String, serde
     // Remove this legacy edge-kind migration after September 1, 2026, once
     // active orchestration snapshots have been migrated by normal loads/saves.
     migrate_legacy_blocks_edges(&mut value);
+    drop_removed_refines_edges(&mut value);
     serde_json::to_string(&value)
 }
 
@@ -178,6 +179,18 @@ fn migrate_legacy_blocks_edges(value: &mut Value) {
     edges.retain(|edge| match edge.as_object().and_then(edge_dedupe_key) {
         Some(key) => seen.insert(key),
         None => true,
+    });
+}
+
+fn drop_removed_refines_edges(value: &mut Value) {
+    let Some(edges) = value.get_mut("task_edges").and_then(Value::as_array_mut) else {
+        return;
+    };
+    edges.retain(|edge| {
+        edge.as_object()
+            .and_then(|object| object.get("kind"))
+            .and_then(Value::as_str)
+            != Some("Refines")
     });
 }
 

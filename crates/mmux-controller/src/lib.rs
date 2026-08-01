@@ -1358,6 +1358,10 @@ async fn run_orchestration_next(
         if !scheduler_task_matches_filters(&state, task, project_id.as_ref(), plan_id.as_ref()) {
             continue;
         }
+        if let Some(reason) = scheduler_superseded_reason(&state, task) {
+            report.skipped.push(schedule_skip(task, &reason));
+            continue;
+        }
         if !task.auto_schedule {
             report
                 .skipped
@@ -1454,6 +1458,16 @@ async fn run_task_start(
     validate_prompt_text_value("task_id_or_slug", &args.task_id_or_slug)?;
     let state = scheduler.orchestration.snapshot()?;
     let task = resolve_task_by_id_or_slug(&state, &args.task_id_or_slug)?;
+    if let Some(reason) = scheduler_superseded_reason(&state, task) {
+        return Ok(TaskStartReport {
+            dry_run: args.dry_run,
+            task_id: task.id.clone(),
+            auto_schedule: task.auto_schedule,
+            action: "skipped".into(),
+            task: None,
+            reason: Some(reason),
+        });
+    }
     let Some(run_spec) = task.run_spec.as_ref() else {
         return Err(format!("task '{}' has no run_spec", task.id.0));
     };
@@ -1680,6 +1694,21 @@ fn scheduler_dependency_blockers(
                 validation_blocked_by: Vec::new(),
             }]
         })
+}
+
+fn scheduler_superseded_reason(state: &OrchestrationState, task: &Task) -> Option<String> {
+    let superseded_by = state.task_superseded_by(&task.id).unwrap_or_default();
+    if superseded_by.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "superseded by {}",
+        superseded_by
+            .iter()
+            .map(|task_id| task_id.0.as_str())
+            .collect::<Vec<_>>()
+            .join(", ")
+    ))
 }
 
 fn format_blocking_dependencies(blocked_by: &[TaskDependencyBlocker]) -> String {
@@ -3062,12 +3091,12 @@ impl TmuxMcpServer {
             ),
             Tool::new(
                 "task_edge_add",
-                "Add an orchestration task edge. DependsOn gates readiness; ParentOf gates parent delivery; Validates gates downstream dependencies on the validated target. Other kinds are traceability in v1.",
+                "Add an orchestration task edge. DependsOn gates readiness; ParentOf gates parent delivery; Validates gates downstream dependencies on the validated target; Supersedes prevents replaced tasks from starting. Audits and Related are traceability.",
                 Arc::new(tool_schema(
                     json!({
                         "from_task_id": { "type": "string" },
                         "to_task_id": { "type": "string" },
-                        "kind": { "type": "string", "enum": ["ParentOf", "DependsOn", "Validates", "Audits", "Refines", "Supersedes", "Related"] },
+                        "kind": { "type": "string", "enum": ["ParentOf", "DependsOn", "Validates", "Audits", "Supersedes", "Related"] },
                         "note": { "type": "string" }
                     }),
                     Some(vec!["from_task_id", "to_task_id", "kind"]),
@@ -3080,7 +3109,7 @@ impl TmuxMcpServer {
                     json!({
                         "from_task_id": { "type": "string" },
                         "to_task_id": { "type": "string" },
-                        "kind": { "type": "string", "enum": ["ParentOf", "DependsOn", "Validates", "Audits", "Refines", "Supersedes", "Related"] }
+                        "kind": { "type": "string", "enum": ["ParentOf", "DependsOn", "Validates", "Audits", "Supersedes", "Related"] }
                     }),
                     Some(vec!["from_task_id", "to_task_id", "kind"]),
                 )),
@@ -5060,9 +5089,8 @@ fn task_edge_kind_rank(kind: TaskEdgeKind) -> u8 {
         TaskEdgeKind::DependsOn => 1,
         TaskEdgeKind::Validates => 2,
         TaskEdgeKind::Audits => 3,
-        TaskEdgeKind::Refines => 4,
-        TaskEdgeKind::Supersedes => 5,
-        TaskEdgeKind::Related => 6,
+        TaskEdgeKind::Supersedes => 4,
+        TaskEdgeKind::Related => 5,
     }
 }
 
@@ -9666,6 +9694,81 @@ mod tests {
         );
         assert_eq!(status.tasks[0].validation_blocked_by, vec![validator.id]);
         assert_eq!(status.tasks[0].failed_validator_count, 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn test_orchestration_report_and_task_start_skip_superseded_tasks() {
+        let dir = unique_temp_dir("mmux-mcp-report-supersedes");
+        let server =
+            test_orchestration_server_with_profiles(&dir, profile_registry(ready_profile())).await;
+        let project = ensure_test_project(&server).await;
+        let plan = create_test_plan_in_project(&server, &project, "Supersedes Plan").await;
+        let replacement = create_test_task_in_plan(&server, &plan, "Replacement").await;
+        let superseded: Task = result_json(
+            &call_orchestration(
+                &server,
+                "task_create",
+                json!({
+                    "plan_id": plan.id.0,
+                    "title": "Old Card",
+                    "objective": "This card was replaced",
+                    "auto_schedule": true,
+                    "run_spec": {
+                        "node_id": "local",
+                        "profile": "codex",
+                        "workspace_path": "/workspace/project",
+                        "bypass_permissions": false,
+                        "role": "implementation-worker",
+                        "kind": "implementation",
+                        "skills": [],
+                        "template": "task",
+                        "instruction": "Do old work."
+                    }
+                }),
+            )
+            .unwrap(),
+        );
+        call_orchestration(
+            &server,
+            "task_edge_add",
+            json!({
+                "from_task_id": replacement.id.0.clone(),
+                "to_task_id": superseded.id.0.clone(),
+                "kind": "Supersedes",
+                "note": "replacement owns this work now"
+            }),
+        )
+        .unwrap();
+
+        let report: OrchestrationReport = result_json(
+            &server
+                .orchestration_report_tool(object_args(json!({
+                    "plan_id": plan.id.0
+                })))
+                .await
+                .unwrap(),
+        );
+
+        assert!(report.ready.is_empty());
+        assert!(report.skipped.iter().any(|skip| {
+            skip.task_id == superseded.id
+                && skip.reason.contains("superseded by")
+                && skip.reason.contains(&replacement.id.0)
+        }));
+
+        let started: TaskStartReport = result_json(
+            &server
+                .task_start_tool(object_args(json!({
+                    "task_id_or_slug": superseded.id.0,
+                    "dry_run": true
+                })))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(started.action, "skipped");
+        assert!(started.reason.unwrap().contains("superseded by"));
+        assert!(started.task.is_none());
         let _ = fs::remove_dir_all(dir);
     }
 

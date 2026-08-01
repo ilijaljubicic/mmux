@@ -195,7 +195,6 @@ pub enum TaskEdgeKind {
     DependsOn,
     Validates,
     Audits,
-    Refines,
     Supersedes,
     Related,
 }
@@ -940,6 +939,26 @@ impl OrchestrationState {
         Ok(blockers)
     }
 
+    pub fn task_superseded_by(&self, task_id: &TaskId) -> Result<Vec<TaskId>, String> {
+        self.tasks
+            .get(task_id)
+            .ok_or_else(|| format!("task '{}' not found", task_id.0))?;
+        let mut superseders = self
+            .task_edges
+            .iter()
+            .filter(|edge| edge.kind == TaskEdgeKind::Supersedes && &edge.to == task_id)
+            .map(|edge| {
+                self.tasks
+                    .get(&edge.from)
+                    .map(|task| task.id.clone())
+                    .ok_or_else(|| format!("task '{}' not found", edge.from.0))
+            })
+            .collect::<Result<Vec<_>, String>>()?;
+        superseders.sort_by(|left, right| left.0.cmp(&right.0));
+        superseders.dedup();
+        Ok(superseders)
+    }
+
     pub fn create_project(&mut self, input: CreateProject, now_ms: u64) -> Result<Project, String> {
         if input.title.trim().is_empty() {
             return Err("project title must not be empty".into());
@@ -1230,6 +1249,9 @@ impl OrchestrationState {
         status: TaskStatus,
         now_ms: u64,
     ) -> Result<Task, String> {
+        if matches!(status, TaskStatus::Planned | TaskStatus::Running) {
+            self.ensure_task_not_superseded(task_id)?;
+        }
         if status == TaskStatus::Planned {
             self.ensure_dependencies_finished(task_id)?;
         }
@@ -1245,6 +1267,18 @@ impl OrchestrationState {
         task.updated_at_ms = now_ms;
         task.completed_at_ms = status.is_finished().then_some(now_ms);
         Ok(task.clone())
+    }
+
+    fn ensure_task_not_superseded(&self, task_id: &TaskId) -> Result<(), String> {
+        let superseded_by = self.task_superseded_by(task_id)?;
+        if superseded_by.is_empty() {
+            return Ok(());
+        }
+        Err(format!(
+            "task '{}' is superseded by {}",
+            task_id.0,
+            format_task_ids(&superseded_by)
+        ))
     }
 
     fn validate_edge(&self, edge: &CreateTaskEdge) -> Result<(), String> {
@@ -1607,9 +1641,8 @@ fn edge_kind_rank(kind: TaskEdgeKind) -> u8 {
         TaskEdgeKind::DependsOn => 1,
         TaskEdgeKind::Validates => 2,
         TaskEdgeKind::Audits => 3,
-        TaskEdgeKind::Refines => 4,
-        TaskEdgeKind::Supersedes => 5,
-        TaskEdgeKind::Related => 6,
+        TaskEdgeKind::Supersedes => 4,
+        TaskEdgeKind::Related => 5,
     }
 }
 
@@ -2426,6 +2459,43 @@ mod tests {
             .update_task_status(&downstream.id, TaskStatus::Planned, 450)
             .unwrap();
         assert_eq!(planned.status, TaskStatus::Planned);
+    }
+
+    #[test]
+    fn supersedes_edges_block_superseded_task_planning_and_running() {
+        let mut state = state_with_project();
+        let replacement = state.create_task(create_task("Replacement"), 100).unwrap();
+        let superseded = state.create_task(create_task("Old Task"), 101).unwrap();
+
+        state
+            .add_task_edge(
+                CreateTaskEdge {
+                    from: replacement.id.clone(),
+                    to: superseded.id.clone(),
+                    kind: TaskEdgeKind::Supersedes,
+                    note: Some("replacement owns the remaining work".into()),
+                },
+                200,
+            )
+            .unwrap();
+
+        assert_eq!(
+            state.task_superseded_by(&superseded.id).unwrap(),
+            vec![replacement.id.clone()]
+        );
+        let planned_error = state
+            .update_task_status(&superseded.id, TaskStatus::Planned, 250)
+            .unwrap_err();
+        assert!(planned_error.contains("superseded by"));
+        let running_error = state
+            .update_task_status(&superseded.id, TaskStatus::Running, 251)
+            .unwrap_err();
+        assert!(running_error.contains("superseded by"));
+
+        let replacement_running = state
+            .update_task_status(&replacement.id, TaskStatus::Running, 300)
+            .unwrap();
+        assert_eq!(replacement_running.status, TaskStatus::Running);
     }
 
     #[test]

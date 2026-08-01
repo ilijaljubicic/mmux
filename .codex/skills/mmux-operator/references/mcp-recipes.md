@@ -55,7 +55,7 @@ local store setup, use
 ## Plans
 
 ```json
-{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"plan_create","arguments":{"project_id":"mmux","title":"Update orchestration docs plan","brief":"Document the orchestration workflow, update operator recipes, and validate examples. Tasks should cover README, AGENTS.md, and skill recipe updates."}}}
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"plan_create","arguments":{"project_id":"mmux","title":"Update orchestration docs plan","brief":"Document the orchestration workflow, update operator recipes, and validate examples. Tasks should cover README and skill recipe updates."}}}
 ```
 
 ## Tasks
@@ -66,7 +66,7 @@ session provides one. `run_spec.workspace_path` is runtime launch placement,
 not an extra scope path.
 
 ```json
-{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"task_create","arguments":{"plan_id":"plan-0001","title":"Update orchestration docs","objective":"Document the orchestration workflow.","include_paths":["README.md","AGENTS.md"],"exclude_paths":["target"],"notes":"Documentation-only task.","gates":["Docs updated","No unrelated files changed"]}}}
+{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"task_create","arguments":{"plan_id":"plan-0001","title":"Update orchestration docs","objective":"Document the orchestration workflow.","include_paths":["README.md",".codex/skills/mmux-operator/SKILL.md",".codex/skills/mmux-operator/references/mcp-recipes.md"],"exclude_paths":["target"],"notes":"Documentation-only task.","gates":["Docs updated","No unrelated files changed"]}}}
 ```
 
 ```json

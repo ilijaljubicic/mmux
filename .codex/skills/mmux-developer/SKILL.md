@@ -18,7 +18,7 @@ Primary use cases:
 - Change local, Microsandbox, or distributed node backend behavior.
 - Change coder profile send/read/wait behavior for codex, opencode, kimi, or
   claude.
-- Update user-facing docs, AGENTS.md guidance, skills, recipes, or smoke tests
+- Update user-facing docs, skills, recipes, or smoke tests
   for changed mmux behavior.
 
 ## Catalog
@@ -52,7 +52,7 @@ User-facing surfaces to keep aligned:
 
 - MCP tool schemas and handlers.
 - CLI flags and proxy helpers.
-- README and `AGENTS.md`.
+- README and bundled Codex skills.
 - `.codex/skills/mmux-*` skills and `references/mcp-recipes.md`.
 - Prompt templates under `crates/mmux-controller/src/prompts`.
 
@@ -86,8 +86,8 @@ User-facing surfaces to keep aligned:
   tools.
 - Keep task orchestration simple in v1. Prefer strings for descriptive role,
   kind, and skill metadata unless the value controls runtime authority.
-- When adding MCP tools, update schema, handler, tests, README, `AGENTS.md`,
-  and relevant codex skills/recipes in the same change.
+- When adding MCP tools, update schema, handler, tests, README, and relevant
+  Codex skills/recipes in the same change.
 - When changing coder profile behavior, consider codex, claude, kimi, and
   opencode profiles. Profile-specific behavior should live in
   canonical built-in profile modules, not scattered special cases.

@@ -256,11 +256,12 @@ Use this flow when coordinating tasks through the orchestration tools:
     `validation_blocked_by`, `unapproved_validator_count`, and
     `failed_validator_count`.
     Supported task edges in v1 are `DependsOn`, `ParentOf`, `Validates`,
-    `Audits`, `Refines`, `Supersedes`, and `Related`. `DependsOn`, `ParentOf`,
-    and `Validates` have orchestration semantics. `Audits` is non-gating review
-    traceability; use `Validates` when an audit must approve gates before
-    dependent work can start. `Refines`, `Supersedes`, and `Related` are durable
-    traceability/navigation relations.
+    `Audits`, `Supersedes`, and `Related`. `DependsOn`, `ParentOf`,
+    `Validates`, and `Supersedes` have orchestration semantics. `Audits` is
+    non-gating review traceability; use `Validates` when an audit must approve
+    gates before dependent work can start. `Supersedes` marks the `to` task as
+    replaced by the `from` task, so the replaced task is skipped by scheduling
+    and explicit starts. `Related` is durable traceability/navigation only.
 13. Update task state with `task_status_update`. Include `status` and a concise
     `outcome`; include `blockers` when blocked. Use `task_report` for the same
     durable result shape when an external controller is committing worker or

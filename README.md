@@ -619,11 +619,12 @@ or `Delivered`. A failed or blocked validator remains visible in
 auto-scheduled tasks from starting.
 
 Supported task edges in v1 are `DependsOn`, `ParentOf`, `Validates`, `Audits`,
-`Refines`, `Supersedes`, and `Related`. `DependsOn`, `ParentOf`, and
-`Validates` have orchestration semantics. `Audits` is non-gating review
+`Supersedes`, and `Related`. `DependsOn`, `ParentOf`, `Validates`, and
+`Supersedes` have orchestration semantics. `Audits` is non-gating review
 traceability; use `Validates` when an audit must approve gates before dependent
-work can start. `Refines`, `Supersedes`, and `Related` are durable
-traceability/navigation relations.
+work can start. `Supersedes` marks the `to` task as replaced by the `from`
+task, so the replaced task is skipped by scheduling and explicit starts.
+`Related` is durable traceability/navigation only.
 
 The orchestrator detects failed or blocked scheduler starts through
 `orchestration_status`: startup/readiness/prompt failures are recorded as task
@@ -651,8 +652,7 @@ including the Markdown plan brief that the summary listings omit.
 `orchestration_prune_store` are dry-run by default; destructive
 cleanup/pruning requires explicit opt-in.
 
-For the full operator workflow, use `AGENTS.md` or the bundled
-`mmux-operator` skill.
+For the full operator workflow, use the bundled `mmux-operator` skill.
 
 ## MCP Surface
 
