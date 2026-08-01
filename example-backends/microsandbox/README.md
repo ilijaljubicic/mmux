@@ -22,7 +22,7 @@ make
 ```
 
 That target uses `msb create` and then runs the optional scripts in
-`mmux_sources/scripts/` inside the sandbox. The repo-local `workspace/`
+`mmux_sources/scripts/` inside the sandbox. The example-local `workspace/`
 directory is mounted read-write at `/workspace`; the setup assets are mounted
 at `/mmux-setup`. Once the sandbox exists and is running, run the connector:
 

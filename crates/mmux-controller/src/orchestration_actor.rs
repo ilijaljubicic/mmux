@@ -115,6 +115,7 @@ impl OrchestrationHandle {
         status: TaskStatus,
         outcome: Option<String>,
         blockers: Option<Vec<String>>,
+        evidence: Option<Vec<String>>,
     ) -> Result<Task, String> {
         self.mutate(|state, now_ms| {
             let task = state
@@ -154,6 +155,9 @@ impl OrchestrationHandle {
             }
             if let Some(blockers) = blockers {
                 task.blockers = blockers;
+            }
+            if let Some(evidence) = evidence {
+                task.evidence = evidence;
             }
             task.updated_at_ms = now_ms;
             Ok(task.clone())
@@ -306,6 +310,8 @@ mod tests {
             scope: TaskScope::default(),
             gates: Vec::new(),
             slug: None,
+            auto_schedule: false,
+            run_spec: None,
         }
     }
 

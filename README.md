@@ -211,6 +211,7 @@ mmux tmux -- list-sessions
 mmux tmux -- list-sessions --project <project-id-or-slug>
 mmux tmux -- capture-pane -t codex -p
 mmux tmux -- send-keys -t codex C-c
+mmux attach --read-only codex
 mmux attach codex
 ```
 
@@ -223,6 +224,7 @@ mmux --store-path /tmp/mmux-dev create-project "Release hardening" --slug releas
 mmux --store-path /tmp/mmux-dev list-projects
 mmux --store-path /tmp/mmux-dev prune-store --dry-run
 mmux --store-path /tmp/mmux-dev tmux -- list-sessions
+mmux --store-path /tmp/mmux-dev attach --read-only codex
 mmux --store-path /tmp/mmux-dev attach codex
 ```
 
@@ -240,6 +242,12 @@ Local node environment is managed outside task orchestration. Start mmux from a
 shell, service, or container that already has the env needed by coder CLIs. If
 the private tmux server does not exist yet, it inherits env from the mmux
 process when the first local session starts.
+For Codex specifically, mmux does not set a separate `CODEX_HOME`; local-node
+Codex sessions use the `CODEX_HOME` inherited by the controller or node
+process. If `CODEX_HOME` is unset, Codex uses its own default home, typically
+`~/.codex`. To isolate mmux Codex state, start the controller or local node with
+an explicit value, for example
+`CODEX_HOME=/path/to/mmux-codex-home mmux controller --enable-local-node`.
 
 If you are calling the MCP endpoint directly, include both accepted response
 types:
@@ -313,10 +321,11 @@ stop, snapshot, import, and export.
 | `mmux controller` | Runs the MCP control plane and node registry. |
 | `mmux node` | Registers to a controller and executes node-side tmux/file commands. |
 | `mmux create-project <title> --description <text>` | Creates a durable orchestration project in the local mmux store. Supports optional `--slug <slug>`. |
+| `mmux delete-project <id-or-slug>` | Deletes a durable orchestration project from the local mmux store, including all contained plans, task cards, task sessions, and task edges. |
 | `mmux list-projects` | Lists durable orchestration projects from the local mmux store so project ids/slugs are discoverable. |
 | `mmux prune-store` | Prunes stale durable task sessions and finished plans from the local mmux store. Use `--dry-run` to preview, `--sessions-only` to skip plan pruning, and `--older-than-days <days>` to constrain by age. |
 | `mmux tmux -- <args>` | Runs `tmux` against mmux's private local-node tmux socket. `list-sessions` accepts mmux's `--project <project-id-or-slug>` filter. |
-| `mmux attach <session>` | Attaches to a session in mmux's private local-node tmux server. |
+| `mmux attach [--read-only|-r] <session>` | Attaches to a session in mmux's private local-node tmux server. Use read-only mode for inspection without sending input. |
 
 `src/main.rs` dispatches to root help when no arguments are provided. Use
 `mmux controller` to start the controller explicitly, or pass controller flags
@@ -562,6 +571,11 @@ launches tmux owns interpreting, validating, or failing the path in its own
 environment. Reconciliation does not compare a live session's current working
 directory to `TaskSession.workspace_path`; the recorded path is the session's
 startup/adoption placement, and the session may change directories during work.
+Task scope is separate from runtime placement: `include_paths` and
+`exclude_paths` define the task work boundaries. Relative scope paths are
+interpreted from the runtime workspace when a `run_spec` or recorded session
+provides one. Prefer scope paths inside that workspace unless the operator
+intentionally scopes external files.
 
 ## Orchestration
 
@@ -570,7 +584,12 @@ projects contain Markdown plan briefs, plans contain executable tasks, and each
 task can own one recorded coder session. Projects are long-lived boundaries
 with required descriptions. Plans carry enough context to derive tasks. Tasks
 carry objective, scope, gates, outcome, blockers, dependency edges, and runtime
-placement for the attached session.
+placement for the attached session. Tasks may also carry an optional
+`run_spec` with `node_id`, `profile`, `workspace_path`, `bypass_permissions`,
+`role`, `kind`, `skills`, prompt `template`, scheduler `instruction`, and
+the top-level `auto_schedule` flag. `run_spec` describes how a task can be
+started; `auto_schedule` separately controls whether explicit
+`orchestration_next` runs may start it automatically.
 
 Operators create or select a project, create a plan, derive tasks from that
 plan, then start or record coder sessions against individual tasks. Initial
@@ -578,10 +597,59 @@ delegation uses `coding_task_send`, which renders deterministic task context
 before sending the operator's instruction to the coding CLI. Follow-up steering
 uses `coding_send`.
 
+Scheduling is explicit. An operator or external MCP controller observes
+`orchestration_status`, records worker and validator results with
+`task_status_update` or `task_report`, optionally calls `orchestration_report`
+to inspect ready/skipped/error task classifications, then calls
+`orchestration_next` to start all currently ready tasks in that plan whose
+`auto_schedule` is true. A task is startable only when a `run_spec` exists,
+dependencies and required validations are ready, the task is `Backlog` or
+`Planned`, its profile is enabled, and it has no live recorded session.
+`orchestration_report` is read-only and never starts sessions.
+`orchestration_next` starts deterministic `mmux-*` sessions, records them on
+tasks, waits for coding readiness, sends task prompts, and marks tasks
+`Running`. Use `task_start` to explicitly start one task from its `run_spec`
+without requiring `auto_schedule=true`.
+
+Task-owned `gates` are acceptance checks. `TaskEdgeKind::Validates` makes a
+validator task operational: an edge from validator to target means downstream
+tasks that `DependsOn` the target cannot start until that validator is `Passed`
+or `Delivered`. A failed or blocked validator remains visible in
+`orchestration_status` through `validation_blocked_by` and keeps dependent
+auto-scheduled tasks from starting.
+
+Supported task edges in v1 are `DependsOn`, `ParentOf`, `Validates`, `Audits`,
+`Refines`, `Supersedes`, and `Related`. `DependsOn`, `ParentOf`, and
+`Validates` have orchestration semantics. `Audits` is non-gating review
+traceability; use `Validates` when an audit must approve gates before dependent
+work can start. `Refines`, `Supersedes`, and `Related` are durable
+traceability/navigation relations.
+
+The orchestrator detects failed or blocked scheduler starts through
+`orchestration_status`: startup/readiness/prompt failures are recorded as task
+`Blocked` state with blockers. Worker-reported failure remains an operator
+state update through `task_status_update`. Runtime detection of a long-running
+task being "stuck" requires an additional timeout or heartbeat policy and is
+not inferred from silence in v1.
+
+Validation that must gate downstream work should be modeled as a task plus a
+`Validates` edge. For example, the validation task should `DependsOn` the
+implementation task, the validation task should `Validates` the implementation
+task, and downstream work should `DependsOn` the implementation task. If
+validation cannot run, mark the validator task `Blocked`; if validation rejects
+the work, mark the validator task `Failed` with outcome evidence. The scheduler
+will not start downstream `DependsOn` tasks while the dependency status is not
+ready or while linked validators have not approved it.
+
 `orchestration_status` is the compact source of truth for current project,
 plan, task, edge, outcome, blocker, task-session, cleanup, warning, and runtime
-state. `orchestration_cleanup_zombies` and `orchestration_prune_store` are
-dry-run by default; destructive cleanup/pruning requires explicit opt-in.
+state. Use `task_get` when an exporter or operator needs one full stored task
+body, including objective, scope, gates, outcome/evidence, run spec, session,
+and incoming/outgoing edges. Use `plan_get` for the analogous full plan record,
+including the Markdown plan brief that the summary listings omit.
+`orchestration_cleanup_zombies` and
+`orchestration_prune_store` are dry-run by default; destructive
+cleanup/pruning requires explicit opt-in.
 
 For the full operator workflow, use `AGENTS.md` or the bundled
 `mmux-operator` skill.
@@ -651,13 +719,19 @@ Orchestration tools:
 | `plan_list` | List orchestration plans, optionally filtered by project. |
 | `plan_update` | Update mutable plan metadata: title and brief. |
 | `plan_status_update` | Update plan status with optional plan-level outcome. |
+| `plan_get` | Return one full stored plan record by plan id or unique slug, including its Markdown brief. |
 | `task_create` | Create a durable orchestration task inside a required `plan_id` selector (plan id or unique slug) with scope, notes, and gates; returns the created task object directly. |
-| `task_update` | Update mutable task metadata: title, objective, scope fields, and gates. |
+| `task_update` | Update mutable task metadata: title, objective, scope fields, gates, `auto_schedule`, and optional `run_spec`. |
+| `task_get` | Return one full stored task record by task id or unique slug, plus incoming and outgoing task edges. |
+| `task_start` | Explicitly start one task using its `run_spec`; does not require `auto_schedule=true`. |
 | `task_edge_add` | Add a task dependency or relationship edge. |
 | `task_edge_remove` | Remove a task dependency or relationship edge. |
 | `session_record` | Record durable runtime placement for an existing or manually started coder session; task-attached records require a live node/session. |
 | `task_status_update` | Update task status with operator outcome and blockers. |
+| `task_report` | Submit durable task result status, outcome, blockers, and evidence; intended for operator/external-controller result commits. |
 | `orchestration_status` | Return compact project, plan, task, edge, task-session, cleanup, warning, and runtime-state summaries. |
+| `orchestration_report` | Read-only report of tasks that are ready or not ready for automatic orchestration. Never starts sessions. |
+| `orchestration_next` | Advance one plan by starting all currently ready tasks whose `auto_schedule` is true and `run_spec` exists. Requires `plan_id` id-or-slug. Executes by default; pass `dry_run=true` to preview. |
 | `orchestration_cleanup_zombies` | Dry-run or explicitly clean live local `mmux-*` sessions missing from durable orchestration storage. |
 | `orchestration_prune_store` | Dry-run or explicitly prune stale durable task sessions and finished plans whose contained tasks are all finished. |
 
@@ -764,10 +838,11 @@ controller credentials and node private keys stay out of sandbox config and
 sandbox files.
 
 Workspace persistence is handled by Microsandbox or the surrounding deployment
-system, not by mmux. The local example Makefile creates a sandbox with the
-repo-local `workspace/` mounted read-write at `/workspace` and setup assets
-mounted read-only at `/mmux-setup`. For other deployments, configure mounts
-with `msb`, Kubernetes, or your image/runtime tooling before starting mmux.
+system, not by mmux. The local example Makefile creates a sandbox with
+`example-backends/microsandbox/workspace/` mounted read-write at `/workspace`
+and setup assets mounted read-only at `/mmux-setup`. For other deployments,
+configure mounts with `msb`, Kubernetes, or your image/runtime tooling before
+starting mmux.
 
 ## Health Check
 

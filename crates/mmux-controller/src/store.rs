@@ -4,6 +4,7 @@ use std::path::PathBuf;
 
 use mmux_controller_core::orchestration::OrchestrationState;
 use rusqlite::{params, Connection, OptionalExtension};
+use serde_json::{Map, Value};
 
 const DB_FILE_NAME: &str = "mmux.db";
 const SNAPSHOT_VERSION: i64 = 1;
@@ -50,6 +51,14 @@ impl OrchestrationStore {
                 self.db_path.display()
             ));
         }
+
+        let state_json = migrate_orchestration_snapshot_json(&state_json).map_err(|error| {
+            format!(
+                "failed to deserialize orchestration snapshot from '{}': {}",
+                self.db_path.display(),
+                error
+            )
+        })?;
 
         serde_json::from_str(&state_json)
             .map(Some)
@@ -130,6 +139,56 @@ impl OrchestrationStore {
     }
 }
 
+fn migrate_orchestration_snapshot_json(state_json: &str) -> Result<String, serde_json::Error> {
+    let mut value = serde_json::from_str::<Value>(state_json)?;
+    // Remove this legacy edge-kind migration after September 1, 2026, once
+    // active orchestration snapshots have been migrated by normal loads/saves.
+    migrate_legacy_blocks_edges(&mut value);
+    serde_json::to_string(&value)
+}
+
+fn migrate_legacy_blocks_edges(value: &mut Value) {
+    let Some(edges) = value.get_mut("task_edges").and_then(Value::as_array_mut) else {
+        return;
+    };
+
+    for edge in edges.iter_mut() {
+        let Some(object) = edge.as_object_mut() else {
+            continue;
+        };
+        let is_blocks = object
+            .get("kind")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind == "Blocks");
+        if !is_blocks {
+            continue;
+        }
+        let from = object.remove("from");
+        let to = object.remove("to");
+        object.insert("kind".into(), Value::String("DependsOn".into()));
+        if let Some(from) = from {
+            object.insert("to".into(), from);
+        }
+        if let Some(to) = to {
+            object.insert("from".into(), to);
+        }
+    }
+
+    let mut seen = std::collections::HashSet::new();
+    edges.retain(|edge| match edge.as_object().and_then(edge_dedupe_key) {
+        Some(key) => seen.insert(key),
+        None => true,
+    });
+}
+
+fn edge_dedupe_key(edge: &Map<String, Value>) -> Option<(String, String, String)> {
+    Some((
+        edge.get("from")?.as_str()?.to_owned(),
+        edge.get("to")?.as_str()?.to_owned(),
+        edge.get("kind")?.as_str()?.to_owned(),
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -169,6 +228,8 @@ mod tests {
             },
             gates: vec!["cargo test".into()],
             slug: None,
+            auto_schedule: false,
+            run_spec: None,
         }
     }
 
@@ -265,6 +326,39 @@ mod tests {
             loaded.tasks.get(&TaskId("task-1".into())).unwrap().gates,
             vec!["cargo test"]
         );
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn load_migrates_legacy_blocks_edges_to_depends_on() {
+        let dir = unique_temp_dir("mmux-store-legacy-blocks");
+        let store = OrchestrationStore::open(dir.clone()).unwrap();
+        let state = populated_state();
+        let mut value = serde_json::to_value(&state).unwrap();
+        let edges = value
+            .get_mut("task_edges")
+            .and_then(Value::as_array_mut)
+            .unwrap();
+        edges[0]["kind"] = Value::String("Blocks".into());
+        let state_json = serde_json::to_string(&value).unwrap();
+
+        store
+            .connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO orchestration_snapshots (id, version, state_json, updated_at_ms)
+                 VALUES (1, ?1, ?2, 450)",
+                params![SNAPSHOT_VERSION, state_json],
+            )
+            .unwrap();
+
+        let loaded = store.load().unwrap().unwrap();
+
+        assert_eq!(loaded.task_edges.len(), 1);
+        assert_eq!(loaded.task_edges[0].kind, TaskEdgeKind::DependsOn);
+        assert_eq!(loaded.task_edges[0].from, TaskId("task-2".into()));
+        assert_eq!(loaded.task_edges[0].to, TaskId("task-1".into()));
 
         fs::remove_dir_all(dir).unwrap();
     }

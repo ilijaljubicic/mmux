@@ -11,6 +11,7 @@ Objective:
 {{objective}}
 
 {{plan_brief_section}}
+{{scheduler_section}}
 {{scope_section}}
 {{gates_section}}
 {{dependencies_section}}

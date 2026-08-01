@@ -38,7 +38,13 @@ Do you need to drive a coding CLI (codex, opencode, kimi, claude)?
   └─ Use list_coder_profiles → start_coding_session → coding_send or coding_task_send → wait_start(kind=coding-ready) → wait_status → coding_read → coding_action
 
 Do you need to coordinate task work across coder sessions?
-  └─ Use tools/list → orchestration_status → project_create/project_list → plan_create/plan_list → task_create/task_update/edges → start_coding_session or session_record → coding_task_send → task_status_update
+  └─ Use tools/list → orchestration_status → project_create/project_list → plan_create/plan_list → task_create/task_update/edges → orchestration_report/orchestration_next or start_coding_session/session_record → coding_task_send → task_status_update
+
+Do you need to export or inspect one full stored task body?
+  └─ Use task_get(task_id) → full task record plus incoming/outgoing edges
+
+Do you need to export or inspect one full stored plan brief?
+  └─ Use plan_get(plan_id) → full plan record including its Markdown brief
 
 Do you need to check what's happening without waiting?
   └─ Use check_state or capture_output
@@ -66,6 +72,7 @@ mmux prune-store --sessions-only --older-than-days 7
 mmux tmux -- list-sessions
 mmux tmux -- list-sessions --project <project-id-or-slug>
 mmux tmux -- capture-pane -t codex -p
+mmux attach --read-only codex
 mmux attach codex
 ```
 
@@ -83,11 +90,17 @@ mmux --store-path /tmp/mmux-dev create-project "Release hardening" --slug releas
 mmux --store-path /tmp/mmux-dev list-projects
 mmux --store-path /tmp/mmux-dev prune-store --dry-run
 mmux --store-path /tmp/mmux-dev tmux -- list-sessions
+mmux --store-path /tmp/mmux-dev attach --read-only codex
 mmux --store-path /tmp/mmux-dev attach codex
 ```
 
 Plain `tmux` talks to the user's default tmux server, not mmux's local-node
 tmux server.
+Local-node coder CLIs inherit environment from the process that started the
+mmux controller or distributed local node. mmux does not set a separate
+`CODEX_HOME`; Codex sessions use that inherited value, or Codex's default
+`~/.codex` when it is unset. To isolate Codex state for mmux, start the
+controller or node with an explicit `CODEX_HOME`.
 For orchestration work, project ids are UUIDs and project slugs are globally
 unique aliases. Use `mmux create-project` for offline store setup, use
 `mmux list-projects` to discover project ids/slugs, then `mmux tmux --
@@ -156,7 +169,11 @@ can update task state unless the operator explicitly delegates that authority.
 2. Inspect durable state with `orchestration_status`; use it for compact
    project, plan, task, outcome, blocker, task session, cleanup candidate,
    warning, and runtime-state data. Pass `include_completed=true` when
-   delivered, canceled, or failed tasks matter.
+   delivered, canceled, or failed tasks matter. Use `task_get` when you need
+   one full stored task body for export or exact inspection; it returns the
+   task record plus incoming and outgoing task edges. Use `plan_get` for the
+   analogous full plan record, including the Markdown brief that `plan_list`
+   omits.
 3. Create or select a project with CLI
    `mmux create-project <title> --description <text>` for offline setup or MCP
    `project_create`/`project_list` through a running controller. Projects are
@@ -172,17 +189,32 @@ can update task state unless the operator explicitly delegates that authority.
    enough context and detail to derive tasks.
    `task_create` returns the created task object directly; read its id from the
    top-level `id` field. Created tasks start in `Backlog`; move them to
-   `Planned` when scope/dependencies are ready.
+   `Planned` when scope/dependencies are ready. To allow mmux to start a task
+   automatically, set top-level `auto_schedule=true` and include optional
+   `run_spec` with `node_id`, `profile`,
+   `workspace_path`, boolean `bypass_permissions`, `role`, `kind`, `skills`,
+   prompt `template`, and scheduler `instruction`. `run_spec` describes how to
+   run a task; `auto_schedule` separately decides whether explicit
+   `orchestration_next` runs may launch it automatically.
 5. Correct mutable task metadata with `task_update`: `title`, `objective`,
-   scope fields (`include_paths`, `exclude_paths`, `notes`), and `gates`.
-   Scalar and scope fields are partial updates; `gates` replaces the whole list.
+   scope fields (`include_paths`, `exclude_paths`, `notes`), `gates`, and
+   optional `run_spec`. Scalar and scope fields are partial updates; `gates`
+   replaces the whole list; `run_spec=null` clears scheduler launch intent.
+   Scope paths define task work boundaries, not runtime placement. Relative
+   `include_paths` and `exclude_paths` are interpreted from the runtime
+   workspace when a `run_spec` or recorded session provides one. Prefer scope
+   paths inside that workspace unless the operator intentionally scopes
+   external files.
    Do not use `task_update` for plan
    membership, status, edges, session runtime metadata, task id, or completion
    time.
 6. Add or remove relationships with `task_edge_add` and `task_edge_remove`
    using `from_task_id`, `to_task_id`, `kind`, and optional `note` on add.
-7. Start a task-aware coder with `start_coding_session`, or adopt an existing
-   coder with `session_record`. Task-aware starts require explicit `node`,
+7. Start one task explicitly with `task_start` when the task has `run_spec`.
+   `task_start` does not require `auto_schedule=true`; it uses `run_spec` as a
+   manual launch recipe. Or start a task-aware coder with
+   `start_coding_session`, or adopt an existing coder with `session_record`.
+   Task-aware starts require explicit `node`,
    `profile`, `workspace_path`, boolean `bypass_permissions`, `task_id`,
    `role`, `kind`, and `skills`; use `session` or
    `generate_session_name=true`.
@@ -199,8 +231,9 @@ can update task state unless the operator explicitly delegates that authority.
    `node_id`/`session` is a metadata refresh, not a replacement.
    Treat `workspace_path` as the backend-owned workspace/start directory for
    the selected node/backend. Pass the explicit string through without
-   controller-side canonicalization. Do not treat later live cwd changes inside
-   the session as invalid orchestration state.
+   controller-side canonicalization. It is runtime start/adoption placement,
+   not task scope. Do not treat later live cwd changes inside the session as
+   invalid orchestration state.
 8. For initial task delegation, use `coding_task_send` with `task_id_or_slug`
    and a concrete instruction. It builds deterministic task context from
    orchestration state and sends it with profile-aware coding behavior. Use
@@ -236,10 +269,49 @@ can update task state unless the operator explicitly delegates that authority.
    The template supplies the operating mode and task context. The prompt must
    supply the concrete focus, such as scope, evidence to inspect, review angle,
    or operator-specific guard points.
-9. Record accepted progress with `task_status_update`. Include a concise
-   `outcome`; include `blockers` when blocked. For gated moves to `Passed` or
-   `Delivered`, the outcome must include validation or review evidence.
-10. Before destructive cleanup, call `orchestration_cleanup_zombies` without
+9. Use `orchestration_report` when an operator or external MCP controller
+   wants a read-only classification of tasks that are ready, skipped, or
+   errored for automatic orchestration. It accepts optional `project_id` and
+   `plan_id` filters and never starts sessions.
+   Use `orchestration_next` when an operator or external MCP controller
+   wants mmux to advance ready auto-start tasks after recording worker or
+   validator results. It executes by default; pass `dry_run=true` to preview.
+   It requires `plan_id`, which accepts a plan id or unique plan slug.
+   There is no background scheduler loop; the
+   orchestration layer observes `orchestration_status`, records worker and
+   validator results, optionally calls `orchestration_report`, then calls
+   `orchestration_next` to advance work.
+   `orchestration_next` starts all currently ready tasks in that plan whose `auto_schedule` is
+   true and `run_spec` exists, dependencies and required validations are ready,
+   status is `Backlog` or `Planned`, profile is enabled, and no live recorded
+   session already exists. The scheduler starts a deterministic `mmux-*`
+   session, records it, waits for coding readiness, sends the task prompt, and
+   marks the task `Running`.
+   Scheduler startup/readiness/prompt failures are visible in
+   `orchestration_status` as `Blocked` tasks with blockers. Worker-reported
+   failures should still be recorded with `task_status_update` or
+   `task_report`. mmux does not infer that a running task is stuck from silence
+   unless a future timeout or heartbeat policy is added.
+   `Task.gates` are the acceptance checklist. A `Validates` edge from a
+   validator task to a target task is operational: downstream tasks that
+   `DependsOn` the target cannot start until every linked validator is `Passed`
+   or `Delivered`. If validation cannot run, mark the validator task
+   `Blocked`; if validation rejects the target, mark the validator task
+   `Failed` with outcome and evidence. `orchestration_status` exposes
+   `validation_blocked_by`, `unapproved_validator_count`, and
+   `failed_validator_count`.
+   Supported task edges in v1 are `DependsOn`, `ParentOf`, `Validates`,
+   `Audits`, `Refines`, `Supersedes`, and `Related`. `DependsOn`, `ParentOf`,
+   and `Validates` have orchestration semantics. `Audits` is non-gating review
+   traceability; use `Validates` when an audit must approve gates before
+   dependent work can start. `Refines`, `Supersedes`, and `Related` are durable
+   traceability/navigation relations.
+10. Record accepted progress with `task_status_update`. Include a concise
+   `outcome`; include `blockers` when blocked. Use `task_report` for the same
+   durable result shape when an external controller is committing worker or
+   validator output. For gated moves to `Passed` or `Delivered`, the outcome
+   must include validation or review evidence.
+11. Before destructive cleanup, call `orchestration_cleanup_zombies` without
    arguments. Explicit cleanup requires `dry_run=false` and can kill only live
    local `mmux-*` sessions absent from durable task sessions.
    Cleanup candidates report tmux creation time as `created_at_ms` when
@@ -483,7 +555,9 @@ Both accept optional `profile` and `session` arguments.
   Microsandbox connector to an existing running sandbox as node `local`.
 - The local backend uses a private tmux socket. Use `--tmux-config <path>` only
   for local tmux backends when an explicit tmux config is needed. Use
-  `mmux tmux -- <args>` or `mmux attach <session>` for manual debugging.
+  `mmux tmux -- <args>` or `mmux attach --read-only <session>` for manual
+  inspection; use `mmux attach <session>` only when interactive input is
+  intended.
 - Microsandbox lifecycle is managed by `msb`, not mmux. Use embedded
   Microsandbox mode for a single controller process, or use
   `mmux node --backend microsandbox --sandbox-name <name>` to attach an

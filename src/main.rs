@@ -29,6 +29,9 @@ fn main() {
         Some("create-project") => {
             std::process::exit(run_create_project(None, &args[2..]));
         }
+        Some("delete-project") => {
+            std::process::exit(run_delete_project(None, &args[2..]));
+        }
         Some("prune-store") => {
             std::process::exit(run_prune_store(None, &args[2..]));
         }
@@ -57,6 +60,14 @@ fn main() {
                 &args[4..],
             ));
         }
+        Some("--store-path")
+            if args.get(3).and_then(|arg| arg.to_str()) == Some("delete-project") =>
+        {
+            std::process::exit(run_delete_project(
+                args.get(2).map(PathBuf::from),
+                &args[4..],
+            ));
+        }
         Some("--store-path") if args.get(3).and_then(|arg| arg.to_str()) == Some("prune-store") => {
             std::process::exit(run_prune_store(args.get(2).map(PathBuf::from), &args[4..]));
         }
@@ -72,6 +83,9 @@ fn main() {
                 Some("list-projects") => std::process::exit(run_list_projects(Some(store_path))),
                 Some("create-project") => {
                     std::process::exit(run_create_project(Some(store_path), &args[3..]))
+                }
+                Some("delete-project") => {
+                    std::process::exit(run_delete_project(Some(store_path), &args[3..]))
                 }
                 Some("prune-store") => {
                     std::process::exit(run_prune_store(Some(store_path), &args[3..]))
@@ -102,9 +116,12 @@ fn print_root_help() {
     println!("  controller              Run the MCP controller explicitly");
     println!("  node                    Run a standalone execution node");
     println!("  tmux -- <args>          Run tmux against mmux's private local-node socket");
-    println!("  attach <session>        Attach to a private local-node tmux session");
+    println!("  attach [--read-only] <session>  Attach to a private local-node tmux session");
     println!(
         "  create-project <title> --description <text>  Create a durable orchestration project in mmux.db"
+    );
+    println!(
+        "  delete-project <id-or-slug>  Delete an orchestration project and its plans/tasks from mmux.db"
     );
     println!("  list-projects           List durable orchestration projects from mmux.db");
     println!("  prune-store             Prune stale task sessions and finished plans from mmux.db");
@@ -259,6 +276,81 @@ fn run_list_projects(store_path: Option<PathBuf>) -> i32 {
         );
     }
     0
+}
+
+fn run_delete_project(store_path: Option<PathBuf>, raw_args: &[OsString]) -> i32 {
+    if raw_args
+        .iter()
+        .any(|arg| matches!(arg.to_str(), Some("-h" | "--help")))
+    {
+        print_delete_project_help();
+        return 0;
+    }
+    let project_id_or_slug = match parse_delete_project_args(raw_args) {
+        Ok(project_id_or_slug) => project_id_or_slug,
+        Err(error) => {
+            eprintln!("mmux delete-project: {error}");
+            return 2;
+        }
+    };
+    let store_path = match mmux_node::resolve_store_path(store_path.as_deref()) {
+        Ok(path) => path,
+        Err(error) => {
+            eprintln!("mmux delete-project: {error}");
+            return 2;
+        }
+    };
+    let report = match mmux_controller::local_delete_project(Some(&store_path), project_id_or_slug)
+    {
+        Ok(report) => report,
+        Err(error) => {
+            eprintln!("mmux delete-project: {error}");
+            return 1;
+        }
+    };
+    let project = report.project;
+    println!(
+        "deleted\t{}\t{}\t{}\t{}/{}\tplans={}\ttasks={}\tedges={}\t{}",
+        project.id,
+        project.slug,
+        project.status,
+        project.active_task_count,
+        project.task_count,
+        report.deleted_plan_count,
+        report.deleted_task_count,
+        report.deleted_edge_count,
+        project.title
+    );
+    0
+}
+
+fn print_delete_project_help() {
+    println!("usage: mmux delete-project <id-or-slug>");
+    println!();
+    println!("Deletes an orchestration project from mmux.db.");
+    println!("Also deletes all plans, task cards, task sessions, and task edges in that project.");
+}
+
+fn parse_delete_project_args(raw_args: &[OsString]) -> Result<String, String> {
+    let mut project_id_or_slug = None;
+    for arg in raw_args {
+        let text = arg
+            .to_str()
+            .ok_or_else(|| "arguments must be valid UTF-8".to_owned())?;
+        if text.starts_with('-') {
+            return Err(format!("unknown argument '{text}'"));
+        }
+        if project_id_or_slug.is_some() {
+            return Err("project id or slug may only be provided once".into());
+        }
+        project_id_or_slug = Some(text.to_owned());
+    }
+    let project_id_or_slug =
+        project_id_or_slug.ok_or_else(|| "project id or slug is required".to_owned())?;
+    if project_id_or_slug.trim().is_empty() {
+        return Err("project id or slug must not be empty".into());
+    }
+    Ok(project_id_or_slug)
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -419,22 +511,91 @@ fn run_attach_proxy(raw_args: &[OsString]) -> i32 {
 }
 
 fn run_attach_proxy_with_store(store_path: Option<PathBuf>, raw_args: &[OsString]) -> i32 {
-    let (store_path, mut args) = match parse_proxy_args(store_path, raw_args) {
+    if let Some(code) = run_attach_help(raw_args) {
+        return code;
+    }
+    let (store_path, args) = match parse_proxy_args(store_path, raw_args) {
         Ok(parsed) => parsed,
         Err(error) => {
             eprintln!("mmux attach: {error}");
             return 2;
         }
     };
-    if args.len() != 1 {
-        eprintln!("usage: mmux attach <session>");
-        return 2;
+    let attach_args = match parse_attach_args(&args) {
+        Ok(args) => args,
+        Err(error) => {
+            eprintln!("mmux attach: {error}");
+            eprintln!("usage: mmux attach [--read-only|-r] <session>");
+            return 2;
+        }
+    };
+    let tmux_args = attach_tmux_args(attach_args);
+    run_tmux_proxy_with_store(store_path, &tmux_args)
+}
+
+fn attach_tmux_args(attach_args: AttachArgs) -> Vec<OsString> {
+    let mut tmux_args = vec![OsString::from("attach")];
+    if attach_args.read_only {
+        tmux_args.push(OsString::from("-r"));
     }
-    let session = args.remove(0);
-    run_tmux_proxy_with_store(
-        store_path,
-        &[OsString::from("attach"), OsString::from("-t"), session],
-    )
+    tmux_args.push(OsString::from("-t"));
+    tmux_args.push(attach_args.session);
+    tmux_args
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct AttachArgs {
+    session: OsString,
+    read_only: bool,
+}
+
+fn parse_attach_args(raw_args: &[OsString]) -> Result<AttachArgs, String> {
+    let mut session = None;
+    let mut read_only = false;
+
+    for arg in raw_args {
+        match arg.to_str() {
+            Some("-r" | "--read-only") => {
+                read_only = true;
+            }
+            Some("-h" | "--help") => {
+                return Err("help is not available for mmux attach yet".into());
+            }
+            Some(value) if value.starts_with('-') => {
+                return Err(format!("unknown argument '{value}'"));
+            }
+            _ if session.is_some() => {
+                return Err("session may only be provided once".into());
+            }
+            _ => {
+                session = Some(arg.clone());
+            }
+        }
+    }
+
+    let session = session.ok_or_else(|| "session is required".to_owned())?;
+    if session.as_os_str().is_empty() {
+        return Err("session must not be empty".into());
+    }
+    Ok(AttachArgs { session, read_only })
+}
+
+fn print_attach_help() {
+    println!("usage: mmux attach [--read-only|-r] <session>");
+    println!();
+    println!("Attaches to a private local-node tmux session.");
+    println!("Use --read-only to attach without sending input to the session.");
+}
+
+fn run_attach_help(raw_args: &[OsString]) -> Option<i32> {
+    if raw_args
+        .iter()
+        .any(|arg| matches!(arg.to_str(), Some("-h" | "--help")))
+    {
+        print_attach_help();
+        return Some(0);
+    }
+    None
 }
 
 fn run_tmux_proxy(raw_args: &[OsString]) -> i32 {
@@ -653,6 +814,52 @@ mod tests {
 
     fn os_args(args: &[&str]) -> Vec<OsString> {
         args.iter().map(OsString::from).collect()
+    }
+
+    #[test]
+    fn attach_args_accept_session_and_read_only_flags() {
+        let args = parse_attach_args(&os_args(&["codex"])).unwrap();
+        assert_eq!(
+            args,
+            AttachArgs {
+                session: OsString::from("codex"),
+                read_only: false,
+            }
+        );
+
+        let args = parse_attach_args(&os_args(&["--read-only", "codex"])).unwrap();
+        assert_eq!(
+            args,
+            AttachArgs {
+                session: OsString::from("codex"),
+                read_only: true,
+            }
+        );
+
+        let args = parse_attach_args(&os_args(&["codex", "-r"])).unwrap();
+        assert!(args.read_only);
+    }
+
+    #[test]
+    fn attach_args_reject_missing_duplicate_and_unknown() {
+        let error = parse_attach_args(&os_args(&[])).unwrap_err();
+        assert_eq!(error, "session is required");
+
+        let error = parse_attach_args(&os_args(&["one", "two"])).unwrap_err();
+        assert_eq!(error, "session may only be provided once");
+
+        let error = parse_attach_args(&os_args(&["--write", "codex"])).unwrap_err();
+        assert!(error.contains("unknown argument"));
+    }
+
+    #[test]
+    fn attach_tmux_args_include_read_only_flag_before_target() {
+        let args = attach_tmux_args(AttachArgs {
+            session: OsString::from("codex"),
+            read_only: true,
+        });
+
+        assert_eq!(args, os_args(&["attach", "-r", "-t", "codex"]));
     }
 
     #[test]

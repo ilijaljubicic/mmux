@@ -35,17 +35,26 @@ Discovery and state tools:
 - `list_coder_profiles`: inspect enabled built-in coder profiles.
 - `orchestration_status`: inspect projects, plans, tasks, outcomes, blockers,
   task sessions, warnings, cleanup candidates, and runtime state.
+- `task_get`: read one full stored task body, including objective, scope,
+  gates, outcome/evidence, run spec, session, and incoming/outgoing edges.
+- `plan_get`: read one full stored plan body, including the Markdown brief that
+  `plan_list` omits.
 - `project_list`, `list_sessions(project_id)`, `admin_list_node_sessions`,
   `session_info`, `check_state`: inspect durable and live runtime state.
 
 Project, plan, and task tools:
 
 - `project_create`: create a project boundary through MCP.
-- `plan_create`, `plan_list`, `plan_update`, `plan_status_update`: manage
-  plan work-package documents and status.
+- `plan_create`, `plan_list`, `plan_update`, `plan_status_update`, `plan_get`:
+  manage plan work-package documents and status; `plan_get` returns one full
+  stored plan body including its brief.
 - `task_create`, `task_update`, `task_status_update`: manage
-  task metadata, task session, and state.
+  task metadata, optional scheduler `run_spec`, task session, and state.
 - `task_edge_add`, `task_edge_remove`: maintain task relationships.
+- `orchestration_report`: read-only report of ready/skipped/error task
+  classifications for automatic orchestration.
+- `orchestration_next`: advance one plan by starting all ready
+  auto-scheduled tasks after worker/validator results have been recorded.
 
 Session and coder tools:
 
@@ -89,8 +98,13 @@ or troubleshooting examples are needed.
 - Keep secrets out of prompts, transcripts, and final answers. Refer to secret
   env vars by name only. Never ask a coder to print API keys or tokens.
 - Prefer mmux MCP tools over direct terminal driving for interactive coder CLIs.
-- Use `mmux attach <session>` or `mmux tmux -- <tmux args>` only as a manual
-  inspection escape hatch when MCP output is not enough.
+- Remember that local-node coder sessions inherit environment from the mmux
+  controller or distributed local node process. mmux does not set a separate
+  `CODEX_HOME`; Codex uses the inherited value, or Codex's default `~/.codex`
+  when it is unset.
+- Use `mmux attach --read-only <session>` or `mmux tmux -- <tmux args>` only as
+  a manual inspection escape hatch when MCP output is not enough. Use writable
+  `mmux attach <session>` only when interactive input is intended.
 - Use `mmux create-project` for offline project setup. Use
   `mmux list-projects` and `mmux tmux -- list-sessions --project <project>`
   when you need to find project-scoped sessions from the CLI.
@@ -152,7 +166,9 @@ Use this flow when coordinating tasks through the orchestration tools:
    projects, plans, task graph, task outcomes, blockers, task session
    summaries, cleanup candidates, warnings, and runtime states instead of
    scraping tmux output. Pass `include_completed=true` when delivered,
-   canceled, or failed tasks matter.
+   canceled, or failed tasks matter. Use `task_get` for one full stored task
+   body when exporting or inspecting exact task fields, and `plan_get` for one
+   full stored plan brief.
 3. Create or select a project with CLI
    `mmux create-project <title> --description <text>` for offline setup or MCP
    `project_create`/`project_list` through a running controller. Projects have
@@ -162,11 +178,23 @@ Use this flow when coordinating tasks through the orchestration tools:
 4. Create a plan with `plan_create`: required `project_id`, `title`, and
    Markdown `brief` with enough context and detail to derive tasks. Create
    tasks with `task_create`: required `plan_id`, `title`, `objective`,
-   `include_paths`, `exclude_paths`, `notes`, optional `gates`. The
-   response is the created task object directly; read `id` from the top level.
+   `include_paths`, `exclude_paths`, `notes`, optional `gates`, and optional
+   scheduler `run_spec`. The response is the created task object directly;
+   read `id` from the top level.
    Created tasks start in `Backlog`; move them to `Planned` only when
    dependencies and scope are ready.
-5. Correct mutable task metadata with `task_update`.
+   A scheduler `run_spec` contains `node_id`, `profile`, `workspace_path`,
+   boolean `bypass_permissions`, `role`, `kind`, `skills`, prompt `template`,
+   and scheduler `instruction`. `run_spec` describes how a task can be started;
+   top-level `auto_schedule` separately controls whether explicit
+   `orchestration_next` runs may start it automatically.
+5. Correct mutable task metadata with `task_update`; pass `run_spec = null` to
+   clear scheduler launch intent.
+   Scope paths define task work boundaries, not runtime placement. Relative
+   `include_paths` and `exclude_paths` are interpreted from the runtime
+   workspace when a `run_spec` or recorded session provides one. Prefer scope
+   paths inside that workspace unless the operator intentionally scopes
+   external files.
 6. Maintain dependency edges with `task_edge_add` and `task_edge_remove`.
 7. Start task-aware coder sessions with `start_coding_session`. Provide
    explicit `node`, `profile`, `workspace_path`, boolean `bypass_permissions`,
@@ -174,8 +202,9 @@ Use this flow when coordinating tasks through the orchestration tools:
    request `generate_session_name = true`.
    When `task_id` is present, `node` is mandatory. Pass the selected runtime
    node explicitly, such as `node = "local"` for the embedded local node.
-   Treat `workspace_path` as session start/adoption placement; do not recreate
-   a live session only because its current working directory changed.
+   Treat `workspace_path` as session start/adoption placement, not task scope;
+   do not recreate a live session only because its current working directory
+   changed.
    Starting or recording a different `node_id`/`session` for the same task
    replaces the task session canonically and stops the previous live session
    with `tmux kill-session` through the previous session's recorded node when
@@ -198,12 +227,49 @@ Use this flow when coordinating tasks through the orchestration tools:
     worker-side mmux calls to recover prior task results.
     Use `coding_send` only for follow-up prompts, steering, corrections, or
     non-task sessions.
-11. Update task state with `task_status_update`. Include `status` and a concise
-    `outcome`; include `blockers` when blocked. For gated moves to `Passed` or
-    `Delivered`, include evidence in the outcome.
+11. Use `task_start` to explicitly start one task from its `run_spec`.
+    `task_start` does not require `auto_schedule = true`.
+12. Use `orchestration_report` when the operator or external MCP controller
+    needs a read-only classification of ready/skipped/error tasks for automatic
+    orchestration. It accepts optional `project_id` and `plan_id` filters and
+    never starts sessions. Use `orchestration_next` for scheduler-driven
+    startup after the operator or external MCP controller records
+    worker/validator results for a plan. It requires `plan_id`, which accepts a
+    plan id or unique plan slug, and executes by default; pass `dry_run = true`
+    to preview. There is no background scheduler loop; the operator or
+    external MCP controller observes `orchestration_status`, commits
+    worker/validator results, optionally calls `orchestration_report`, then
+    calls `orchestration_next` to advance work. Scheduler startup is
+    conservative: it requires top-level `auto_schedule = true`, a `run_spec`,
+    `Backlog` or `Planned` status, ready `DependsOn` dependencies and required
+    validations, an enabled profile, and no live recorded session. Scheduler
+    startup/readiness/prompt failures are visible in `orchestration_status` as
+    `Blocked` tasks with blockers; worker-reported failures still need
+    `task_status_update` or `task_report`. mmux does not infer stuck running
+    tasks from silence without a separate timeout or heartbeat policy.
+    `Task.gates` are the acceptance checklist. A `Validates` edge from a
+    validator task to a target task is operational: downstream tasks that
+    `DependsOn` the target cannot start until every linked validator is
+    `Passed` or `Delivered`. If validation cannot run, mark the validator task
+    `Blocked`; if validation rejects the target, mark the validator task
+    `Failed` with outcome and evidence. `orchestration_status` exposes
+    `validation_blocked_by`, `unapproved_validator_count`, and
+    `failed_validator_count`.
+    Supported task edges in v1 are `DependsOn`, `ParentOf`, `Validates`,
+    `Audits`, `Refines`, `Supersedes`, and `Related`. `DependsOn`, `ParentOf`,
+    and `Validates` have orchestration semantics. `Audits` is non-gating review
+    traceability; use `Validates` when an audit must approve gates before
+    dependent work can start. `Refines`, `Supersedes`, and `Related` are durable
+    traceability/navigation relations.
+13. Update task state with `task_status_update`. Include `status` and a concise
+    `outcome`; include `blockers` when blocked. Use `task_report` for the same
+    durable result shape when an external controller is committing worker or
+    validator output. For gated moves to `Passed` or `Delivered`, include
+    evidence in the outcome.
 
 Task-owned `gates` are validation checks. Moving a gated task to `Passed` or
-`Delivered` requires an operator-recorded outcome.
+`Delivered` requires an operator-recorded outcome. `Validates` edges give those
+checks orchestration meaning for downstream scheduling.
 
 `coding_task_send` templates answer different orchestration questions:
 
@@ -316,9 +382,11 @@ Role: task-writer
 Task goal: <goal or capability>
 Known context: <facts, scope paths, dependencies, constraints>
 Session hints: <node/profile/workspace_path if already chosen>
-Draft concrete orchestration tasks with clear objectives, allowed paths,
-dependencies, and validation gates. Report: task_writing_outcome, proposed_tasks,
-scope_paths, gates, dependencies, blockers, unresolved_questions.
+Draft concrete orchestration tasks with clear objectives, allowed scope paths,
+dependencies, and validation gates. Scope paths are task work boundaries;
+workspace_path is runtime start/adoption placement. Report:
+task_writing_outcome, proposed_tasks, scope_paths, gates, dependencies,
+blockers, unresolved_questions.
 ```
 
 ```text
@@ -326,7 +394,8 @@ Role: editable-worker
 Task: <task_id> - <title>
 Objective: <objective>
 Task outcome and current status: <outcome/status/blockers>
-Scope: include <paths>; exclude <paths>; workspace_path <workspace_path>
+Scope: include <paths>; exclude <paths>; relative paths are from runtime workspace when provided
+Runtime placement: workspace_path <workspace_path>
 Dependencies and gates: <dependency status; gate list>
 Task session: <node/session/profile/workspace_path/role/kind/skills>
 Implement only this task. Run focused verification. Report: implementation_outcome,

@@ -10,7 +10,7 @@ define update_version
 	perl -0pi -e 's/(\[workspace\.package\]\nversion = ")[^"]+(")/$${1}$(1)$${2}/' $(CARGO_TOML)
 endef
 
-.PHONY: help build check test clean lint release release-tag npm-package npm-pack-dry-run npm-pack update-patch update-minor update-major run-local run-controller run-node wire-check-tools wire-generate
+.PHONY: help build check test clean lint release release-tag npm-package npm-pack-dry-run npm-pack update-patch update-minor update-major run-local run-controller run-node run-cormilo-agent wire-check-tools wire-generate
 
 LOCAL_ARGS ?=
 CONTROLLER_ARGS ?=
@@ -37,6 +37,7 @@ help:
 	@printf '  make run-local         Run mmux controller with the built-in local node enabled\n'
 	@printf '  make run-controller    Run mmux controller\n'
 	@printf '  make run-node          Run mmux node\n'
+	@printf '  make run-cormilo-agent Run the local Cormilo mmux orchestration agent\n'
 	@printf '\nWire protocol:\n'
 	@printf '  make wire-check-tools  Verify buf/buffa/connect-rust generators\n'
 	@printf '  make wire-generate     Generate crates/mmux-wire sources\n'
@@ -121,6 +122,9 @@ run-controller:
 # Run the node scaffold entrypoint
 run-node:
 	cargo run -- node $(NODE_ARGS)
+
+run-cormilo-agent:
+	$(MAKE) -C mmux-cormilo-agent start
 
 # Verify the local wire-protocol generator toolchain used by crates/mmux-wire
 wire-check-tools:

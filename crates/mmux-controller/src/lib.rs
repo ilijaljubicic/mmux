@@ -8,8 +8,9 @@ use mmux_controller_core::{
     orchestration::{
         CreatePlan, CreateProject, CreateTask, CreateTaskEdge, NodeId, OrchestrationCounts,
         OrchestrationState, OrchestrationStatus, PlanId, PlanStatus, ProjectId, ProjectStatus,
-        SessionCleanupCandidate, SessionId, Task, TaskEdge, TaskEdgeKind, TaskId, TaskScope,
-        TaskSession, TaskStatus, UpdatePlan, UpdateTask, UpdateTaskScope,
+        SessionCleanupCandidate, SessionId, Task, TaskDependencyBlocker, TaskEdge, TaskEdgeKind,
+        TaskId, TaskRunSpec, TaskScope, TaskSession, TaskStatus, UpdatePlan, UpdateTask,
+        UpdateTaskScope,
     },
     NodeRegistry, NodeWireAuthContext, NodeWireAuthMode, NodeWireAuthPolicy, NodeWireIdentity,
 };
@@ -1218,6 +1219,845 @@ async fn execute_node_command(
     .await
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+//  Orchestration scheduler actor
+// ═══════════════════════════════════════════════════════════════════════════════
+
+struct OrchestrationSchedulerActor;
+
+enum OrchestrationSchedulerMessage {
+    Report {
+        args: OrchestrationReportArgs,
+        reply: RpcReplyPort<Result<OrchestrationReport, String>>,
+    },
+    Next {
+        args: OrchestrationSchedulerRunArgs,
+        reply: RpcReplyPort<Result<OrchestrationSchedulerRunReport, String>>,
+    },
+    StartTask {
+        args: TaskStartArgs,
+        reply: RpcReplyPort<Result<TaskStartReport, String>>,
+    },
+}
+
+#[derive(Clone)]
+struct OrchestrationSchedulerState {
+    profiles: ProfileRegistry,
+    default_coder_profile: Option<String>,
+    node_executor: ActorRef<NodeExecutionMessage>,
+    orchestration: orchestration_actor::OrchestrationHandle,
+}
+
+impl Actor for OrchestrationSchedulerActor {
+    type Msg = OrchestrationSchedulerMessage;
+    type State = OrchestrationSchedulerState;
+    type Arguments = OrchestrationSchedulerState;
+
+    async fn pre_start(
+        &self,
+        _myself: ActorRef<Self::Msg>,
+        state: Self::Arguments,
+    ) -> Result<Self::State, ActorProcessingErr> {
+        Ok(state)
+    }
+
+    async fn handle(
+        &self,
+        _myself: ActorRef<Self::Msg>,
+        message: Self::Msg,
+        state: &mut Self::State,
+    ) -> Result<(), ActorProcessingErr> {
+        match message {
+            OrchestrationSchedulerMessage::Report { args, reply } => {
+                let result = run_orchestration_report(state, args).await;
+                let _ = reply.send(result);
+            }
+            OrchestrationSchedulerMessage::Next { args, reply } => {
+                let result = run_orchestration_next(state, args).await;
+                let _ = reply.send(result);
+            }
+            OrchestrationSchedulerMessage::StartTask { args, reply } => {
+                let result = run_task_start(state, args).await;
+                let _ = reply.send(result);
+            }
+        }
+        Ok(())
+    }
+}
+
+async fn run_orchestration_report(
+    scheduler: &OrchestrationSchedulerState,
+    args: OrchestrationReportArgs,
+) -> Result<OrchestrationReport, String> {
+    let state = scheduler.orchestration.snapshot()?;
+    let project_id = args
+        .project_id
+        .as_deref()
+        .map(|selector| resolve_project_id_or_slug(&state, selector))
+        .transpose()?;
+    let plan_id = args
+        .plan_id
+        .as_deref()
+        .map(|selector| resolve_plan_id_or_slug(&state, selector))
+        .transpose()?;
+    let run_report = run_orchestration_next(
+        scheduler,
+        OrchestrationSchedulerRunArgs {
+            project_id: args.project_id,
+            plan_id: args.plan_id,
+            dry_run: true,
+            max_tasks: state.tasks.len().max(1),
+        },
+    )
+    .await?;
+    Ok(OrchestrationReport {
+        project_id,
+        plan_id,
+        ready: run_report.would_start,
+        skipped: run_report.skipped,
+        errors: run_report.errors,
+    })
+}
+
+async fn run_orchestration_next(
+    scheduler: &OrchestrationSchedulerState,
+    args: OrchestrationSchedulerRunArgs,
+) -> Result<OrchestrationSchedulerRunReport, String> {
+    if args.max_tasks == 0 {
+        return Err("max_tasks must be greater than zero".into());
+    }
+    let state = scheduler.orchestration.snapshot()?;
+    let project_id = args
+        .project_id
+        .as_deref()
+        .map(|selector| resolve_project_id_or_slug(&state, selector))
+        .transpose()?;
+    let plan_id = args
+        .plan_id
+        .as_deref()
+        .map(|selector| resolve_plan_id_or_slug(&state, selector))
+        .transpose()?;
+
+    let mut report = OrchestrationSchedulerRunReport {
+        dry_run: args.dry_run,
+        project_id: project_id.clone(),
+        plan_id: plan_id.clone(),
+        max_tasks: args.max_tasks,
+        would_start: Vec::new(),
+        started: Vec::new(),
+        skipped: Vec::new(),
+        errors: Vec::new(),
+    };
+
+    let mut tasks = state.tasks.values().collect::<Vec<_>>();
+    tasks.sort_by(|left, right| left.id.0.cmp(&right.id.0));
+    for task in tasks {
+        if report.would_start.len() + report.started.len() >= args.max_tasks {
+            break;
+        }
+        if !scheduler_task_matches_filters(&state, task, project_id.as_ref(), plan_id.as_ref()) {
+            continue;
+        }
+        if !task.auto_schedule {
+            report
+                .skipped
+                .push(schedule_skip(task, "auto_schedule is false"));
+            continue;
+        }
+        let Some(run_spec) = task.run_spec.as_ref() else {
+            report.skipped.push(schedule_skip(task, "missing run_spec"));
+            continue;
+        };
+        if !matches!(task.status, TaskStatus::Backlog | TaskStatus::Planned) {
+            report.skipped.push(schedule_skip(
+                task,
+                &format!("status {:?} is not auto-startable", task.status),
+            ));
+            continue;
+        }
+        let blocked_by = scheduler_dependency_blockers(&state, task);
+        if !blocked_by.is_empty() {
+            report.skipped.push(schedule_skip(
+                task,
+                &format!(
+                    "dependencies not ready: {}",
+                    format_blocking_dependencies(&blocked_by)
+                ),
+            ));
+            continue;
+        }
+        if scheduler_resolve_profile(scheduler, &run_spec.profile).is_none() {
+            report.errors.push(schedule_error(
+                task,
+                &format!("profile '{}' is not enabled", run_spec.profile),
+            ));
+            continue;
+        }
+        if let Some(session) = task.session.as_ref() {
+            if args.dry_run {
+                report
+                    .skipped
+                    .push(schedule_skip(task, "task already has a recorded session"));
+                continue;
+            }
+            match scheduler_node_session_exists(
+                &scheduler.node_executor,
+                &session.node_id.0,
+                &session.session.0,
+            )
+            .await
+            {
+                Ok(true) => {
+                    report
+                        .skipped
+                        .push(schedule_skip(task, "recorded session is already live"));
+                    continue;
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    report.errors.push(schedule_error(
+                        task,
+                        &format!("failed to inspect recorded session: {error}"),
+                    ));
+                    continue;
+                }
+            }
+        }
+
+        let session_name = scheduler_session_name(task, run_spec);
+        let scheduled = OrchestrationScheduledTask {
+            task_id: task.id.clone(),
+            slug: task.slug.clone(),
+            node_id: run_spec.node_id.0.clone(),
+            session: session_name,
+            profile: run_spec.profile.clone(),
+            template: run_spec.template.clone(),
+        };
+        if args.dry_run {
+            report.would_start.push(scheduled);
+            continue;
+        }
+
+        match scheduler_start_task(scheduler, task, run_spec, &scheduled).await {
+            Ok(started) => report.started.push(started),
+            Err(error) => report.errors.push(schedule_error(task, &error)),
+        }
+    }
+
+    Ok(report)
+}
+
+async fn run_task_start(
+    scheduler: &OrchestrationSchedulerState,
+    args: TaskStartArgs,
+) -> Result<TaskStartReport, String> {
+    validate_prompt_text_value("task_id_or_slug", &args.task_id_or_slug)?;
+    let state = scheduler.orchestration.snapshot()?;
+    let task = resolve_task_by_id_or_slug(&state, &args.task_id_or_slug)?;
+    let Some(run_spec) = task.run_spec.as_ref() else {
+        return Err(format!("task '{}' has no run_spec", task.id.0));
+    };
+    let scheduled = OrchestrationScheduledTask {
+        task_id: task.id.clone(),
+        slug: task.slug.clone(),
+        node_id: run_spec.node_id.0.clone(),
+        session: scheduler_session_name(task, run_spec),
+        profile: run_spec.profile.clone(),
+        template: run_spec.template.clone(),
+    };
+    if !matches!(task.status, TaskStatus::Backlog | TaskStatus::Planned) {
+        return Ok(TaskStartReport {
+            dry_run: args.dry_run,
+            task_id: task.id.clone(),
+            auto_schedule: task.auto_schedule,
+            action: "skipped".into(),
+            task: Some(scheduled),
+            reason: Some(format!("status {:?} is not startable", task.status)),
+        });
+    }
+    let blocked_by = scheduler_dependency_blockers(&state, task);
+    if !blocked_by.is_empty() {
+        return Ok(TaskStartReport {
+            dry_run: args.dry_run,
+            task_id: task.id.clone(),
+            auto_schedule: task.auto_schedule,
+            action: "skipped".into(),
+            task: Some(scheduled),
+            reason: Some(format!(
+                "dependencies not ready: {}",
+                format_blocking_dependencies(&blocked_by)
+            )),
+        });
+    }
+    if scheduler_resolve_profile(scheduler, &run_spec.profile).is_none() {
+        return Err(format!("profile '{}' is not enabled", run_spec.profile));
+    }
+    if let Some(session) = task.session.as_ref() {
+        if !args.dry_run {
+            match scheduler_node_session_exists(
+                &scheduler.node_executor,
+                &session.node_id.0,
+                &session.session.0,
+            )
+            .await
+            {
+                Ok(true) => {
+                    return Ok(TaskStartReport {
+                        dry_run: false,
+                        task_id: task.id.clone(),
+                        auto_schedule: task.auto_schedule,
+                        action: "already-running".into(),
+                        task: Some(OrchestrationScheduledTask {
+                            task_id: task.id.clone(),
+                            slug: task.slug.clone(),
+                            node_id: session.node_id.0.clone(),
+                            session: session.session.0.clone(),
+                            profile: session.profile.clone(),
+                            template: run_spec.template.clone(),
+                        }),
+                        reason: Some("recorded session is already live".into()),
+                    });
+                }
+                Ok(false) => {}
+                Err(error) => {
+                    return Err(format!("failed to inspect recorded session: {error}"));
+                }
+            }
+        }
+    }
+    if args.dry_run {
+        return Ok(TaskStartReport {
+            dry_run: true,
+            task_id: task.id.clone(),
+            auto_schedule: task.auto_schedule,
+            action: "would-start".into(),
+            task: Some(scheduled),
+            reason: None,
+        });
+    }
+
+    let started = scheduler_start_task(scheduler, task, run_spec, &scheduled).await?;
+    Ok(TaskStartReport {
+        dry_run: false,
+        task_id: task.id.clone(),
+        auto_schedule: task.auto_schedule,
+        action: "started".into(),
+        task: Some(started),
+        reason: None,
+    })
+}
+
+async fn scheduler_start_task(
+    scheduler: &OrchestrationSchedulerState,
+    task: &Task,
+    run_spec: &TaskRunSpec,
+    scheduled: &OrchestrationScheduledTask,
+) -> Result<OrchestrationScheduledTask, String> {
+    let profile = scheduler_resolve_profile(scheduler, &run_spec.profile)
+        .ok_or_else(|| format!("profile '{}' is not enabled", run_spec.profile))?;
+    let command = profile_launch_command(&profile, run_spec.bypass_permissions)?;
+    scheduler_create_coding_session_with_command(
+        &scheduler.node_executor,
+        &run_spec.node_id.0,
+        &scheduled.session,
+        command,
+        Some(run_spec.workspace_path.as_str()),
+        &profile,
+    )
+    .await?;
+    scheduler
+        .orchestration
+        .record_session(
+            task.id.clone(),
+            TaskSession {
+                node_id: run_spec.node_id.clone(),
+                session: SessionId(scheduled.session.clone()),
+                profile: profile.name.clone(),
+                workspace_path: run_spec.workspace_path.clone(),
+                bypass_permissions: run_spec.bypass_permissions,
+                role: run_spec.role.clone(),
+                kind: run_spec.kind.clone(),
+                skills: run_spec.skills.clone(),
+                created_at_ms: 0,
+                updated_at_ms: 0,
+                last_seen_ms: 0,
+            },
+        )
+        .map_err(|error| format!("failed to record session: {error}"))?;
+    if let Err(error) = scheduler_wait_coding_ready(
+        &scheduler.node_executor,
+        &run_spec.node_id.0,
+        &scheduled.session,
+        &profile,
+        DEFAULT_CODING_READY_TIMEOUT_SECONDS,
+    )
+    .await
+    {
+        let _ = scheduler.orchestration.update_task_status_details(
+            task.id.clone(),
+            TaskStatus::Blocked,
+            Some("scheduler could not confirm coding session readiness".into()),
+            Some(vec![error.clone()]),
+            None,
+        );
+        return Err(format!("session readiness failed: {error}"));
+    }
+
+    let prompt_args = CodingTaskSendArgs {
+        node: run_spec.node_id.0.clone(),
+        session: scheduled.session.clone(),
+        profile: Some(profile.name.clone()),
+        task_id_or_slug: task.id.0.clone(),
+        prompt: run_spec.instruction.clone(),
+        template: Some(scheduler_parse_template(&run_spec.template)?),
+        include_dependencies: None,
+        include_gates: None,
+        include_scope: None,
+        context_task_ids: None,
+        extra_context: None,
+    };
+    let prompt = build_coding_task_prompt(&scheduler.orchestration.snapshot()?, &prompt_args)?;
+    if let Err(error) = scheduler_send_coding_prompt(
+        &scheduler.node_executor,
+        &run_spec.node_id.0,
+        &scheduled.session,
+        &profile,
+        &prompt,
+    )
+    .await
+    {
+        let _ = scheduler.orchestration.update_task_status_details(
+            task.id.clone(),
+            TaskStatus::Blocked,
+            Some("scheduler could not send task prompt".into()),
+            Some(vec![error.clone()]),
+            None,
+        );
+        return Err(format!("prompt send failed: {error}"));
+    }
+    scheduler
+        .orchestration
+        .update_task_status_details(
+            task.id.clone(),
+            TaskStatus::Running,
+            Some(format!(
+                "scheduler started '{}' on node '{}'",
+                scheduled.session, run_spec.node_id.0
+            )),
+            None,
+            None,
+        )
+        .map_err(|error| format!("failed to mark task running: {error}"))?;
+    Ok(scheduled.clone())
+}
+
+fn scheduler_task_matches_filters(
+    state: &OrchestrationState,
+    task: &Task,
+    project_id: Option<&ProjectId>,
+    plan_id: Option<&PlanId>,
+) -> bool {
+    if plan_id.is_some_and(|plan_id| &task.plan_id != plan_id) {
+        return false;
+    }
+    if let Some(project_id) = project_id {
+        return task_project_id(state, task).as_ref() == Some(project_id);
+    }
+    true
+}
+
+fn scheduler_dependency_blockers(
+    state: &OrchestrationState,
+    task: &Task,
+) -> Vec<TaskDependencyBlocker> {
+    state
+        .task_dependency_blockers(&task.id)
+        .unwrap_or_else(|error| {
+            vec![TaskDependencyBlocker {
+                task_id: task.id.clone(),
+                status: task.status,
+                reason: error,
+                validation_blocked_by: Vec::new(),
+            }]
+        })
+}
+
+fn format_blocking_dependencies(blocked_by: &[TaskDependencyBlocker]) -> String {
+    blocked_by
+        .iter()
+        .map(|blocker| {
+            if blocker.validation_blocked_by.is_empty() {
+                format!(
+                    "{} [{:?}: {}]",
+                    blocker.task_id.0, blocker.status, blocker.reason
+                )
+            } else {
+                format!(
+                    "{} [{:?}: {}; validators: {}]",
+                    blocker.task_id.0,
+                    blocker.status,
+                    blocker.reason,
+                    blocker
+                        .validation_blocked_by
+                        .iter()
+                        .map(|task_id| task_id.0.as_str())
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn scheduler_resolve_profile(
+    scheduler: &OrchestrationSchedulerState,
+    profile_name: &str,
+) -> Option<CliProfile> {
+    let profile_name = profile_name
+        .trim()
+        .is_empty()
+        .then(|| scheduler.default_coder_profile.as_deref())
+        .flatten()
+        .unwrap_or(profile_name);
+    mmux_node::get_profile(&scheduler.profiles, profile_name)
+}
+
+fn scheduler_session_name(task: &Task, run_spec: &TaskRunSpec) -> String {
+    generated_orchestration_session_name(&task.slug, &run_spec.kind, &task.id.0)
+}
+
+fn schedule_skip(task: &Task, reason: &str) -> OrchestrationScheduleSkip {
+    OrchestrationScheduleSkip {
+        task_id: task.id.clone(),
+        reason: reason.to_owned(),
+    }
+}
+
+fn schedule_error(task: &Task, reason: &str) -> OrchestrationScheduleError {
+    OrchestrationScheduleError {
+        task_id: task.id.clone(),
+        reason: reason.to_owned(),
+    }
+}
+
+fn scheduler_parse_template(template: &str) -> Result<CodingTaskSendTemplate, String> {
+    match template.trim() {
+        "task" => Ok(CodingTaskSendTemplate::Task),
+        "validate" => Ok(CodingTaskSendTemplate::Validate),
+        "review" => Ok(CodingTaskSendTemplate::Review),
+        "quality-guard" => Ok(CodingTaskSendTemplate::QualityGuard),
+        other => Err(format!("unsupported task run_spec template '{other}'")),
+    }
+}
+
+async fn scheduler_create_coding_session_with_command(
+    node_executor: &ActorRef<NodeExecutionMessage>,
+    node: &str,
+    session: &str,
+    cmd: &str,
+    workspace_path: Option<&str>,
+    profile: &CliProfile,
+) -> Result<String, String> {
+    match profile_launch_strategy(profile)? {
+        "direct" => {
+            scheduler_create_session_with_command(node_executor, node, session, cmd, workspace_path)
+                .await
+        }
+        "shell_send" => {
+            if scheduler_node_session_exists(node_executor, node, session).await? {
+                return Ok(format!("Session '{}' already exists", session));
+            }
+            scheduler_create_session_with_command(
+                node_executor,
+                node,
+                session,
+                "bash",
+                workspace_path,
+            )
+            .await?;
+            tokio::time::sleep(Duration::from_millis(1000)).await;
+            scheduler_tmux(
+                node_executor,
+                node,
+                vec![
+                    "send-keys".into(),
+                    "-l".into(),
+                    "-t".into(),
+                    session.into(),
+                    cmd.into(),
+                ],
+                Duration::from_secs(20),
+            )
+            .await?;
+            tokio::time::sleep(coding_prompt_submit_delay(cmd)).await;
+            scheduler_tmux(
+                node_executor,
+                node,
+                vec![
+                    "send-keys".into(),
+                    "-t".into(),
+                    session.into(),
+                    "Enter".into(),
+                ],
+                Duration::from_secs(20),
+            )
+            .await?;
+            Ok(format!(
+                "Created session '{}' with shell-send command '{}'",
+                session, cmd
+            ))
+        }
+        _ => unreachable!("profile_launch_strategy validates supported values"),
+    }
+}
+
+async fn scheduler_create_session_with_command(
+    node_executor: &ActorRef<NodeExecutionMessage>,
+    node: &str,
+    session: &str,
+    cmd: &str,
+    workspace_path: Option<&str>,
+) -> Result<String, String> {
+    if scheduler_node_session_exists(node_executor, node, session).await? {
+        return Ok(format!(
+            "Session '{}' already exists on node '{}'",
+            session, node
+        ));
+    }
+    let mut tmux_args = vec![
+        "new-session".into(),
+        "-d".into(),
+        "-s".into(),
+        session.into(),
+    ];
+    if let Some(workspace_path) = workspace_path {
+        tmux_args.push("-c".into());
+        tmux_args.push(workspace_path.into());
+    }
+    tmux_args.push(cmd.into());
+    scheduler_tmux(node_executor, node, tmux_args, Duration::from_secs(30)).await?;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    Ok(format!(
+        "Created session '{}' with command '{}' on node '{}'",
+        session, cmd, node
+    ))
+}
+
+async fn scheduler_node_session_exists(
+    node_executor: &ActorRef<NodeExecutionMessage>,
+    node: &str,
+    session: &str,
+) -> Result<bool, String> {
+    match scheduler_node_command(
+        node_executor,
+        node,
+        NodeCommandKind::Tmux {
+            args: vec!["has-session".into(), "-t".into(), session.into()],
+        },
+        Duration::from_secs(10),
+    )
+    .await
+    {
+        Ok(NodeCommandResult::TmuxOutput(_)) => Ok(true),
+        Ok(NodeCommandResult::Error { message }) if is_tmux_missing_session_error(&message) => {
+            Ok(false)
+        }
+        Ok(NodeCommandResult::Error { message }) => Err(format!(
+            "failed to check session '{}' on node '{}': {}",
+            session, node, message
+        )),
+        Ok(other) => Err(format!(
+            "unexpected session existence result from node '{}': {:?}",
+            node, other
+        )),
+        Err(error) => Err(format!(
+            "node '{}' is unreachable while checking session '{}': {}",
+            node, session, error
+        )),
+    }
+}
+
+async fn scheduler_wait_coding_ready(
+    node_executor: &ActorRef<NodeExecutionMessage>,
+    node: &str,
+    session: &str,
+    profile: &CliProfile,
+    timeout_seconds: u64,
+) -> Result<(), String> {
+    let deadline = Instant::now() + Duration::from_secs(timeout_seconds);
+    let poll = Duration::from_millis(500);
+    let required_stable = 2;
+    let mut stable_count = 0;
+    while Instant::now() < deadline {
+        let pane = scheduler_first_pane(node_executor, node, session).await?;
+        let output = scheduler_capture(node_executor, node, &pane, Some(200), false).await?;
+        if let Some(key) = startup_dismiss_key(&output, profile) {
+            let _ = scheduler_tmux(
+                node_executor,
+                node,
+                node_send_key_args(&pane, &key),
+                Duration::from_secs(20),
+            )
+            .await;
+            stable_count = 0;
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            continue;
+        }
+        if mmux_node::profiles::has_blocking_confirmation(&output, profile) {
+            return Err(format!(
+                "session '{}' on node '{}' is showing a blocking {} confirmation",
+                session, node, profile.name
+            ));
+        }
+        if profile_turn_idle(&output, profile) {
+            stable_count += 1;
+            if stable_count >= required_stable {
+                return Ok(());
+            }
+        } else {
+            stable_count = 0;
+        }
+        tokio::time::sleep(poll).await;
+    }
+    Err(format!(
+        "timeout after {}s waiting for {} to be coding-ready",
+        timeout_seconds, session
+    ))
+}
+
+async fn scheduler_send_coding_prompt(
+    node_executor: &ActorRef<NodeExecutionMessage>,
+    node: &str,
+    session: &str,
+    profile: &CliProfile,
+    prompt: &str,
+) -> Result<(), String> {
+    validate_prompt_text_value("scheduler task prompt", prompt)?;
+    let pane = scheduler_first_pane(node_executor, node, session).await?;
+    let output = scheduler_capture(node_executor, node, &pane, None, false)
+        .await
+        .unwrap_or_default();
+    if mmux_node::profiles::has_blocking_confirmation(&output, profile) {
+        return Err(format!(
+            "session '{}' on node '{}' is showing a blocking {} confirmation",
+            session, node, profile.name
+        ));
+    }
+    let text_mode = profile_text_mode(profile)?;
+    match text_mode {
+        "paste-buffer" => {
+            let buffer = tmux_buffer_name("mmux-scheduler-prompt", &pane);
+            scheduler_tmux(
+                node_executor,
+                node,
+                tmux_set_buffer_args(&buffer, prompt),
+                Duration::from_secs(20),
+            )
+            .await?;
+            scheduler_tmux(
+                node_executor,
+                node,
+                tmux_paste_buffer_args(&pane, &buffer),
+                Duration::from_secs(20),
+            )
+            .await?;
+        }
+        "literal-keys" => {
+            scheduler_tmux(
+                node_executor,
+                node,
+                tmux_literal_text_args(&pane, prompt),
+                Duration::from_secs(20),
+            )
+            .await?;
+        }
+        _ => unreachable!("profile_text_mode validates supported values"),
+    }
+    tokio::time::sleep(coding_prompt_submit_delay(prompt)).await;
+    if profile.submit_after_text && !profile.submit_keys.trim().is_empty() {
+        scheduler_tmux(
+            node_executor,
+            node,
+            tmux_submit_keys_args(&pane, &profile.submit_keys),
+            Duration::from_secs(20),
+        )
+        .await?;
+    }
+    Ok(())
+}
+
+async fn scheduler_first_pane(
+    node_executor: &ActorRef<NodeExecutionMessage>,
+    node: &str,
+    session: &str,
+) -> Result<String, String> {
+    let panes = scheduler_tmux(
+        node_executor,
+        node,
+        vec![
+            "list-panes".into(),
+            "-t".into(),
+            session.into(),
+            "-F".into(),
+            "#{pane_id}".into(),
+        ],
+        Duration::from_secs(20),
+    )
+    .await?;
+    panes
+        .lines()
+        .find(|line| !line.trim().is_empty())
+        .map(|line| line.trim().to_owned())
+        .ok_or_else(|| format!("Session '{}' has no panes on node '{}'", session, node))
+}
+
+async fn scheduler_capture(
+    node_executor: &ActorRef<NodeExecutionMessage>,
+    node: &str,
+    pane_or_session: &str,
+    lines: Option<usize>,
+    scrollback: bool,
+) -> Result<String, String> {
+    scheduler_tmux(
+        node_executor,
+        node,
+        tmux_capture_output_args(pane_or_session, lines, scrollback),
+        Duration::from_secs(20),
+    )
+    .await
+}
+
+async fn scheduler_tmux(
+    node_executor: &ActorRef<NodeExecutionMessage>,
+    node: &str,
+    args: Vec<String>,
+    timeout: Duration,
+) -> Result<String, String> {
+    match scheduler_node_command(node_executor, node, NodeCommandKind::Tmux { args }, timeout)
+        .await?
+    {
+        NodeCommandResult::TmuxOutput(output) => Ok(output),
+        NodeCommandResult::Error { message } => Err(message),
+        other => Err(format!("unexpected tmux command result: {:?}", other)),
+    }
+}
+
+async fn scheduler_node_command(
+    node_executor: &ActorRef<NodeExecutionMessage>,
+    node: &str,
+    kind: NodeCommandKind,
+    timeout: Duration,
+) -> Result<NodeCommandResult, String> {
+    node_execution_actor_call(node_executor, |reply| NodeExecutionMessage::Command {
+        node_id: node.to_owned(),
+        kind,
+        timeout,
+        reply,
+    })
+    .await
+}
+
 fn parse_session_list(node: &str, output: &str) -> Vec<SessionListEntry> {
     let mut sessions = output
         .lines()
@@ -1412,6 +2252,7 @@ struct TmuxMcpServer {
     policy: ControllerPolicy,
     node_executor: ActorRef<NodeExecutionMessage>,
     registry: ActorRef<NodeRegistryMessage>,
+    scheduler: ActorRef<OrchestrationSchedulerMessage>,
     orchestration: orchestration_actor::OrchestrationHandle,
     wait_jobs: WaitJobRegistry,
     startup_warnings: Arc<Mutex<Vec<String>>>,
@@ -1614,6 +2455,12 @@ struct PlanStatusUpdateArgs {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
+struct PlanGetArgs {
+    plan_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct TaskCreateArgs {
     plan_id: String,
     title: String,
@@ -1625,6 +2472,10 @@ struct TaskCreateArgs {
     notes: Option<String>,
     #[serde(default)]
     gates: Vec<String>,
+    #[serde(default)]
+    auto_schedule: bool,
+    #[serde(default)]
+    run_spec: Option<TaskRunSpec>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1643,6 +2494,16 @@ struct TaskUpdateArgs {
     notes: Option<Option<String>>,
     #[serde(default)]
     gates: Option<Vec<String>>,
+    #[serde(default)]
+    auto_schedule: Option<bool>,
+    #[serde(default)]
+    run_spec: Option<Option<TaskRunSpec>>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskGetArgs {
+    task_id: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1684,6 +2545,7 @@ struct TaskStatusUpdateArgs {
     status: TaskStatus,
     outcome: Option<String>,
     blockers: Option<Vec<String>>,
+    evidence: Option<Vec<String>>,
 }
 
 #[derive(Debug, Default, Deserialize)]
@@ -1694,6 +2556,107 @@ struct OrchestrationStatusArgs {
     task_id: Option<String>,
     #[serde(default)]
     include_completed: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OrchestrationReportArgs {
+    project_id: Option<String>,
+    plan_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct OrchestrationSchedulerRunArgs {
+    project_id: Option<String>,
+    plan_id: Option<String>,
+    dry_run: bool,
+    max_tasks: usize,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OrchestrationNextArgs {
+    plan_id: String,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TaskStartArgs {
+    task_id_or_slug: String,
+    #[serde(default)]
+    dry_run: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct OrchestrationReport {
+    project_id: Option<ProjectId>,
+    plan_id: Option<PlanId>,
+    ready: Vec<OrchestrationScheduledTask>,
+    skipped: Vec<OrchestrationScheduleSkip>,
+    errors: Vec<OrchestrationScheduleError>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct OrchestrationSchedulerRunReport {
+    dry_run: bool,
+    project_id: Option<ProjectId>,
+    plan_id: Option<PlanId>,
+    max_tasks: usize,
+    would_start: Vec<OrchestrationScheduledTask>,
+    started: Vec<OrchestrationScheduledTask>,
+    skipped: Vec<OrchestrationScheduleSkip>,
+    errors: Vec<OrchestrationScheduleError>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct OrchestrationNextReport {
+    dry_run: bool,
+    plan_id: PlanId,
+    would_start: Vec<OrchestrationScheduledTask>,
+    started: Vec<OrchestrationScheduledTask>,
+    skipped: Vec<OrchestrationScheduleSkip>,
+    errors: Vec<OrchestrationScheduleError>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct OrchestrationScheduledTask {
+    task_id: TaskId,
+    slug: String,
+    node_id: String,
+    session: String,
+    profile: String,
+    template: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct OrchestrationScheduleSkip {
+    task_id: TaskId,
+    reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct OrchestrationScheduleError {
+    task_id: TaskId,
+    reason: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct TaskStartReport {
+    dry_run: bool,
+    task_id: TaskId,
+    auto_schedule: bool,
+    action: String,
+    task: Option<OrchestrationScheduledTask>,
+    reason: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct TaskGetResult {
+    task: Task,
+    incoming_edges: Vec<TaskEdge>,
+    outgoing_edges: Vec<TaskEdge>,
 }
 
 struct NodeWaitOptions<'a> {
@@ -1722,6 +2685,7 @@ impl TmuxMcpServer {
         policy: ControllerPolicy,
         node_executor: ActorRef<NodeExecutionMessage>,
         registry: ActorRef<NodeRegistryMessage>,
+        scheduler: ActorRef<OrchestrationSchedulerMessage>,
         orchestration: orchestration_actor::OrchestrationHandle,
         wait_jobs: WaitJobRegistry,
         startup_warnings: Arc<Mutex<Vec<String>>>,
@@ -1732,6 +2696,7 @@ impl TmuxMcpServer {
             policy,
             node_executor,
             registry,
+            scheduler,
             orchestration,
             wait_jobs,
             startup_warnings,
@@ -2029,6 +2994,16 @@ impl TmuxMcpServer {
                 )),
             ),
             Tool::new(
+                "plan_get",
+                "Return one full stored plan record including its Markdown brief",
+                Arc::new(tool_schema(
+                    json!({
+                        "plan_id": { "type": "string", "description": "Plan id or unique plan slug" }
+                    }),
+                    Some(vec!["plan_id"]),
+                )),
+            ),
+            Tool::new(
                 "task_create",
                 "Create an orchestration task and return the created Task object directly",
                 Arc::new(tool_schema(
@@ -2039,7 +3014,9 @@ impl TmuxMcpServer {
                         "include_paths": { "type": "array", "items": { "type": "string" } },
                         "exclude_paths": { "type": "array", "items": { "type": "string" } },
                         "notes": { "type": "string" },
-                        "gates": { "type": "array", "items": { "type": "string" } }
+                        "gates": { "type": "array", "items": { "type": "string" } },
+                        "auto_schedule": { "type": "boolean", "description": "Allow explicit orchestration_next runs to start this task when ready" },
+                        "run_spec": { "type": "object", "description": "Optional runtime launch spec for scheduler-driven task execution" }
                     }),
                     Some(vec!["plan_id", "title", "objective"]),
                 )),
@@ -2055,19 +3032,42 @@ impl TmuxMcpServer {
                         "include_paths": { "type": "array", "items": { "type": "string" } },
                         "exclude_paths": { "type": "array", "items": { "type": "string" } },
                         "notes": { "type": ["string", "null"] },
-                        "gates": { "type": "array", "items": { "type": "string" } }
+                        "gates": { "type": "array", "items": { "type": "string" } },
+                        "auto_schedule": { "type": "boolean", "description": "Allow explicit orchestration_next runs to start this task when ready" },
+                        "run_spec": { "type": ["object", "null"], "description": "Optional runtime launch spec; null clears it" }
                     }),
                     Some(vec!["task_id"]),
                 )),
             ),
             Tool::new(
+                "task_get",
+                "Return one full stored task record with incoming and outgoing task edges",
+                Arc::new(tool_schema(
+                    json!({
+                        "task_id": { "type": "string", "description": "Task id or unique task slug" }
+                    }),
+                    Some(vec!["task_id"]),
+                )),
+            ),
+            Tool::new(
+                "task_start",
+                "Explicitly start one task using its run_spec. Does not require auto_schedule=true.",
+                Arc::new(tool_schema(
+                    json!({
+                        "task_id_or_slug": { "type": "string", "description": "Task id or unique task slug" },
+                        "dry_run": { "type": "boolean", "description": "When true, only report the task that would be started. Default: false." }
+                    }),
+                    Some(vec!["task_id_or_slug"]),
+                )),
+            ),
+            Tool::new(
                 "task_edge_add",
-                "Add an orchestration task edge",
+                "Add an orchestration task edge. DependsOn gates readiness; ParentOf gates parent delivery; Validates gates downstream dependencies on the validated target. Other kinds are traceability in v1.",
                 Arc::new(tool_schema(
                     json!({
                         "from_task_id": { "type": "string" },
                         "to_task_id": { "type": "string" },
-                        "kind": { "type": "string", "enum": ["ParentOf", "DependsOn", "Blocks", "Validates", "Audits", "Refines", "Supersedes", "Related"] },
+                        "kind": { "type": "string", "enum": ["ParentOf", "DependsOn", "Validates", "Audits", "Refines", "Supersedes", "Related"] },
                         "note": { "type": "string" }
                     }),
                     Some(vec!["from_task_id", "to_task_id", "kind"]),
@@ -2080,7 +3080,7 @@ impl TmuxMcpServer {
                     json!({
                         "from_task_id": { "type": "string" },
                         "to_task_id": { "type": "string" },
-                        "kind": { "type": "string", "enum": ["ParentOf", "DependsOn", "Blocks", "Validates", "Audits", "Refines", "Supersedes", "Related"] }
+                        "kind": { "type": "string", "enum": ["ParentOf", "DependsOn", "Validates", "Audits", "Refines", "Supersedes", "Related"] }
                     }),
                     Some(vec!["from_task_id", "to_task_id", "kind"]),
                 )),
@@ -2111,9 +3111,24 @@ impl TmuxMcpServer {
                         "task_id": { "type": "string" },
                         "status": { "type": "string", "enum": ["Backlog", "Planned", "Running", "WaitingForValidation", "Blocked", "Failed", "Passed", "Delivered", "Canceled"] },
                         "outcome": { "type": "string" },
-                        "blockers": { "type": "array", "items": { "type": "string" } }
+                        "blockers": { "type": "array", "items": { "type": "string" } },
+                        "evidence": { "type": "array", "items": { "type": "string" } }
                     }),
                     Some(vec!["task_id", "status"]),
+                )),
+            ),
+            Tool::new(
+                "task_report",
+                "Submit durable task result status, outcome, blockers, and evidence. This is the explicit worker/orchestrator result reporting path.",
+                Arc::new(tool_schema(
+                    json!({
+                        "task_id": { "type": "string" },
+                        "status": { "type": "string", "enum": ["Backlog", "Planned", "Running", "WaitingForValidation", "Blocked", "Failed", "Passed", "Delivered", "Canceled"] },
+                        "outcome": { "type": "string", "description": "Concise result, approval, rejection, or blocked reason" },
+                        "blockers": { "type": "array", "items": { "type": "string" } },
+                        "evidence": { "type": "array", "items": { "type": "string" }, "description": "Commands, files, logs, task ids, or observations supporting the reported status" }
+                    }),
+                    Some(vec!["task_id", "status", "outcome"]),
                 )),
             ),
             Tool::new(
@@ -2127,6 +3142,28 @@ impl TmuxMcpServer {
                         "include_completed": { "type": "boolean" }
                     }),
                     None,
+                )),
+            ),
+            Tool::new(
+                "orchestration_report",
+                "Report tasks that are ready or not ready for automatic orchestration. Read-only; never starts sessions.",
+                Arc::new(tool_schema(
+                    json!({
+                        "project_id": { "type": "string", "description": "Optional project UUID id or globally unique project slug" },
+                        "plan_id": { "type": "string", "description": "Optional plan id or slug" }
+                    }),
+                    None,
+                )),
+            ),
+            Tool::new(
+                "orchestration_next",
+                "Advance one plan by starting all currently ready auto_schedule tasks. Executes by default; pass dry_run=true to preview.",
+                Arc::new(tool_schema(
+                    json!({
+                        "plan_id": { "type": "string", "description": "Plan id or unique plan slug" },
+                        "dry_run": { "type": "boolean", "description": "When true, only report tasks that would be started. Default: false." }
+                    }),
+                    Some(vec!["plan_id"]),
                 )),
             ),
             Tool::new(
@@ -2171,11 +3208,14 @@ impl TmuxMcpServer {
             "plan_list" => self.plan_list_tool(args),
             "plan_update" => self.plan_update_tool(args),
             "plan_status_update" => self.plan_status_update_tool(args),
+            "plan_get" => self.plan_get_tool(args),
             "task_create" => self.task_create_tool(args),
             "task_update" => self.task_update_tool(args),
+            "task_get" => self.task_get_tool(args),
             "task_edge_add" => self.task_edge_add_tool(args),
             "task_edge_remove" => self.task_edge_remove_tool(args),
             "task_status_update" => self.task_status_update_tool(args),
+            "task_report" => self.task_status_update_tool(args),
             "orchestration_status" => self.orchestration_status_tool(args),
             _ => return None,
         };
@@ -2276,6 +3316,19 @@ impl TmuxMcpServer {
         Self::json_result(plan)
     }
 
+    fn plan_get_tool(&self, args: Map<String, Value>) -> Result<CallToolResult, McpError> {
+        let args: PlanGetArgs = parse_tool_args("plan_get", args)?;
+        let state = self.orchestration.snapshot().map_err(mcp_invalid_request)?;
+        let plan_id =
+            resolve_plan_id_or_slug(&state, &args.plan_id).map_err(mcp_invalid_request)?;
+        let plan = state
+            .plans
+            .get(&plan_id)
+            .cloned()
+            .ok_or_else(|| mcp_invalid_request(format!("plan '{}' not found", args.plan_id)))?;
+        Self::json_result(plan)
+    }
+
     fn task_create_tool(&self, args: Map<String, Value>) -> Result<CallToolResult, McpError> {
         let args: TaskCreateArgs = parse_tool_args("task_create", args)?;
         let state = self.orchestration.snapshot().map_err(mcp_invalid_request)?;
@@ -2294,6 +3347,8 @@ impl TmuxMcpServer {
                 },
                 gates: args.gates,
                 slug: None,
+                auto_schedule: args.auto_schedule,
+                run_spec: args.run_spec,
             })
             .map_err(mcp_invalid_request)?;
         Self::json_result(task)
@@ -2314,10 +3369,39 @@ impl TmuxMcpServer {
                         notes: args.notes,
                     },
                     gates: args.gates,
+                    auto_schedule: args.auto_schedule,
+                    run_spec: args.run_spec,
                 },
             )
             .map_err(mcp_invalid_request)?;
         Self::json_result(task)
+    }
+
+    fn task_get_tool(&self, args: Map<String, Value>) -> Result<CallToolResult, McpError> {
+        let args: TaskGetArgs = parse_tool_args("task_get", args)?;
+        let state = self.orchestration.snapshot().map_err(mcp_invalid_request)?;
+        let task = resolve_task_by_id_or_slug(&state, &args.task_id)
+            .map_err(mcp_invalid_request)?
+            .clone();
+        let mut incoming_edges = state
+            .task_edges
+            .iter()
+            .filter(|edge| edge.to == task.id)
+            .cloned()
+            .collect::<Vec<_>>();
+        incoming_edges.sort_by(task_edge_cmp);
+        let mut outgoing_edges = state
+            .task_edges
+            .iter()
+            .filter(|edge| edge.from == task.id)
+            .cloned()
+            .collect::<Vec<_>>();
+        outgoing_edges.sort_by(task_edge_cmp);
+        Self::json_result(TaskGetResult {
+            task,
+            incoming_edges,
+            outgoing_edges,
+        })
     }
 
     fn task_edge_add_tool(&self, args: Map<String, Value>) -> Result<CallToolResult, McpError> {
@@ -2420,6 +3504,7 @@ impl TmuxMcpServer {
                 args.status,
                 args.outcome,
                 args.blockers,
+                args.evidence,
             )
             .map_err(mcp_invalid_request)?;
         Self::json_result(task)
@@ -2590,6 +3675,120 @@ impl TmuxMcpServer {
             )
             .map_err(mcp_invalid_request)?;
         Self::json_result(report)
+    }
+
+    async fn orchestration_report_tool(
+        &self,
+        args: Map<String, Value>,
+    ) -> Result<CallToolResult, McpError> {
+        let args: OrchestrationReportArgs = parse_tool_args("orchestration_report", args)?;
+        Self::json_result(self.orchestration_report(args).await?)
+    }
+
+    async fn orchestration_next_tool(
+        &self,
+        args: Map<String, Value>,
+    ) -> Result<CallToolResult, McpError> {
+        let args: OrchestrationNextArgs = parse_tool_args("orchestration_next", args)?;
+        let state = self.orchestration.snapshot().map_err(mcp_invalid_request)?;
+        let plan_id =
+            resolve_plan_id_or_slug(&state, &args.plan_id).map_err(mcp_invalid_request)?;
+        let max_tasks = state.tasks.len().max(1);
+        let report = self
+            .orchestration_next(OrchestrationSchedulerRunArgs {
+                project_id: None,
+                plan_id: Some(args.plan_id),
+                dry_run: args.dry_run,
+                max_tasks,
+            })
+            .await?;
+        Self::json_result(OrchestrationNextReport {
+            dry_run: report.dry_run,
+            plan_id,
+            would_start: report.would_start,
+            started: report.started,
+            skipped: report.skipped,
+            errors: report.errors,
+        })
+    }
+
+    async fn orchestration_report(
+        &self,
+        args: OrchestrationReportArgs,
+    ) -> Result<OrchestrationReport, McpError> {
+        let report = self
+            .scheduler
+            .call(
+                |reply| OrchestrationSchedulerMessage::Report { args, reply },
+                Some(Duration::from_secs(180)),
+            )
+            .await
+            .map_err(|error| {
+                McpError::internal_error(format!("scheduler actor call failed: {}", error), None)
+            })?;
+        match report {
+            CallResult::Success(result) => result.map_err(mcp_invalid_request),
+            CallResult::Timeout => Err(McpError::internal_error(
+                "scheduler actor call timed out",
+                None,
+            )),
+            CallResult::SenderError => Err(McpError::internal_error(
+                "scheduler actor reply channel closed",
+                None,
+            )),
+        }
+    }
+
+    async fn orchestration_next(
+        &self,
+        args: OrchestrationSchedulerRunArgs,
+    ) -> Result<OrchestrationSchedulerRunReport, McpError> {
+        let report = self
+            .scheduler
+            .call(
+                |reply| OrchestrationSchedulerMessage::Next { args, reply },
+                Some(Duration::from_secs(180)),
+            )
+            .await
+            .map_err(|error| {
+                McpError::internal_error(format!("scheduler actor call failed: {}", error), None)
+            })?;
+        match report {
+            CallResult::Success(result) => result.map_err(mcp_invalid_request),
+            CallResult::Timeout => Err(McpError::internal_error(
+                "scheduler actor call timed out",
+                None,
+            )),
+            CallResult::SenderError => Err(McpError::internal_error(
+                "scheduler actor reply channel closed",
+                None,
+            )),
+        }
+    }
+
+    async fn task_start_tool(&self, args: Map<String, Value>) -> Result<CallToolResult, McpError> {
+        let args: TaskStartArgs = parse_tool_args("task_start", args)?;
+        let report = self
+            .scheduler
+            .call(
+                |reply| OrchestrationSchedulerMessage::StartTask { args, reply },
+                Some(Duration::from_secs(180)),
+            )
+            .await
+            .map_err(|error| {
+                McpError::internal_error(format!("scheduler actor call failed: {}", error), None)
+            })?;
+        match report {
+            CallResult::Success(result) => Self::json_result(result.map_err(mcp_invalid_request)?),
+            CallResult::Timeout => Err(McpError::internal_error(
+                "scheduler actor call timed out",
+                None,
+            )),
+            CallResult::SenderError => Err(McpError::internal_error(
+                "scheduler actor reply channel closed",
+                None,
+            )),
+        }
     }
 
     async fn decorate_status_with_runtime(&self, status: &mut OrchestrationStatus) {
@@ -3736,6 +4935,10 @@ fn build_coding_task_prompt(
             &build_plan_brief_section(plan.map(|plan| plan.brief.as_str())),
         )
         .replace(
+            "{{scheduler_section}}",
+            &build_scheduler_section(task.auto_schedule, task.run_spec.as_ref()),
+        )
+        .replace(
             "{{gates_section}}",
             &optional_section(
                 args.include_gates.unwrap_or(true),
@@ -3843,9 +5046,29 @@ fn resolve_task_by_id_or_slug<'a>(
     }
 }
 
+fn task_edge_cmp(left: &TaskEdge, right: &TaskEdge) -> std::cmp::Ordering {
+    left.from
+        .0
+        .cmp(&right.from.0)
+        .then_with(|| left.to.0.cmp(&right.to.0))
+        .then_with(|| task_edge_kind_rank(left.kind).cmp(&task_edge_kind_rank(right.kind)))
+}
+
+fn task_edge_kind_rank(kind: TaskEdgeKind) -> u8 {
+    match kind {
+        TaskEdgeKind::ParentOf => 0,
+        TaskEdgeKind::DependsOn => 1,
+        TaskEdgeKind::Validates => 2,
+        TaskEdgeKind::Audits => 3,
+        TaskEdgeKind::Refines => 4,
+        TaskEdgeKind::Supersedes => 5,
+        TaskEdgeKind::Related => 6,
+    }
+}
+
 fn build_scope_section(scope: &TaskScope) -> String {
     format!(
-        "Scope:\nInclude paths:\n{}Exclude paths:\n{}Notes:\n{}\n\n",
+        "Scope:\nPath semantics: include/exclude paths define task work boundaries. Relative paths are interpreted from the runtime workspace when one is provided; prefer paths inside that workspace unless the operator explicitly scopes external files.\nInclude paths:\n{}Exclude paths:\n{}Notes:\n{}\n\n",
         format_string_list(&scope.include_paths),
         format_string_list(&scope.exclude_paths),
         scope.notes.as_deref().unwrap_or("- none")
@@ -3859,6 +5082,28 @@ fn build_plan_brief_section(brief: Option<&str>) -> String {
             .map(str::trim)
             .filter(|brief| !brief.is_empty())
             .unwrap_or("- missing")
+    )
+}
+
+fn build_scheduler_section(auto_schedule: bool, run_spec: Option<&TaskRunSpec>) -> String {
+    let Some(run_spec) = run_spec else {
+        return format!(
+            "Scheduler:\nAuto schedule: {}\nRun spec: - none\n\n",
+            auto_schedule
+        );
+    };
+    format!(
+        "Scheduler:\nAuto schedule: {}\nRun spec:\n- node={} profile={} role={} kind={} skills={} workspace_path(runtime start directory)={} bypass_permissions={} template={}\n- instruction={}\n\n",
+        auto_schedule,
+        run_spec.node_id.0,
+        run_spec.profile,
+        run_spec.role,
+        run_spec.kind,
+        format_inline_list(&run_spec.skills),
+        run_spec.workspace_path,
+        run_spec.bypass_permissions,
+        run_spec.template,
+        run_spec.instruction
     )
 }
 
@@ -3877,17 +5122,23 @@ fn build_dependencies_section(state: &OrchestrationState, task: &Task) -> String
         .iter()
         .filter(|edge| edge.kind == TaskEdgeKind::DependsOn && edge.from == task.id)
         .collect::<Vec<_>>();
-    let blocking_tasks = state
+    let validators = state
         .task_edges
         .iter()
-        .filter(|edge| edge.kind == TaskEdgeKind::Blocks && edge.to == task.id)
+        .filter(|edge| edge.kind == TaskEdgeKind::Validates && edge.to == task.id)
+        .collect::<Vec<_>>();
+    let validates = state
+        .task_edges
+        .iter()
+        .filter(|edge| edge.kind == TaskEdgeKind::Validates && edge.from == task.id)
         .collect::<Vec<_>>();
 
     format!(
-        "Dependencies:\nParent:\n{}Depends on:\n{}Blocked by task edges:\n{}\n",
+        "Dependencies:\nParent:\n{}Depends on:\n{}Validators:\n{}Validates:\n{}\n",
         format_task_edge_list(state, &parents, |edge| &edge.from),
         format_task_edge_list(state, &dependencies, |edge| &edge.to),
-        format_task_edge_list(state, &blocking_tasks, |edge| &edge.from),
+        format_task_edge_list(state, &validators, |edge| &edge.from),
+        format_task_edge_list(state, &validates, |edge| &edge.to),
     )
 }
 
@@ -3907,7 +5158,7 @@ fn build_task_card_context_section(state: &OrchestrationState, tasks: &[&Task]) 
     let mut section = String::from(
         "Operator Task Card Bundle:\n\
          Purpose: read-only multi-task evidence supplied by the operator. Do not call mmux from the worker session to reconstruct this context.\n\
-         Field checklist for each card: id, plan_id, slug, title, objective, status, outcome, gates, scope, blockers, edges, session.\n\
+         Field checklist for each card: id, plan_id, slug, title, objective, status, outcome, scheduler, gates, scope, blockers, edges, session.\n\
          Validation rule: every gate must be addressed by the outcome, command evidence, an explicit caveat, or a named waiver.\n\n",
     );
     for task in tasks {
@@ -3917,6 +5168,10 @@ fn build_task_card_context_section(state: &OrchestrationState, tasks: &[&Task]) 
         section.push_str(&format!("Title: {}\n", task.title));
         section.push_str(&format!("Status: {}\n", task_status_name(task.status)));
         section.push_str(&format!("Objective:\n{}\n", task.objective));
+        section.push_str(&build_scheduler_section(
+            task.auto_schedule,
+            task.run_spec.as_ref(),
+        ));
         section.push_str(&build_scope_section(&task.scope));
         section.push_str(&build_gates_section(&task.gates));
         section.push_str(&format!(
@@ -3974,7 +5229,7 @@ fn format_task_session(session: Option<&TaskSession>) -> String {
         return "- none\n".into();
     };
     format!(
-        "- node={} session={} profile={} role={} kind={} skills={} workspace={} bypass_permissions={}\n",
+        "- node={} session={} profile={} role={} kind={} skills={} workspace_path(recorded start/adoption directory)={} bypass_permissions={}\n",
         record.node_id.0,
         record.session.0,
         record.profile,
@@ -4556,6 +5811,9 @@ impl ServerHandler for TmuxMcpServer {
                 return self.orchestration_cleanup_zombies_tool(args).await
             }
             "orchestration_prune_store" => return self.orchestration_prune_store_tool(args).await,
+            "orchestration_report" => return self.orchestration_report_tool(args).await,
+            "orchestration_next" => return self.orchestration_next_tool(args).await,
+            "task_start" => return self.task_start_tool(args).await,
             "session_record" => return self.session_record_tool(args).await,
             "wait_start" => return self.wait_start_tool(args).await,
             "wait_status" => return self.wait_status_tool(args),
@@ -5509,7 +6767,7 @@ impl ServerHandler for TmuxMcpServer {
                             PromptMessageRole::User,
                             PromptMessageContent::Text {
                                 text: format!(
-                                    "You are driving a coding CLI via mmux.\n\nProfile: {}\nSession: {}\n\nWorkflow:\n1. Start the session with start_coding_session using the profile-defined command\n2. For initial task delegation, use coding_task_send with task_id_or_slug, template, and a concrete instruction; for follow-up or non-task prompts, use coding_send\n3. For validation/review spanning multiple tasks, pass context_task_ids so mmux renders operator-supplied task cards; do not ask the worker to call mmux for missing prior task results\n4. Start a coding-ready wait with wait_start kind=coding-ready and this profile\n5. Poll wait_status until completed, failed, or canceled\n6. Use coding_read to capture the output\n7. Use coding_action (approve/reject/cancel/escape) to interact\n\ncoding_task_send templates:\n- task: initial implementation/delegation\n- validate: task gates and objective validation; for task sets require field_coverage_table over supplied context_task_ids\n- review: correctness, regression, risk, missing-test, and scope-drift review\n- quality-guard: maintainability, architecture fit, naming, boundaries, lifecycle, API shape, and operator/project quality preferences\n\nTips:\n- check_state is a quick non-blocking way to inspect has_prompt, promptable, busy, and turn_idle\n- promptable means the CLI can accept text; turn_idle means foreground work has settled\n- resize_pane can help if the TUI layout is broken\n- capture_output with scrollback:true gets full history\n- Use wait_start with sentinel or prompt kind to detect specific output strings",
+                                    "You are driving a coding CLI via mmux.\n\nProfile: {}\nSession: {}\n\nWorkflow:\n1. Start the session with start_coding_session using the profile-defined command\n2. For initial task delegation, use coding_task_send with task_id_or_slug, template, and a concrete instruction; for follow-up or non-task prompts, use coding_send\n3. For validation/review spanning multiple tasks, pass context_task_ids so mmux renders operator-supplied task cards; do not ask the worker to call mmux for missing prior task results\n4. Start a coding-ready wait with wait_start kind=coding-ready and this profile\n5. Poll wait_status until completed, failed, or canceled\n6. Use coding_read to capture the output\n7. Use coding_action (approve/reject/cancel/escape) to interact\n\ncoding_task_send templates:\n- task: initial implementation/delegation\n- validate: task gates and objective validation; for task sets require field_coverage_table over supplied context_task_ids\n- review: correctness, regression, risk, missing-test, and scope-drift review\n- quality-guard: maintainability, architecture fit, naming, boundaries, lifecycle, API shape, and operator/project quality preferences\n\nTips:\n- orchestration_status is compact; use task_get when you need one full stored task body with objective, scope, gates, result fields, run spec, session, and edges\n- check_state is a quick non-blocking way to inspect has_prompt, promptable, busy, and turn_idle\n- promptable means the CLI can accept text; turn_idle means foreground work has settled\n- resize_pane can help if the TUI layout is broken\n- capture_output with scrollback:true gets full history\n- Use wait_start with sentinel or prompt kind to detect specific output strings",
                                     profile, session
                                 ),
                             },
@@ -6058,6 +7316,18 @@ pub(crate) async fn run_mcp_http_server(
     )
     .await
     .map_err(|error| format!("failed to start node execution actor: {}", error))?;
+    let (scheduler, _scheduler_handle) = Actor::spawn(
+        None,
+        OrchestrationSchedulerActor,
+        OrchestrationSchedulerState {
+            profiles: profiles.clone(),
+            default_coder_profile: Some(default_coder_profile.clone()),
+            node_executor: node_executor.clone(),
+            orchestration: orchestration.clone(),
+        },
+    )
+    .await
+    .map_err(|error| format!("failed to start orchestration scheduler actor: {}", error))?;
     let startup_warnings = Arc::new(Mutex::new(Vec::new()));
     let wait_jobs = Arc::new(Mutex::new(HashMap::new()));
     if embedded_local_node_enabled {
@@ -6067,6 +7337,7 @@ pub(crate) async fn run_mcp_http_server(
             policy.clone(),
             node_executor.clone(),
             registry.clone(),
+            scheduler.clone(),
             orchestration.clone(),
             wait_jobs.clone(),
             startup_warnings.clone(),
@@ -6092,6 +7363,7 @@ pub(crate) async fn run_mcp_http_server(
                     service_policy.clone(),
                     node_executor.clone(),
                     service_registry.clone(),
+                    scheduler.clone(),
                     service_orchestration.clone(),
                     service_wait_jobs.clone(),
                     startup_warnings.clone(),
@@ -6472,7 +7744,7 @@ pub fn print_help() -> std::io::Result<()> {
     Ok(())
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct LocalProjectEntry {
     pub id: String,
     pub slug: String,
@@ -6548,6 +7820,68 @@ pub fn local_projects(store_path: Option<&Path>) -> Result<Vec<LocalProjectEntry
             .then_with(|| left.title.cmp(&right.title))
     });
     Ok(projects)
+}
+
+pub fn local_delete_project(
+    store_path: Option<&Path>,
+    project_id_or_slug: String,
+) -> Result<LocalDeleteProjectReport, String> {
+    let store_path = mmux_node::resolve_store_path(store_path)?;
+    let store = store::OrchestrationStore::open(store_path)?;
+    let Some(mut state) = store.load()? else {
+        return Err(format!("project '{}' not found", project_id_or_slug.trim()));
+    };
+    let project_id = resolve_project_id_or_slug(&state, &project_id_or_slug)?;
+    let project = state
+        .projects
+        .get(&project_id)
+        .cloned()
+        .ok_or_else(|| format!("project '{}' not found", project_id.0))?;
+    let entry = local_project_entry(&state, &project);
+    let plan_ids = state
+        .plans
+        .iter()
+        .filter(|(_, plan)| plan.project_id == project_id)
+        .map(|(plan_id, _)| plan_id.clone())
+        .collect::<HashSet<_>>();
+    let task_ids = state
+        .tasks
+        .iter()
+        .filter(|(_, task)| plan_ids.contains(&task.plan_id))
+        .map(|(task_id, _)| task_id.clone())
+        .collect::<HashSet<_>>();
+    let deleted_edge_count = state
+        .task_edges
+        .iter()
+        .filter(|edge| task_ids.contains(&edge.from) || task_ids.contains(&edge.to))
+        .count();
+    let deleted_plan_count = plan_ids.len();
+    let deleted_task_count = task_ids.len();
+    for plan_id in plan_ids {
+        state.plans.remove(&plan_id);
+    }
+    for task_id in &task_ids {
+        state.tasks.remove(task_id);
+    }
+    state
+        .task_edges
+        .retain(|edge| !task_ids.contains(&edge.from) && !task_ids.contains(&edge.to));
+    state.projects.remove(&project_id);
+    store.save(&state, now_ms())?;
+    Ok(LocalDeleteProjectReport {
+        project: entry,
+        deleted_plan_count,
+        deleted_task_count,
+        deleted_edge_count,
+    })
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct LocalDeleteProjectReport {
+    pub project: LocalProjectEntry,
+    pub deleted_plan_count: usize,
+    pub deleted_task_count: usize,
+    pub deleted_edge_count: usize,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -6860,13 +8194,29 @@ mod tests {
         )
         .await
         .expect("node execution actor");
+        let profiles = Arc::new(HashMap::new());
+        let orchestration =
+            orchestration_actor::OrchestrationHandle::open(Some(store_path)).unwrap();
+        let (scheduler, _scheduler_handle) = Actor::spawn(
+            None,
+            OrchestrationSchedulerActor,
+            OrchestrationSchedulerState {
+                profiles: profiles.clone(),
+                default_coder_profile: None,
+                node_executor: node_executor.clone(),
+                orchestration: orchestration.clone(),
+            },
+        )
+        .await
+        .expect("scheduler actor");
         TmuxMcpServer::new(
-            Arc::new(HashMap::new()),
+            profiles,
             None,
             ControllerPolicy::new(&test_cli()).unwrap(),
             node_executor,
             registry,
-            orchestration_actor::OrchestrationHandle::open(Some(store_path)).unwrap(),
+            scheduler,
+            orchestration,
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(Vec::new())),
         )
@@ -6890,13 +8240,28 @@ mod tests {
         .await
         .expect("node execution actor");
         let default_coder_profile = first_enabled_builtin_profile(&profiles);
+        let orchestration =
+            orchestration_actor::OrchestrationHandle::open(Some(store_path)).unwrap();
+        let (scheduler, _scheduler_handle) = Actor::spawn(
+            None,
+            OrchestrationSchedulerActor,
+            OrchestrationSchedulerState {
+                profiles: profiles.clone(),
+                default_coder_profile: default_coder_profile.clone(),
+                node_executor: node_executor.clone(),
+                orchestration: orchestration.clone(),
+            },
+        )
+        .await
+        .expect("scheduler actor");
         TmuxMcpServer::new(
             profiles,
             default_coder_profile,
             ControllerPolicy::new(&test_cli()).unwrap(),
             node_executor,
             registry,
-            orchestration_actor::OrchestrationHandle::open(Some(store_path)).unwrap(),
+            scheduler,
+            orchestration,
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(Vec::new())),
         )
@@ -6925,13 +8290,28 @@ mod tests {
         .await
         .expect("node execution actor");
         let default_coder_profile = first_enabled_builtin_profile(&profiles);
+        let orchestration =
+            orchestration_actor::OrchestrationHandle::open(Some(store_path)).unwrap();
+        let (scheduler, _scheduler_handle) = Actor::spawn(
+            None,
+            OrchestrationSchedulerActor,
+            OrchestrationSchedulerState {
+                profiles: profiles.clone(),
+                default_coder_profile: default_coder_profile.clone(),
+                node_executor: node_executor.clone(),
+                orchestration: orchestration.clone(),
+            },
+        )
+        .await
+        .expect("scheduler actor");
         TmuxMcpServer::new(
             profiles,
             default_coder_profile,
             ControllerPolicy::new(&test_cli()).unwrap(),
             node_executor,
             registry,
-            orchestration_actor::OrchestrationHandle::open(Some(store_path)).unwrap(),
+            scheduler,
+            orchestration,
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(Vec::new())),
         )
@@ -7260,13 +8640,17 @@ mod tests {
             "plan_list",
             "plan_update",
             "plan_status_update",
+            "plan_get",
             "task_create",
             "task_update",
+            "task_get",
             "task_edge_add",
             "task_edge_remove",
             "session_record",
             "task_status_update",
             "orchestration_status",
+            "orchestration_next",
+            "orchestration_report",
             "orchestration_cleanup_zombies",
         ] {
             assert!(admin_names.contains(&expected), "missing {expected}");
@@ -7300,13 +8684,28 @@ mod tests {
         )
         .await
         .expect("node execution actor");
+        let profiles = Arc::new(HashMap::new());
+        let orchestration = orchestration_actor::OrchestrationHandle::open(Some(&dir)).unwrap();
+        let (scheduler, _scheduler_handle) = Actor::spawn(
+            None,
+            OrchestrationSchedulerActor,
+            OrchestrationSchedulerState {
+                profiles: profiles.clone(),
+                default_coder_profile: None,
+                node_executor: node_executor.clone(),
+                orchestration: orchestration.clone(),
+            },
+        )
+        .await
+        .expect("scheduler actor");
         let server = TmuxMcpServer::new(
-            Arc::new(HashMap::new()),
+            profiles,
             None,
             ControllerPolicy::new(&cli).unwrap(),
             node_executor,
             registry,
-            orchestration_actor::OrchestrationHandle::open(Some(&dir)).unwrap(),
+            scheduler,
+            orchestration,
             Arc::new(Mutex::new(HashMap::new())),
             Arc::new(Mutex::new(Vec::new())),
         );
@@ -7408,6 +8807,8 @@ mod tests {
                     scope: TaskScope::default(),
                     gates: Vec::new(),
                     slug: None,
+                    auto_schedule: false,
+                    run_spec: None,
                 },
                 100,
             )
@@ -7498,6 +8899,137 @@ mod tests {
     }
 
     #[test]
+    fn test_local_delete_project_cascades_plans_tasks_and_edges() {
+        let dir = unique_temp_dir("mmux-local-delete-project");
+        let store = store::OrchestrationStore::open(dir.clone()).unwrap();
+        let mut state = OrchestrationState::new();
+        let project = state
+            .create_project(
+                CreateProject {
+                    title: "Delete Project".into(),
+                    description: "Project to delete".into(),
+                    slug: Some("delete-project".into()),
+                },
+                90,
+            )
+            .unwrap();
+        let kept_project = state
+            .create_project(
+                CreateProject {
+                    title: "Kept Project".into(),
+                    description: "Project to keep".into(),
+                    slug: Some("kept-project".into()),
+                },
+                91,
+            )
+            .unwrap();
+        let plan = create_state_plan(&mut state, &project);
+        let kept_plan = create_state_plan(&mut state, &kept_project);
+        let parent = state
+            .create_task(
+                CreateTask {
+                    plan_id: plan.id.clone(),
+                    title: "Parent".into(),
+                    objective: "Parent objective".into(),
+                    scope: TaskScope::default(),
+                    gates: Vec::new(),
+                    slug: None,
+                    auto_schedule: false,
+                    run_spec: None,
+                },
+                100,
+            )
+            .unwrap();
+        let child = state
+            .create_task(
+                CreateTask {
+                    plan_id: plan.id.clone(),
+                    title: "Child".into(),
+                    objective: "Child objective".into(),
+                    scope: TaskScope::default(),
+                    gates: Vec::new(),
+                    slug: None,
+                    auto_schedule: false,
+                    run_spec: None,
+                },
+                101,
+            )
+            .unwrap();
+        let kept_task = state
+            .create_task(
+                CreateTask {
+                    plan_id: kept_plan.id.clone(),
+                    title: "Kept".into(),
+                    objective: "Kept objective".into(),
+                    scope: TaskScope::default(),
+                    gates: Vec::new(),
+                    slug: None,
+                    auto_schedule: false,
+                    run_spec: None,
+                },
+                102,
+            )
+            .unwrap();
+        let kept_child = state
+            .create_task(
+                CreateTask {
+                    plan_id: kept_plan.id.clone(),
+                    title: "Kept Child".into(),
+                    objective: "Kept child objective".into(),
+                    scope: TaskScope::default(),
+                    gates: Vec::new(),
+                    slug: None,
+                    auto_schedule: false,
+                    run_spec: None,
+                },
+                103,
+            )
+            .unwrap();
+        state
+            .add_task_edge(
+                CreateTaskEdge {
+                    from: parent.id.clone(),
+                    to: child.id.clone(),
+                    kind: TaskEdgeKind::Related,
+                    note: None,
+                },
+                104,
+            )
+            .unwrap();
+        state
+            .add_task_edge(
+                CreateTaskEdge {
+                    from: kept_task.id.clone(),
+                    to: kept_child.id.clone(),
+                    kind: TaskEdgeKind::Related,
+                    note: None,
+                },
+                105,
+            )
+            .unwrap();
+        store.save(&state, 106).unwrap();
+
+        let report = local_delete_project(Some(&dir), "delete-project".into()).unwrap();
+
+        assert_eq!(report.project.id, project.id.0);
+        assert_eq!(report.deleted_plan_count, 1);
+        assert_eq!(report.deleted_task_count, 2);
+        assert_eq!(report.deleted_edge_count, 1);
+        let loaded = store.load().unwrap().unwrap();
+        assert!(!loaded.projects.contains_key(&project.id));
+        assert!(!loaded.plans.contains_key(&plan.id));
+        assert!(!loaded.tasks.contains_key(&parent.id));
+        assert!(!loaded.tasks.contains_key(&child.id));
+        assert!(loaded.projects.contains_key(&kept_project.id));
+        assert!(loaded.plans.contains_key(&kept_plan.id));
+        assert!(loaded.tasks.contains_key(&kept_task.id));
+        assert!(loaded.tasks.contains_key(&kept_child.id));
+        assert_eq!(loaded.task_edges.len(), 1);
+        assert_eq!(loaded.task_edges[0].from, kept_task.id);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn test_status_decoration_sets_runtime_state_and_cleanup_candidates() {
         let mut state = OrchestrationState::new();
         let project = state
@@ -7530,6 +9062,8 @@ mod tests {
                     scope: TaskScope::default(),
                     gates: Vec::new(),
                     slug: None,
+                    auto_schedule: false,
+                    run_spec: None,
                 },
                 100,
             )
@@ -7543,6 +9077,8 @@ mod tests {
                     scope: TaskScope::default(),
                     gates: Vec::new(),
                     slug: None,
+                    auto_schedule: false,
+                    run_spec: None,
                 },
                 101,
             )
@@ -7649,6 +9185,8 @@ mod tests {
                     scope: TaskScope::default(),
                     gates: Vec::new(),
                     slug: None,
+                    auto_schedule: false,
+                    run_spec: None,
                 },
                 100,
             )
@@ -7662,6 +9200,8 @@ mod tests {
                     scope: TaskScope::default(),
                     gates: Vec::new(),
                     slug: None,
+                    auto_schedule: false,
+                    run_spec: None,
                 },
                 101,
             )
@@ -7752,6 +9292,440 @@ mod tests {
         );
         assert_eq!(project_summary.task_status_counts[&TaskStatus::Backlog], 1);
         assert_eq!(project_summary.task_status_counts[&TaskStatus::Planned], 0);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn test_task_get_returns_full_task_record_and_edges() {
+        let dir = unique_temp_dir("mmux-mcp-task-get");
+        let server = test_orchestration_server(&dir).await;
+        let project = ensure_test_project(&server).await;
+        let plan = create_test_plan_in_project(&server, &project, "Task Get Plan").await;
+        let task: Task = result_json(
+            &call_orchestration(
+                &server,
+                "task_create",
+                json!({
+                    "plan_id": plan.id.0,
+                    "title": "Export Body",
+                    "objective": "Return the full task body for exporters.",
+                    "include_paths": ["src/lib.rs"],
+                    "exclude_paths": ["target"],
+                    "notes": "Exporter needs this.",
+                    "gates": ["body returned", "edges returned"],
+                    "auto_schedule": true,
+                    "run_spec": {
+                        "node_id": "local",
+                        "profile": "codex",
+                        "workspace_path": "/workspace/project",
+                        "bypass_permissions": false,
+                        "role": "implementation-worker",
+                        "kind": "implementation",
+                        "skills": ["mmux-developer"],
+                        "template": "task",
+                        "instruction": "Implement and report validation."
+                    }
+                }),
+            )
+            .unwrap(),
+        );
+        let dependency = create_test_task_in_plan(&server, &plan, "Dependency").await;
+        call_orchestration(
+            &server,
+            "task_edge_add",
+            json!({
+                "from_task_id": task.id.0.clone(),
+                "to_task_id": dependency.id.0.clone(),
+                "kind": "DependsOn",
+                "note": "Export task depends on dependency."
+            }),
+        )
+        .unwrap();
+
+        let result: TaskGetResult = result_json(
+            &call_orchestration(
+                &server,
+                "task_get",
+                json!({
+                    "task_id": task.slug.clone()
+                }),
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(result.task.id, task.id);
+        assert_eq!(
+            result.task.objective,
+            "Return the full task body for exporters."
+        );
+        assert_eq!(result.task.scope.include_paths, vec!["src/lib.rs"]);
+        assert_eq!(result.task.scope.exclude_paths, vec!["target"]);
+        assert_eq!(
+            result.task.scope.notes.as_deref(),
+            Some("Exporter needs this.")
+        );
+        assert_eq!(result.task.gates, vec!["body returned", "edges returned"]);
+        assert_eq!(result.task.auto_schedule, true);
+        assert_eq!(
+            result
+                .task
+                .run_spec
+                .as_ref()
+                .map(|spec| spec.template.as_str()),
+            Some("task")
+        );
+        assert!(result.incoming_edges.is_empty());
+        assert_eq!(result.outgoing_edges.len(), 1);
+        assert_eq!(result.outgoing_edges[0].from, task.id);
+        assert_eq!(result.outgoing_edges[0].to, dependency.id);
+        assert_eq!(result.outgoing_edges[0].kind, TaskEdgeKind::DependsOn);
+        assert_eq!(
+            result.outgoing_edges[0].note.as_deref(),
+            Some("Export task depends on dependency.")
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn test_plan_get_returns_full_plan_record_with_brief() {
+        let dir = unique_temp_dir("mmux-mcp-plan-get");
+        let server = test_orchestration_server(&dir).await;
+        let project = ensure_test_project(&server).await;
+        let plan = create_test_plan_in_project(&server, &project, "Plan Get Plan").await;
+
+        let by_id: Plan = result_json(
+            &call_orchestration(&server, "plan_get", json!({ "plan_id": plan.id.0 })).unwrap(),
+        );
+        assert_eq!(by_id.id, plan.id);
+        assert_eq!(by_id.brief, "Detailed plan brief for Plan Get Plan");
+
+        let by_slug: Plan = result_json(
+            &call_orchestration(&server, "plan_get", json!({ "plan_id": plan.slug })).unwrap(),
+        );
+        assert_eq!(by_slug.id, plan.id);
+        assert_eq!(by_slug.brief, "Detailed plan brief for Plan Get Plan");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn test_orchestration_report_reports_auto_startable_tasks() {
+        let dir = unique_temp_dir("mmux-mcp-report-ready");
+        let server =
+            test_orchestration_server_with_profiles(&dir, profile_registry(ready_profile())).await;
+        let project = ensure_test_project(&server).await;
+        let plan = create_test_plan_in_project(&server, &project, "Schedule Plan").await;
+        let result = call_orchestration(
+            &server,
+            "task_create",
+            json!({
+                "plan_id": plan.id.0,
+                "title": "Runnable",
+                "objective": "Start automatically",
+                "auto_schedule": true,
+                "run_spec": {
+                    "node_id": "local",
+                    "profile": "codex",
+                    "workspace_path": "/workspace/project",
+                    "bypass_permissions": false,
+                    "role": "implementation-worker",
+                    "kind": "implementation",
+                    "skills": ["mmux-developer"],
+                    "template": "task",
+                    "instruction": "Implement this task and report validation."
+                }
+            }),
+        )
+        .unwrap();
+        let task: Task = result_json(&result);
+
+        let report: OrchestrationReport = result_json(
+            &server
+                .orchestration_report_tool(object_args(json!({
+                    "plan_id": plan.id.0
+                })))
+                .await
+                .unwrap(),
+        );
+
+        assert_eq!(report.ready.len(), 1);
+        assert_eq!(report.ready[0].task_id, task.id);
+        assert_eq!(
+            report.ready[0].session,
+            "mmux-runnable-implementation-task-1"
+        );
+        assert!(report.errors.is_empty());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn test_orchestration_next_defaults_to_execution_mode() {
+        let dir = unique_temp_dir("mmux-mcp-next-default");
+        let server =
+            test_orchestration_server_with_profiles(&dir, profile_registry(ready_profile())).await;
+        let project = ensure_test_project(&server).await;
+        let plan = create_test_plan_in_project(&server, &project, "Next Tick Plan").await;
+        let task = create_test_task_in_plan(&server, &plan, "Manual Only").await;
+
+        let report: OrchestrationNextReport = result_json(
+            &server
+                .orchestration_next_tool(object_args(json!({
+                    "plan_id": plan.id.0
+                })))
+                .await
+                .unwrap(),
+        );
+
+        assert!(!report.dry_run);
+        assert_eq!(report.plan_id, plan.id);
+        assert!(report.would_start.is_empty());
+        assert!(report.started.is_empty());
+        assert!(report
+            .skipped
+            .iter()
+            .any(|skip| skip.task_id == task.id && skip.reason == "auto_schedule is false"));
+
+        let missing_plan = server
+            .orchestration_next_tool(object_args(json!({})))
+            .await
+            .unwrap_err();
+        assert!(missing_plan.message.contains("missing field `plan_id`"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn test_orchestration_report_skips_tasks_with_unready_dependencies() {
+        let dir = unique_temp_dir("mmux-mcp-report-deps");
+        let server =
+            test_orchestration_server_with_profiles(&dir, profile_registry(ready_profile())).await;
+        let project = ensure_test_project(&server).await;
+        let plan = create_test_plan_in_project(&server, &project, "Schedule Plan").await;
+        let dependency = create_test_task_in_plan(&server, &plan, "Dependency").await;
+        let task: Task = result_json(
+            &call_orchestration(
+                &server,
+                "task_create",
+                json!({
+                    "plan_id": plan.id.0,
+                    "title": "Dependent",
+                    "objective": "Wait for dependency",
+                    "auto_schedule": true,
+                    "run_spec": {
+                        "node_id": "local",
+                        "profile": "codex",
+                        "workspace_path": "/workspace/project",
+                        "bypass_permissions": false,
+                        "role": "implementation-worker",
+                        "kind": "implementation",
+                        "skills": [],
+                        "template": "task",
+                        "instruction": "Implement after dependency."
+                    }
+                }),
+            )
+            .unwrap(),
+        );
+        call_orchestration(
+            &server,
+            "task_edge_add",
+            json!({
+                "from_task_id": task.id.0,
+                "to_task_id": dependency.id.0,
+                "kind": "DependsOn"
+            }),
+        )
+        .unwrap();
+
+        let report: OrchestrationReport = result_json(
+            &server
+                .orchestration_report_tool(object_args(json!({
+                    "plan_id": plan.id.0
+                })))
+                .await
+                .unwrap(),
+        );
+
+        assert!(report.ready.is_empty());
+        assert_eq!(report.skipped.len(), 2);
+        assert!(report
+            .skipped
+            .iter()
+            .any(|skip| skip.task_id == task.id && skip.reason.contains("dependencies not ready")));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn test_orchestration_report_skips_tasks_with_failed_validation() {
+        let dir = unique_temp_dir("mmux-mcp-report-validation");
+        let server =
+            test_orchestration_server_with_profiles(&dir, profile_registry(ready_profile())).await;
+        let project = ensure_test_project(&server).await;
+        let plan = create_test_plan_in_project(&server, &project, "Validation Schedule Plan").await;
+        let dependency: Task = result_json(
+            &call_orchestration(
+                &server,
+                "task_create",
+                json!({
+                    "plan_id": plan.id.0,
+                    "title": "Dependency",
+                    "objective": "Produce validated result",
+                    "gates": ["validator approves"]
+                }),
+            )
+            .unwrap(),
+        );
+        let validator = create_test_task_in_plan(&server, &plan, "Validator").await;
+        let downstream: Task = result_json(
+            &call_orchestration(
+                &server,
+                "task_create",
+                json!({
+                    "plan_id": plan.id.0,
+                    "title": "Downstream",
+                    "objective": "Start after validated dependency",
+                    "auto_schedule": true,
+                    "run_spec": {
+                        "node_id": "local",
+                        "profile": "codex",
+                        "workspace_path": "/workspace/project",
+                        "bypass_permissions": false,
+                        "role": "implementation-worker",
+                        "kind": "implementation",
+                        "skills": [],
+                        "template": "task",
+                        "instruction": "Implement after validation passes."
+                    }
+                }),
+            )
+            .unwrap(),
+        );
+        call_orchestration(
+            &server,
+            "task_edge_add",
+            json!({
+                "from_task_id": downstream.id.0.clone(),
+                "to_task_id": dependency.id.0.clone(),
+                "kind": "DependsOn"
+            }),
+        )
+        .unwrap();
+        call_orchestration(
+            &server,
+            "task_edge_add",
+            json!({
+                "from_task_id": validator.id.0.clone(),
+                "to_task_id": dependency.id.0.clone(),
+                "kind": "Validates"
+            }),
+        )
+        .unwrap();
+        call_orchestration(
+            &server,
+            "task_status_update",
+            json!({
+                "task_id": dependency.id.0.clone(),
+                "status": "Passed",
+                "outcome": "implementation evidence recorded"
+            }),
+        )
+        .unwrap();
+        call_orchestration(
+            &server,
+            "task_report",
+            json!({
+                "task_id": validator.id.0.clone(),
+                "status": "Failed",
+                "outcome": "validator rejected the dependency",
+                "evidence": ["validation command failed"]
+            }),
+        )
+        .unwrap();
+
+        let report: OrchestrationReport = result_json(
+            &server
+                .orchestration_report_tool(object_args(json!({
+                    "plan_id": plan.id.0
+                })))
+                .await
+                .unwrap(),
+        );
+
+        assert!(report.ready.is_empty());
+        assert!(report.skipped.iter().any(|skip| {
+            skip.task_id == downstream.id
+                && skip.reason.contains("validation not approved")
+                && skip.reason.contains(&validator.id.0)
+        }));
+
+        let status: OrchestrationStatus = result_json(
+            &call_orchestration(
+                &server,
+                "orchestration_status",
+                json!({ "task_id": dependency.id.0.clone() }),
+            )
+            .unwrap(),
+        );
+        assert_eq!(status.tasks[0].validation_blocked_by, vec![validator.id]);
+        assert_eq!(status.tasks[0].failed_validator_count, 1);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn test_task_start_uses_run_spec_without_auto_schedule() {
+        let dir = unique_temp_dir("mmux-mcp-task-start-dry-run");
+        let server =
+            test_orchestration_server_with_profiles(&dir, profile_registry(ready_profile())).await;
+        let project = ensure_test_project(&server).await;
+        let plan = create_test_plan_in_project(&server, &project, "Manual Start Plan").await;
+        let task: Task = result_json(
+            &call_orchestration(
+                &server,
+                "task_create",
+                json!({
+                    "plan_id": plan.id.0,
+                    "title": "Manual Runnable",
+                    "objective": "Start explicitly",
+                    "run_spec": {
+                        "node_id": "local",
+                        "profile": "codex",
+                        "workspace_path": "/workspace/project",
+                        "bypass_permissions": false,
+                        "role": "implementation-worker",
+                        "kind": "implementation",
+                        "skills": [],
+                        "template": "task",
+                        "instruction": "Implement manually."
+                    }
+                }),
+            )
+            .unwrap(),
+        );
+
+        let schedule: OrchestrationReport = result_json(
+            &server
+                .orchestration_report_tool(object_args(json!({
+                    "plan_id": plan.id.0
+                })))
+                .await
+                .unwrap(),
+        );
+        assert!(schedule.ready.is_empty());
+        assert!(schedule
+            .skipped
+            .iter()
+            .any(|skip| skip.task_id == task.id && skip.reason == "auto_schedule is false"));
+
+        let started: TaskStartReport = result_json(
+            &server
+                .task_start_tool(object_args(json!({
+                    "task_id_or_slug": task.id.0,
+                    "dry_run": true
+                })))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(started.action, "would-start");
+        assert!(!started.auto_schedule);
+        assert_eq!(started.task.unwrap().task_id, task.id);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -9445,6 +11419,8 @@ mod tests {
                     scope: TaskScope::default(),
                     gates: Vec::new(),
                     slug: None,
+                    auto_schedule: false,
+                    run_spec: None,
                 },
                 110,
             )
@@ -9462,6 +11438,8 @@ mod tests {
                     },
                     gates: vec!["Context includes task identity".into()],
                     slug: None,
+                    auto_schedule: false,
+                    run_spec: None,
                 },
                 120,
             )
@@ -9522,6 +11500,8 @@ mod tests {
                     },
                     gates: vec!["Review docs".into()],
                     slug: None,
+                    auto_schedule: false,
+                    run_spec: None,
                 },
                 120,
             )
@@ -9562,6 +11542,8 @@ mod tests {
                     scope: TaskScope::default(),
                     gates: vec!["Review docs".into()],
                     slug: None,
+                    auto_schedule: false,
+                    run_spec: None,
                 },
                 120,
             )
@@ -9619,6 +11601,8 @@ mod tests {
                     },
                     gates: vec!["Unit tests pass".into(), "Outcome names evidence".into()],
                     slug: None,
+                    auto_schedule: false,
+                    run_spec: None,
                 },
                 110,
             )
@@ -9644,6 +11628,8 @@ mod tests {
                     scope: TaskScope::default(),
                     gates: vec!["Prerequisite card was checked".into()],
                     slug: None,
+                    auto_schedule: false,
+                    run_spec: None,
                 },
                 140,
             )
@@ -9702,6 +11688,8 @@ mod tests {
                     scope: TaskScope::default(),
                     gates: Vec::new(),
                     slug: None,
+                    auto_schedule: false,
+                    run_spec: None,
                 },
                 110,
             )
@@ -9778,6 +11766,8 @@ mod tests {
                         scope: TaskScope::default(),
                         gates: Vec::new(),
                         slug: None,
+                        auto_schedule: false,
+                        run_spec: None,
                     },
                     110,
                 )
@@ -9845,11 +11835,18 @@ mod tests {
                 title: active.title,
                 status: TaskStatus::Backlog,
                 outcome: None,
+                evidence: Vec::new(),
+                auto_schedule: false,
+                run_spec: None,
                 session: None,
                 parent: None,
                 child_count: 0,
                 dependency_count: 0,
                 blocked_by: Vec::new(),
+                validator_count: 0,
+                validation_blocked_by: Vec::new(),
+                unapproved_validator_count: 0,
+                failed_validator_count: 0,
                 open_gate_count: 0,
                 failed_gate_count: 0,
                 blocker_count: 0,
@@ -9884,6 +11881,51 @@ mod tests {
         )
         .unwrap_err();
         assert!(error.message.contains("task 'task-missing' not found"));
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn test_task_report_records_status_outcome_blockers_and_evidence() {
+        let dir = unique_temp_dir("mmux-mcp-task-report");
+        let server = test_orchestration_server(&dir).await;
+        let task = create_test_task(&server, "Validation Report").await;
+
+        let reported: Task = result_json(
+            &call_orchestration(
+                &server,
+                "task_report",
+                json!({
+                    "task_id": task.id.0.clone(),
+                    "status": "Blocked",
+                    "outcome": "validation could not run",
+                    "blockers": ["test environment unavailable"],
+                    "evidence": ["cargo test was not executed"]
+                }),
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(reported.status, TaskStatus::Blocked);
+        assert_eq!(
+            reported.outcome.as_deref(),
+            Some("validation could not run")
+        );
+        assert_eq!(reported.blockers, vec!["test environment unavailable"]);
+        assert_eq!(reported.evidence, vec!["cargo test was not executed"]);
+
+        let status: OrchestrationStatus = result_json(
+            &call_orchestration(
+                &server,
+                "orchestration_status",
+                json!({ "task_id": task.id.0 }),
+            )
+            .unwrap(),
+        );
+        assert_eq!(
+            status.tasks[0].evidence,
+            vec!["cargo test was not executed"]
+        );
+        assert_eq!(status.tasks[0].blocker_count, 1);
         let _ = fs::remove_dir_all(dir);
     }
 

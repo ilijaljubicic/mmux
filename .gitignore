@@ -4,3 +4,17 @@
 /npm/mmux/artifacts/
 /npm/mmux/*.tgz
 PLANS
+
+# Local Cormilo orchestration runtime bundle and state.
+mmux-cormilo-agent/
+
+# Python / uv build artifacts (tools/ uv packages).
+.venv/
+**/.venv/
+__pycache__/
+*.py[cod]
+build/
+dist/
+*.egg-info/
+.uv/
+uv.lock

@@ -96,6 +96,12 @@ pub struct Task {
     pub completed_at_ms: Option<u64>,
     pub outcome: Option<String>,
     pub blockers: Vec<String>,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+    #[serde(default)]
+    pub auto_schedule: bool,
+    #[serde(default)]
+    pub run_spec: Option<TaskRunSpec>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -126,6 +132,21 @@ pub struct TaskScope {
     pub include_paths: Vec<String>,
     pub exclude_paths: Vec<String>,
     pub notes: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskRunSpec {
+    pub node_id: NodeId,
+    pub profile: String,
+    pub workspace_path: String,
+    pub bypass_permissions: bool,
+    pub role: String,
+    pub kind: String,
+    #[serde(default)]
+    pub skills: Vec<String>,
+    pub template: String,
+    pub instruction: String,
 }
 
 #[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Hash, Serialize, Deserialize)]
@@ -172,7 +193,6 @@ pub struct TaskEdge {
 pub enum TaskEdgeKind {
     ParentOf,
     DependsOn,
-    Blocks,
     Validates,
     Audits,
     Refines,
@@ -234,16 +254,32 @@ pub struct TaskSummary {
     pub title: String,
     pub status: TaskStatus,
     pub outcome: Option<String>,
+    pub evidence: Vec<String>,
+    pub auto_schedule: bool,
+    pub run_spec: Option<TaskRunSpec>,
     pub session: Option<TaskSession>,
     pub parent: Option<TaskId>,
     pub child_count: usize,
     pub dependency_count: usize,
     pub blocked_by: Vec<TaskId>,
+    pub validator_count: usize,
+    pub validation_blocked_by: Vec<TaskId>,
+    pub unapproved_validator_count: usize,
+    pub failed_validator_count: usize,
     pub open_gate_count: usize,
     pub failed_gate_count: usize,
     pub blocker_count: usize,
     pub blockers: Vec<String>,
     pub updated_at_ms: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct TaskDependencyBlocker {
+    pub task_id: TaskId,
+    pub status: TaskStatus,
+    pub reason: String,
+    pub validation_blocked_by: Vec<TaskId>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -332,6 +368,10 @@ pub struct CreateTask {
     pub gates: Vec<String>,
     #[serde(default)]
     pub slug: Option<String>,
+    #[serde(default)]
+    pub auto_schedule: bool,
+    #[serde(default)]
+    pub run_spec: Option<TaskRunSpec>,
 }
 
 #[derive(Clone, Debug, Default, Serialize, Deserialize)]
@@ -398,6 +438,10 @@ pub struct UpdateTask {
     pub scope: UpdateTaskScope,
     #[serde(default)]
     pub gates: Option<Vec<String>>,
+    #[serde(default)]
+    pub auto_schedule: Option<bool>,
+    #[serde(default)]
+    pub run_spec: Option<Option<TaskRunSpec>>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -715,12 +759,13 @@ impl OrchestrationState {
                         self.tasks
                             .get(dependency_id)
                             .map(|dependency| {
-                                !dependency_status_allows_readiness(dependency.status)
+                                self.dependency_readiness_blocker(dependency).is_some()
                             })
                             .unwrap_or(true)
                     })
                     .cloned()
                     .collect::<Vec<_>>();
+                let validation = self.validation_state_for_task(&task.id);
                 let is_blocked = task.status == TaskStatus::Blocked || !blocked_by.is_empty();
 
                 if !task.status.is_finished() {
@@ -745,6 +790,9 @@ impl OrchestrationState {
                     title: task.title.clone(),
                     status: task.status,
                     outcome: task.outcome.clone(),
+                    evidence: task.evidence.clone(),
+                    auto_schedule: task.auto_schedule,
+                    run_spec: task.run_spec.clone(),
                     session: task.session.clone(),
                     parent: parent_by_child
                         .get(&task.id)
@@ -752,6 +800,10 @@ impl OrchestrationState {
                     child_count: child_counts.get(&task.id).copied().unwrap_or_default(),
                     dependency_count: dependency_ids.len(),
                     blocked_by,
+                    validator_count: validation.validator_ids.len(),
+                    validation_blocked_by: validation.unapproved_validator_ids.clone(),
+                    unapproved_validator_count: validation.unapproved_validator_ids.len(),
+                    failed_validator_count: validation.failed_validator_ids.len(),
                     open_gate_count: if matches!(
                         task.status,
                         TaskStatus::Passed | TaskStatus::Delivered
@@ -853,6 +905,39 @@ impl OrchestrationState {
             cleanup_candidates,
             warnings,
         }
+    }
+
+    pub fn task_dependency_blockers(
+        &self,
+        task_id: &TaskId,
+    ) -> Result<Vec<TaskDependencyBlocker>, String> {
+        self.tasks
+            .get(task_id)
+            .ok_or_else(|| format!("task '{}' not found", task_id.0))?;
+
+        let mut blockers = self
+            .task_edges
+            .iter()
+            .filter(|edge| edge.kind == TaskEdgeKind::DependsOn && &edge.from == task_id)
+            .map(|edge| {
+                let dependency = self
+                    .tasks
+                    .get(&edge.to)
+                    .ok_or_else(|| format!("task '{}' not found", edge.to.0))?;
+                Ok((dependency, self.dependency_readiness_blocker(dependency)))
+            })
+            .collect::<Result<Vec<_>, String>>()?
+            .into_iter()
+            .filter_map(|(dependency, blocker)| blocker.map(|blocker| (dependency, blocker)))
+            .map(|(dependency, blocker)| TaskDependencyBlocker {
+                task_id: dependency.id.clone(),
+                status: dependency.status,
+                reason: blocker.reason,
+                validation_blocked_by: blocker.validation_blocked_by,
+            })
+            .collect::<Vec<_>>();
+        blockers.sort_by(|left, right| left.task_id.0.cmp(&right.task_id.0));
+        Ok(blockers)
     }
 
     pub fn create_project(&mut self, input: CreateProject, now_ms: u64) -> Result<Project, String> {
@@ -984,6 +1069,9 @@ impl OrchestrationState {
         if input.objective.trim().is_empty() {
             return Err("task objective must not be empty".into());
         }
+        if let Some(run_spec) = input.run_spec.as_ref() {
+            validate_task_run_spec(run_spec)?;
+        }
 
         let id = TaskId(format!("task-{}", self.next_task_id));
         self.next_task_id += 1;
@@ -1004,6 +1092,9 @@ impl OrchestrationState {
             completed_at_ms: None,
             outcome: None,
             blockers: Vec::new(),
+            evidence: Vec::new(),
+            auto_schedule: input.auto_schedule,
+            run_spec: input.run_spec,
         };
 
         self.tasks.insert(id, task.clone());
@@ -1026,6 +1117,9 @@ impl OrchestrationState {
                 return Err("task objective must not be empty".into());
             }
         }
+        if let Some(Some(run_spec)) = update.run_spec.as_ref() {
+            validate_task_run_spec(run_spec)?;
+        }
         let task = self
             .tasks
             .get_mut(task_id)
@@ -1047,6 +1141,12 @@ impl OrchestrationState {
         }
         if let Some(gates) = update.gates {
             task.gates = gates;
+        }
+        if let Some(auto_schedule) = update.auto_schedule {
+            task.auto_schedule = auto_schedule;
+        }
+        if let Some(run_spec) = update.run_spec {
+            task.run_spec = run_spec;
         }
         task.updated_at_ms = now_ms;
         Ok(task.clone())
@@ -1297,14 +1397,74 @@ impl OrchestrationState {
                 .tasks
                 .get(&edge.to)
                 .ok_or_else(|| format!("task '{}' not found", edge.to.0))?;
-            if !dependency_status_allows_readiness(dependency.status) {
+            if let Some(blocker) = self.dependency_readiness_blocker(dependency) {
                 return Err(format!(
-                    "task '{}' is blocked by dependency '{}' that is not ready",
-                    task_id.0, edge.to.0
+                    "task '{}' is blocked by dependency '{}': {}",
+                    task_id.0, edge.to.0, blocker.reason
                 ));
             }
         }
         Ok(())
+    }
+
+    fn dependency_readiness_blocker(&self, dependency: &Task) -> Option<DependencyBlocker> {
+        if !dependency_status_allows_readiness(dependency.status) {
+            return Some(DependencyBlocker {
+                reason: format!("status {:?} is not ready", dependency.status),
+                validation_blocked_by: Vec::new(),
+            });
+        }
+
+        let validation = self.validation_state_for_task(&dependency.id);
+        if !validation.unapproved_validator_ids.is_empty() {
+            return Some(DependencyBlocker {
+                reason: format!(
+                    "validation not approved by {}",
+                    format_task_ids(&validation.unapproved_validator_ids)
+                ),
+                validation_blocked_by: validation.unapproved_validator_ids,
+            });
+        }
+
+        None
+    }
+
+    fn validation_state_for_task(&self, task_id: &TaskId) -> TaskValidationState {
+        let mut validator_ids = self
+            .task_edges
+            .iter()
+            .filter(|edge| edge.kind == TaskEdgeKind::Validates && &edge.to == task_id)
+            .filter_map(|edge| self.tasks.get(&edge.from).map(|task| task.id.clone()))
+            .collect::<Vec<_>>();
+        validator_ids.sort_by(|left, right| left.0.cmp(&right.0));
+        validator_ids.dedup();
+
+        let unapproved_validator_ids = validator_ids
+            .iter()
+            .filter(|validator_id| {
+                self.tasks
+                    .get(*validator_id)
+                    .map(|validator| !validation_status_approves(validator.status))
+                    .unwrap_or(true)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let failed_validator_ids = validator_ids
+            .iter()
+            .filter(|validator_id| {
+                self.tasks
+                    .get(*validator_id)
+                    .map(|validator| validation_status_rejects(validator.status))
+                    .unwrap_or(false)
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        TaskValidationState {
+            validator_ids,
+            unapproved_validator_ids,
+            failed_validator_ids,
+        }
     }
 
     fn ensure_children_delivered(&self, task_id: &TaskId) -> Result<(), String> {
@@ -1373,6 +1533,14 @@ fn dependency_status_allows_readiness(status: TaskStatus) -> bool {
     )
 }
 
+fn validation_status_approves(status: TaskStatus) -> bool {
+    matches!(status, TaskStatus::Passed | TaskStatus::Delivered)
+}
+
+fn validation_status_rejects(status: TaskStatus) -> bool {
+    matches!(status, TaskStatus::Blocked | TaskStatus::Failed)
+}
+
 fn child_status_allows_parent_delivery(child: &Task) -> bool {
     matches!(child.status, TaskStatus::Delivered | TaskStatus::Canceled)
         || (child.status == TaskStatus::Failed
@@ -1382,16 +1550,66 @@ fn child_status_allows_parent_delivery(child: &Task) -> bool {
                 .is_some_and(|outcome| !outcome.trim().is_empty()))
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct DependencyBlocker {
+    reason: String,
+    validation_blocked_by: Vec<TaskId>,
+}
+
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+struct TaskValidationState {
+    validator_ids: Vec<TaskId>,
+    unapproved_validator_ids: Vec<TaskId>,
+    failed_validator_ids: Vec<TaskId>,
+}
+
+fn format_task_ids(task_ids: &[TaskId]) -> String {
+    task_ids
+        .iter()
+        .map(|task_id| task_id.0.as_str())
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+fn validate_task_run_spec(run_spec: &TaskRunSpec) -> Result<(), String> {
+    if run_spec.node_id.0.trim().is_empty() {
+        return Err("task run_spec node_id must not be empty".into());
+    }
+    if run_spec.profile.trim().is_empty() {
+        return Err("task run_spec profile must not be empty".into());
+    }
+    if run_spec.workspace_path.trim().is_empty() {
+        return Err("task run_spec workspace_path must not be empty".into());
+    }
+    if run_spec.role.trim().is_empty() {
+        return Err("task run_spec role must not be empty".into());
+    }
+    if run_spec.kind.trim().is_empty() {
+        return Err("task run_spec kind must not be empty".into());
+    }
+    match run_spec.template.trim() {
+        "task" | "validate" | "review" | "quality-guard" => {}
+        other => {
+            return Err(format!(
+                "task run_spec template must be one of task, validate, review, quality-guard; got '{other}'"
+            ));
+        }
+    }
+    if run_spec.instruction.trim().is_empty() {
+        return Err("task run_spec instruction must not be empty".into());
+    }
+    Ok(())
+}
+
 fn edge_kind_rank(kind: TaskEdgeKind) -> u8 {
     match kind {
         TaskEdgeKind::ParentOf => 0,
         TaskEdgeKind::DependsOn => 1,
-        TaskEdgeKind::Blocks => 2,
-        TaskEdgeKind::Validates => 3,
-        TaskEdgeKind::Audits => 4,
-        TaskEdgeKind::Refines => 5,
-        TaskEdgeKind::Supersedes => 6,
-        TaskEdgeKind::Related => 7,
+        TaskEdgeKind::Validates => 2,
+        TaskEdgeKind::Audits => 3,
+        TaskEdgeKind::Refines => 4,
+        TaskEdgeKind::Supersedes => 5,
+        TaskEdgeKind::Related => 6,
     }
 }
 
@@ -1455,6 +1673,8 @@ mod tests {
             scope: TaskScope::default(),
             gates: Vec::new(),
             slug: None,
+            auto_schedule: false,
+            run_spec: None,
         }
     }
 
@@ -1536,6 +1756,20 @@ mod tests {
             created_at_ms: 0,
             updated_at_ms: 0,
             last_seen_ms: 0,
+        }
+    }
+
+    fn run_spec() -> TaskRunSpec {
+        TaskRunSpec {
+            node_id: NodeId("local".into()),
+            profile: "codex".into(),
+            workspace_path: "/workspace/project".into(),
+            bypass_permissions: false,
+            role: "implementation-worker".into(),
+            kind: "implementation".into(),
+            skills: vec!["mmux-developer".into()],
+            template: "task".into(),
+            instruction: "Implement this task and report validation.".into(),
         }
     }
 
@@ -1755,6 +1989,8 @@ mod tests {
                         notes: Some(Some("new notes".into())),
                     },
                     gates: Some(vec!["new gate".into(), "second gate".into()]),
+                    auto_schedule: None,
+                    run_spec: None,
                 },
                 200,
             )
@@ -1824,6 +2060,41 @@ mod tests {
             )
             .unwrap();
         assert!(updated.gates.is_empty());
+    }
+
+    #[test]
+    fn task_run_spec_is_optional_mutable_and_validated() {
+        let mut state = state_with_project();
+        let mut input = create_task("Auto Task");
+        input.run_spec = Some(run_spec());
+        let task = state.create_task(input, 100).unwrap();
+        assert_eq!(task.run_spec.as_ref().unwrap().profile, "codex");
+
+        let updated = state
+            .update_task(
+                &task.id,
+                UpdateTask {
+                    run_spec: Some(None),
+                    ..UpdateTask::default()
+                },
+                110,
+            )
+            .unwrap();
+        assert!(updated.run_spec.is_none());
+
+        let mut invalid = run_spec();
+        invalid.template = "unsupported".into();
+        let error = state
+            .update_task(
+                &task.id,
+                UpdateTask {
+                    run_spec: Some(Some(invalid)),
+                    ..UpdateTask::default()
+                },
+                120,
+            )
+            .unwrap_err();
+        assert!(error.contains("template"));
     }
 
     #[test]
@@ -2089,6 +2360,75 @@ mod tests {
     }
 
     #[test]
+    fn validates_edges_block_dependency_readiness_until_validator_approves() {
+        let mut state = state_with_project();
+        let downstream = state.create_task(create_task("Downstream"), 100).unwrap();
+        let dependency = state
+            .create_task(
+                CreateTask {
+                    gates: vec!["validation approves".into()],
+                    ..create_task("Dependency")
+                },
+                101,
+            )
+            .unwrap();
+        let validator = state.create_task(create_task("Validator"), 102).unwrap();
+
+        state
+            .add_task_edge(
+                CreateTaskEdge {
+                    from: downstream.id.clone(),
+                    to: dependency.id.clone(),
+                    kind: TaskEdgeKind::DependsOn,
+                    note: None,
+                },
+                200,
+            )
+            .unwrap();
+        state
+            .add_task_edge(
+                CreateTaskEdge {
+                    from: validator.id.clone(),
+                    to: dependency.id.clone(),
+                    kind: TaskEdgeKind::Validates,
+                    note: Some("validator must approve dependency gates".into()),
+                },
+                201,
+            )
+            .unwrap();
+
+        state
+            .update_task_status(&dependency.id, TaskStatus::Passed, 300)
+            .unwrap();
+        state
+            .update_task_status(&validator.id, TaskStatus::Failed, 301)
+            .unwrap();
+
+        let blockers = state.task_dependency_blockers(&downstream.id).unwrap();
+        assert_eq!(blockers.len(), 1);
+        assert_eq!(blockers[0].task_id, dependency.id);
+        assert_eq!(blockers[0].status, TaskStatus::Passed);
+        assert_eq!(
+            blockers[0].validation_blocked_by,
+            vec![validator.id.clone()]
+        );
+        assert!(blockers[0].reason.contains("validation not approved"));
+
+        let err = state
+            .update_task_status(&downstream.id, TaskStatus::Planned, 350)
+            .unwrap_err();
+        assert!(err.contains("validation not approved"));
+
+        state
+            .update_task_status(&validator.id, TaskStatus::Passed, 400)
+            .unwrap();
+        let planned = state
+            .update_task_status(&downstream.id, TaskStatus::Planned, 450)
+            .unwrap();
+        assert_eq!(planned.status, TaskStatus::Planned);
+    }
+
+    #[test]
     fn parent_children_block_delivery_but_not_running() {
         let mut state = state_with_project();
         let parent = state.create_task(create_task("Parent"), 100).unwrap();
@@ -2345,6 +2685,73 @@ mod tests {
             .unwrap();
         assert!(summary.blocked_by.is_empty());
         assert_eq!(status.counts.blocked_tasks, 0);
+    }
+
+    #[test]
+    fn orchestration_status_reports_validation_blockers() {
+        let mut state = state_with_project();
+        let downstream = state.create_task(create_task("Downstream"), 100).unwrap();
+        let dependency = state
+            .create_task(
+                CreateTask {
+                    gates: vec!["validator approves".into()],
+                    ..create_task("Dependency")
+                },
+                101,
+            )
+            .unwrap();
+        let validator = state.create_task(create_task("Validator"), 102).unwrap();
+
+        state
+            .add_task_edge(
+                CreateTaskEdge {
+                    from: downstream.id.clone(),
+                    to: dependency.id.clone(),
+                    kind: TaskEdgeKind::DependsOn,
+                    note: None,
+                },
+                200,
+            )
+            .unwrap();
+        state
+            .add_task_edge(
+                CreateTaskEdge {
+                    from: validator.id.clone(),
+                    to: dependency.id.clone(),
+                    kind: TaskEdgeKind::Validates,
+                    note: None,
+                },
+                201,
+            )
+            .unwrap();
+        state
+            .update_task_status(&dependency.id, TaskStatus::Passed, 300)
+            .unwrap();
+        state
+            .update_task_status(&validator.id, TaskStatus::Blocked, 301)
+            .unwrap();
+
+        let status = state.orchestration_status(400);
+        let dependency_summary = status
+            .tasks
+            .iter()
+            .find(|summary| summary.id == dependency.id)
+            .unwrap();
+        assert_eq!(dependency_summary.validator_count, 1);
+        assert_eq!(dependency_summary.unapproved_validator_count, 1);
+        assert_eq!(dependency_summary.failed_validator_count, 1);
+        assert_eq!(
+            dependency_summary.validation_blocked_by,
+            vec![validator.id.clone()]
+        );
+
+        let downstream_summary = status
+            .tasks
+            .iter()
+            .find(|summary| summary.id == downstream.id)
+            .unwrap();
+        assert_eq!(downstream_summary.blocked_by, vec![dependency.id.clone()]);
+        assert_eq!(status.counts.blocked_tasks, 2);
     }
 
     #[test]

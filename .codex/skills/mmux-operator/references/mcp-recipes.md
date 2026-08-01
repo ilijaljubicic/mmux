@@ -60,6 +60,11 @@ local store setup, use
 
 ## Tasks
 
+`include_paths` and `exclude_paths` are task scope boundaries. Relative paths
+are interpreted from the runtime workspace when a `run_spec` or recorded
+session provides one. `run_spec.workspace_path` is runtime launch placement,
+not an extra scope path.
+
 ```json
 {"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"task_create","arguments":{"plan_id":"plan-0001","title":"Update orchestration docs","objective":"Document the orchestration workflow.","include_paths":["README.md","AGENTS.md"],"exclude_paths":["target"],"notes":"Documentation-only task.","gates":["Docs updated","No unrelated files changed"]}}}
 ```
@@ -69,11 +74,61 @@ local store setup, use
 ```
 
 ```json
-{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"task_edge_add","arguments":{"from_task_id":"task-0001","to_task_id":"task-0002","kind":"DependsOn","note":"Validation should run after docs are patched."}}}
+{"jsonrpc":"2.0","id":12,"method":"tools/call","params":{"name":"task_update","arguments":{"task_id":"task-0001","auto_schedule":true,"run_spec":{"node_id":"local","profile":"codex","workspace_path":"/mnt/Radni/mmux","bypass_permissions":false,"role":"implementation-worker","kind":"implementation","skills":["mmux-developer"],"template":"task","instruction":"Implement this task. Report changed files, validation commands, blockers, and unresolved questions."}}}}}
+```
+
+Read one full stored task body for export or exact inspection:
+
+```json
+{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"task_get","arguments":{"task_id":"task-0001"}}}
+```
+
+Read one full stored plan body (including its Markdown brief):
+
+```json
+{"jsonrpc":"2.0","id":13,"method":"tools/call","params":{"name":"plan_get","arguments":{"plan_id":"plan-0001"}}}
+```
+
+```json
+{"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"task_edge_add","arguments":{"from_task_id":"task-0001","to_task_id":"task-0002","kind":"DependsOn","note":"Validation should run after docs are patched."}}}
+```
+
+Use `Validates` from validator task to target task when the validator result
+should gate downstream tasks that depend on the target:
+
+```json
+{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"task_edge_add","arguments":{"from_task_id":"task-0002","to_task_id":"task-0001","kind":"Validates","note":"Validator approves target gates before downstream auto-schedule."}}}
 ```
 
 ```json
 {"jsonrpc":"2.0","id":14,"method":"tools/call","params":{"name":"task_edge_remove","arguments":{"from_task_id":"task-0001","to_task_id":"task-0002","kind":"DependsOn"}}}
+```
+
+```json
+{"jsonrpc":"2.0","id":15,"method":"tools/call","params":{"name":"orchestration_report","arguments":{"plan_id":"plan-0001"}}}
+```
+
+After committing worker or validator results, an external controller advances a
+plan with `orchestration_next`; it starts all currently ready tasks in the
+plan by default:
+
+```json
+{"jsonrpc":"2.0","id":16,"method":"tools/call","params":{"name":"orchestration_next","arguments":{"plan_id":"plan-0001"}}}
+```
+
+```json
+{"jsonrpc":"2.0","id":17,"method":"tools/call","params":{"name":"orchestration_next","arguments":{"plan_id":"plan-0001","dry_run":true}}}
+```
+
+```json
+{"jsonrpc":"2.0","id":18,"method":"tools/call","params":{"name":"task_start","arguments":{"task_id_or_slug":"task-0001","dry_run":false}}}
+```
+
+An external controller commits worker or validator outcomes before advancing
+the plan with `orchestration_next`:
+
+```json
+{"jsonrpc":"2.0","id":19,"method":"tools/call","params":{"name":"task_report","arguments":{"task_id":"task-0002","status":"Failed","outcome":"validation rejected the target task","blockers":["unit test failure"],"evidence":["cargo test -p mmux-controller failed"]}}}
 ```
 
 ## Sessions
