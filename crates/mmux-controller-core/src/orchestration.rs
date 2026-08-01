@@ -42,6 +42,8 @@ pub struct Plan {
     pub slug: String,
     pub title: String,
     pub brief: String,
+    #[serde(default)]
+    pub instructions: Option<String>,
     pub status: PlanStatus,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
@@ -389,6 +391,8 @@ pub struct CreatePlan {
     pub title: String,
     pub brief: String,
     #[serde(default)]
+    pub instructions: Option<String>,
+    #[serde(default)]
     pub slug: Option<String>,
 }
 
@@ -406,6 +410,8 @@ pub struct UpdatePlan {
     pub title: Option<String>,
     #[serde(default)]
     pub brief: Option<String>,
+    #[serde(default)]
+    pub instructions: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -1018,6 +1024,7 @@ impl OrchestrationState {
             slug,
             title: input.title,
             brief: input.brief,
+            instructions: normalize_plan_instructions(input.instructions),
             status: PlanStatus::Backlog,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
@@ -1053,6 +1060,9 @@ impl OrchestrationState {
         }
         if let Some(brief) = update.brief {
             plan.brief = brief;
+        }
+        if let Some(instructions) = update.instructions {
+            plan.instructions = normalize_plan_instructions(Some(instructions));
         }
         plan.updated_at_ms = now_ms;
         Ok(plan.clone())
@@ -1560,6 +1570,12 @@ fn session_key(node_id: &NodeId, session: &SessionId) -> String {
     format!("{}:{}", node_id.0, session.0)
 }
 
+fn normalize_plan_instructions(instructions: Option<String>) -> Option<String> {
+    instructions
+        .map(|instructions| instructions.trim().to_owned())
+        .filter(|instructions| !instructions.is_empty())
+}
+
 fn dependency_status_allows_readiness(status: TaskStatus) -> bool {
     matches!(
         status,
@@ -1734,6 +1750,7 @@ mod tests {
                 slug: "plan".into(),
                 title: "Plan".into(),
                 brief: "Detailed plan brief for test tasks.".into(),
+                instructions: None,
                 status: PlanStatus::Backlog,
                 created_at_ms: 1,
                 updated_at_ms: 1,
@@ -1774,6 +1791,53 @@ mod tests {
         assert_ne!(first.id, second.id);
         assert_eq!(first.slug, "project");
         assert_eq!(second.slug, "project-2");
+    }
+
+    #[test]
+    fn plan_instructions_are_stored_trimmed_and_clearable() {
+        let mut state = OrchestrationState::new();
+        let project = state
+            .create_project(
+                CreateProject {
+                    title: "Project".into(),
+                    description: "Test project".into(),
+                    slug: None,
+                },
+                100,
+            )
+            .unwrap();
+
+        let plan = state
+            .create_plan(
+                CreatePlan {
+                    project_id: project.id,
+                    title: "Plan".into(),
+                    brief: "Detailed plan brief.".into(),
+                    instructions: Some("  Keep work scoped to this plan.  ".into()),
+                    slug: None,
+                },
+                101,
+            )
+            .unwrap();
+
+        assert_eq!(
+            plan.instructions.as_deref(),
+            Some("Keep work scoped to this plan.")
+        );
+
+        let updated = state
+            .update_plan(
+                &plan.id,
+                UpdatePlan {
+                    title: None,
+                    brief: None,
+                    instructions: Some("".into()),
+                },
+                102,
+            )
+            .unwrap();
+
+        assert_eq!(updated.instructions, None);
     }
 
     fn session() -> TaskSession {

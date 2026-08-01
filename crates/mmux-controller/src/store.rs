@@ -145,6 +145,7 @@ fn migrate_orchestration_snapshot_json(state_json: &str) -> Result<String, serde
     // active orchestration snapshots have been migrated by normal loads/saves.
     migrate_legacy_blocks_edges(&mut value);
     drop_removed_refines_edges(&mut value);
+    add_missing_plan_instructions(&mut value);
     serde_json::to_string(&value)
 }
 
@@ -194,6 +195,19 @@ fn drop_removed_refines_edges(value: &mut Value) {
     });
 }
 
+fn add_missing_plan_instructions(value: &mut Value) {
+    let Some(plans) = value.get_mut("plans").and_then(Value::as_object_mut) else {
+        return;
+    };
+
+    for plan in plans.values_mut() {
+        let Some(object) = plan.as_object_mut() else {
+            continue;
+        };
+        object.entry("instructions").or_insert_with(|| Value::Null);
+    }
+}
+
 fn edge_dedupe_key(edge: &Map<String, Value>) -> Option<(String, String, String)> {
     Some((
         edge.get("from")?.as_str()?.to_owned(),
@@ -225,6 +239,7 @@ mod tests {
             project_id,
             title: "Plan".into(),
             brief: "Detailed test plan brief.".into(),
+            instructions: None,
             slug: None,
         }
     }
@@ -372,6 +387,45 @@ mod tests {
         assert_eq!(loaded.task_edges[0].kind, TaskEdgeKind::DependsOn);
         assert_eq!(loaded.task_edges[0].from, TaskId("task-2".into()));
         assert_eq!(loaded.task_edges[0].to, TaskId("task-1".into()));
+
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn load_migrates_missing_plan_instructions_to_none() {
+        let dir = unique_temp_dir("mmux-store-plan-instructions");
+        let store = OrchestrationStore::open(dir.clone()).unwrap();
+        let state = populated_state();
+        let mut value = serde_json::to_value(&state).unwrap();
+        let plans = value
+            .get_mut("plans")
+            .and_then(Value::as_object_mut)
+            .unwrap();
+        for plan in plans.values_mut() {
+            plan.as_object_mut().unwrap().remove("instructions");
+        }
+        let state_json = serde_json::to_string(&value).unwrap();
+
+        store
+            .connect()
+            .unwrap()
+            .execute(
+                "INSERT INTO orchestration_snapshots (id, version, state_json, updated_at_ms)
+                 VALUES (1, ?1, ?2, 451)",
+                params![SNAPSHOT_VERSION, state_json],
+            )
+            .unwrap();
+
+        let loaded = store.load().unwrap().unwrap();
+
+        assert_eq!(
+            loaded
+                .plans
+                .get(&PlanId("plan-1".into()))
+                .unwrap()
+                .instructions,
+            None
+        );
 
         fs::remove_dir_all(dir).unwrap();
     }

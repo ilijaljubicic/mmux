@@ -13,7 +13,8 @@ The core idea is simple:
   endpoint.
 - `mmux node` owns tmux and filesystem access in the environment where it runs.
 - Durable orchestration state groups work as projects, Markdown plan briefs,
-  and executable tasks with task-owned runtime sessions.
+  optional plan-wide instructions, and executable tasks with task-owned runtime
+  sessions.
 - mmux can run as one process for local convenience, or as a distributed
   controller plus one or more node processes. In single-process mode, the
   controller embeds a node backend and exposes it as the reserved `local` node.
@@ -582,9 +583,11 @@ intentionally scopes external files.
 mmux includes a durable orchestration layer for coordinating agent work:
 projects contain Markdown plan briefs, plans contain executable tasks, and each
 task can own one recorded coder session. Projects are long-lived boundaries
-with required descriptions. Plans carry enough context to derive tasks. Tasks
-carry objective, scope, gates, outcome, blockers, dependency edges, and runtime
-placement for the attached session. Tasks may also carry an optional
+with required descriptions. Plans carry enough context to derive tasks and may
+carry optional plan-wide instructions that every task, validation, review, and
+quality-guard prompt receives. Tasks carry objective, scope, gates, outcome,
+blockers, dependency edges, and runtime placement for the attached session.
+Tasks may also carry an optional
 `run_spec` with `node_id`, `profile`, `workspace_path`, `bypass_permissions`,
 `role`, `kind`, `skills`, prompt `template`, scheduler `instruction`, and
 the top-level `auto_schedule` flag. `run_spec` describes how a task can be
@@ -647,7 +650,8 @@ plan, task, edge, outcome, blocker, task-session, cleanup, warning, and runtime
 state. Use `task_get` when an exporter or operator needs one full stored task
 body, including objective, scope, gates, outcome/evidence, run spec, session,
 and incoming/outgoing edges. Use `plan_get` for the analogous full plan record,
-including the Markdown plan brief that the summary listings omit.
+including the Markdown plan brief and optional plan instructions that the
+summary listings omit.
 `orchestration_cleanup_zombies` and
 `orchestration_prune_store` are dry-run by default; destructive
 cleanup/pruning requires explicit opt-in.
@@ -689,7 +693,7 @@ Profile-aware coding tools:
 | `list_coder_profiles` | List enabled built-in coder profiles. |
 | `start_coding_session` | Create or adopt a CLI session from its profile command, or from `permission_bypass_cmd` when `bypass_permissions = true`; returns without waiting for readiness. Optional task metadata records one `TaskSession` on the task. |
 | `coding_send` | Send a prompt to a coding CLI; rejects blank prompts and placeholder strings such as `null` or `undefined`. |
-| `coding_task_send` | Send an initial task-scoped prompt by rendering task context from orchestration state with template `task`, `validate`, `review`, or `quality-guard`, optionally adding `context_task_ids` task cards for multi-task validation/review, then appending the provided instruction. The template selects the operating mode; the instruction supplies the concrete focus. |
+| `coding_task_send` | Send an initial task-scoped prompt by rendering task context from orchestration state with template `task`, `validate`, `review`, or `quality-guard`, including optional plan-wide instructions when configured, optionally adding `context_task_ids` task cards for multi-task validation/review, then appending the provided instruction. The template selects the operating mode; the instruction supplies the concrete focus. |
 | `coding_read` | Read recent CLI output through profile-aware compaction by default; pass `raw = true` for the full tmux pane text. |
 | `coding_action` | Send `approve`, `reject`, `cancel`, `escape`, or `dismiss`. |
 | `check_state` | Non-blocking JSON state check with `has_prompt`, `promptable`, `busy`, and `turn_idle`. |
@@ -715,11 +719,11 @@ Orchestration tools:
 | `project_create` | Create a durable orchestration project boundary with required `title` and `description`, a UUID id, and globally unique slug. Requires `--enable-admin-tools`. |
 | `project_list` | List orchestration projects with total, active, and per-status plan/task counts. |
 | `project_status_update` | Set project status to `Active` or `Archived`; `project_id` accepts UUID id or slug. Requires `--enable-admin-tools`. |
-| `plan_create` | Create a durable plan brief under a project; `project_id` accepts UUID id or slug. |
+| `plan_create` | Create a durable plan brief under a project; `project_id` accepts UUID id or slug. Optional `instructions` stores Markdown instructions rendered into every task prompt for the plan. |
 | `plan_list` | List orchestration plans, optionally filtered by project. |
-| `plan_update` | Update mutable plan metadata: title and brief. |
+| `plan_update` | Update mutable plan metadata: title, brief, and instructions. Set `instructions` to an empty string to clear it. |
 | `plan_status_update` | Update plan status with optional plan-level outcome. |
-| `plan_get` | Return one full stored plan record by plan id or unique slug, including its Markdown brief. |
+| `plan_get` | Return one full stored plan record by plan id or unique slug, including its Markdown brief and optional instructions. |
 | `task_create` | Create a durable orchestration task inside a required `plan_id` selector (plan id or unique slug) with scope, notes, and gates; returns the created task object directly. |
 | `task_update` | Update mutable task metadata: title, objective, scope fields, gates, `auto_schedule`, and optional `run_spec`. |
 | `task_get` | Return one full stored task record by task id or unique slug, plus incoming and outgoing task edges. |

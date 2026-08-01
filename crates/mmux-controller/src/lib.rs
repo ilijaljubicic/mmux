@@ -2461,6 +2461,8 @@ struct PlanCreateArgs {
     project_id: String,
     title: String,
     brief: String,
+    #[serde(default)]
+    instructions: Option<String>,
     slug: Option<String>,
 }
 
@@ -2472,6 +2474,8 @@ struct PlanUpdateArgs {
     title: Option<String>,
     #[serde(default)]
     brief: Option<String>,
+    #[serde(default)]
+    instructions: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -2983,6 +2987,7 @@ impl TmuxMcpServer {
                         "project_id": { "type": "string", "description": "Project UUID id or globally unique project slug" },
                         "title": { "type": "string" },
                         "brief": { "type": "string", "description": "Required Markdown plan brief with enough context and detail to derive tasks" },
+                        "instructions": { "type": "string", "description": "Optional Markdown instructions that every task prompt in this plan receives" },
                         "slug": { "type": "string" }
                     }),
                     Some(vec!["project_id", "title", "brief"]),
@@ -3005,7 +3010,8 @@ impl TmuxMcpServer {
                     json!({
                         "plan_id": { "type": "string", "description": "Plan id or slug" },
                         "title": { "type": "string" },
-                        "brief": { "type": "string", "description": "Markdown plan brief with enough context and detail to derive tasks" }
+                        "brief": { "type": "string", "description": "Markdown plan brief with enough context and detail to derive tasks" },
+                        "instructions": { "type": "string", "description": "Markdown instructions for every task prompt in this plan; set to an empty string to clear" }
                     }),
                     Some(vec!["plan_id"]),
                 )),
@@ -3299,6 +3305,7 @@ impl TmuxMcpServer {
                 project_id,
                 title: args.title,
                 brief: args.brief,
+                instructions: args.instructions,
                 slug: args.slug,
             })
             .map_err(mcp_invalid_request)?;
@@ -3324,6 +3331,7 @@ impl TmuxMcpServer {
                 UpdatePlan {
                     title: args.title,
                     brief: args.brief,
+                    instructions: args.instructions,
                 },
             )
             .map_err(mcp_invalid_request)?;
@@ -4964,6 +4972,10 @@ fn build_coding_task_prompt(
             &build_plan_brief_section(plan.map(|plan| plan.brief.as_str())),
         )
         .replace(
+            "{{plan_instructions_section}}",
+            &build_plan_instructions_section(plan.and_then(|plan| plan.instructions.as_deref())),
+        )
+        .replace(
             "{{scheduler_section}}",
             &build_scheduler_section(task.auto_schedule, task.run_spec.as_ref()),
         )
@@ -5111,6 +5123,16 @@ fn build_plan_brief_section(brief: Option<&str>) -> String {
             .filter(|brief| !brief.is_empty())
             .unwrap_or("- missing")
     )
+}
+
+fn build_plan_instructions_section(instructions: Option<&str>) -> String {
+    let Some(instructions) = instructions
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return String::new();
+    };
+    format!("Plan Instructions:\n{}\n\n", instructions)
 }
 
 fn build_scheduler_section(auto_schedule: bool, run_spec: Option<&TaskRunSpec>) -> String {
@@ -8796,6 +8818,7 @@ mod tests {
                     project_id: project.id.clone(),
                     title: "Plan".into(),
                     brief: "Detailed plan brief for test task derivation.".into(),
+                    instructions: None,
                     slug: Some("plan".into()),
                 },
                 95,
@@ -8821,6 +8844,7 @@ mod tests {
                     project_id: project.id,
                     title: "Plan".into(),
                     brief: "Detailed plan brief for test task.".into(),
+                    instructions: None,
                     slug: None,
                 },
                 95,
@@ -9076,6 +9100,7 @@ mod tests {
                     project_id: project.id,
                     title: "Plan".into(),
                     brief: "Detailed plan brief for runtime status.".into(),
+                    instructions: None,
                     slug: None,
                 },
                 95,
@@ -9432,6 +9457,47 @@ mod tests {
         );
         assert_eq!(by_slug.id, plan.id);
         assert_eq!(by_slug.brief, "Detailed plan brief for Plan Get Plan");
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn test_plan_create_and_update_persist_instructions() {
+        let dir = unique_temp_dir("mmux-mcp-plan-instructions");
+        let server = test_orchestration_server(&dir).await;
+        let project = ensure_test_project(&server).await;
+
+        let created: Plan = result_json(
+            &call_orchestration(
+                &server,
+                "plan_create",
+                json!({
+                    "project_id": project.id.0,
+                    "title": "Plan Instructions",
+                    "brief": "Detailed plan brief for instructions.",
+                    "instructions": "  Apply these instructions to every task.  "
+                }),
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(
+            created.instructions.as_deref(),
+            Some("Apply these instructions to every task.")
+        );
+
+        let updated: Plan = result_json(
+            &call_orchestration(
+                &server,
+                "plan_update",
+                json!({
+                    "plan_id": created.id.0,
+                    "instructions": ""
+                }),
+            )
+            .unwrap(),
+        );
+
+        assert_eq!(updated.instructions, None);
         let _ = fs::remove_dir_all(dir);
     }
 
@@ -11513,6 +11579,17 @@ mod tests {
             )
             .unwrap();
         let plan = create_state_plan(&mut state, &project);
+        state
+            .update_plan(
+                &plan.id,
+                UpdatePlan {
+                    title: None,
+                    brief: None,
+                    instructions: Some("Keep generated work inside plan boundaries.".into()),
+                },
+                105,
+            )
+            .unwrap();
         let dependency = state
             .create_task(
                 CreateTask {
@@ -11568,6 +11645,7 @@ mod tests {
         assert!(prompt.contains(&format!("Project: {} / mmux", project.id.0)));
         assert!(prompt.contains(&format!("Plan: {} / plan", plan.id.0)));
         assert!(prompt.contains("Plan Brief:\nDetailed plan brief for test task derivation."));
+        assert!(prompt.contains("Plan Instructions:\nKeep generated work inside plan boundaries."));
         assert!(prompt.contains("Objective:\nBuild deterministic context"));
         assert!(prompt.contains("Include paths:\n- crates/mmux-controller/src/lib.rs"));
         assert!(prompt.contains("Gates:\n- Context includes task identity"));

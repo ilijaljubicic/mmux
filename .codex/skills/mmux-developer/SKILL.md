@@ -35,6 +35,10 @@ Code areas:
 - `src/main.rs`: root CLI commands and local tmux proxy helpers.
 - `crates/mmux-controller/src/prompts`: compile-time prompt templates used by
   MCP tools.
+- `Plan.instructions` in `mmux-controller-core` stores optional plan-wide
+  Markdown instructions rendered into all `coding_task_send` prompt templates.
+  Keep tool schemas, prompt rendering tests, README, and operator recipes
+  aligned when changing this behavior.
 
 Primary commands:
 

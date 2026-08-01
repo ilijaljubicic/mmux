@@ -298,6 +298,7 @@ mod tests {
             project_id,
             title: "Plan".into(),
             brief: "Detailed test plan brief.".into(),
+            instructions: None,
             slug: None,
         }
     }

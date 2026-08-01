@@ -55,7 +55,7 @@ local store setup, use
 ## Plans
 
 ```json
-{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"plan_create","arguments":{"project_id":"mmux","title":"Update orchestration docs plan","brief":"Document the orchestration workflow, update operator recipes, and validate examples. Tasks should cover README and skill recipe updates."}}}
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"plan_create","arguments":{"project_id":"mmux","title":"Update orchestration docs plan","brief":"Document the orchestration workflow, update operator recipes, and validate examples. Tasks should cover README and skill recipe updates.","instructions":"Keep changes scoped to the documented plan and report changed files, validation commands, blockers, and unresolved questions."}}}
 ```
 
 ## Tasks
