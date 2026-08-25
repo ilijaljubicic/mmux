@@ -1025,7 +1025,7 @@ dependencies = [
 
 [[package]]
 name = "mmux"
-version = "0.2.3"
+version = "0.3.1"
 dependencies = [
  "mmux-controller",
  "mmux-node",
@@ -1033,7 +1033,7 @@ dependencies = [
 
 [[package]]
 name = "mmux-controller"
-version = "0.2.3"
+version = "0.3.1"
 dependencies = [
  "axum",
  "base64",
@@ -1060,7 +1060,7 @@ dependencies = [
 
 [[package]]
 name = "mmux-controller-core"
-version = "0.2.3"
+version = "0.3.1"
 dependencies = [
  "mmux-wire",
  "serde",
@@ -1070,7 +1070,7 @@ dependencies = [
 
 [[package]]
 name = "mmux-node"
-version = "0.2.3"
+version = "0.3.1"
 dependencies = [
  "base64",
  "buffa",
@@ -1088,7 +1088,7 @@ dependencies = [
 
 [[package]]
 name = "mmux-shared"
-version = "0.2.3"
+version = "0.3.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1096,7 +1096,7 @@ dependencies = [
 
 [[package]]
 name = "mmux-wire"
-version = "0.2.3"
+version = "0.3.1"
 dependencies = [
  "buffa",
  "connectrpc",
