@@ -55,7 +55,7 @@ local store setup, use
 ## Plans
 
 ```json
-{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"plan_create","arguments":{"project_id":"mmux","title":"Update orchestration docs plan","brief":"Document the orchestration workflow, update operator recipes, and validate examples. Tasks should cover README, AGENTS.md, and skill recipe updates."}}}
+{"jsonrpc":"2.0","id":6,"method":"tools/call","params":{"name":"plan_create","arguments":{"project_id":"mmux","title":"Update orchestration docs plan","brief":"Document the orchestration workflow, update operator recipes, and validate examples. Tasks should cover README and skill recipe updates.","instructions":"Keep changes scoped to the documented plan and report changed files, validation commands, blockers, and unresolved questions."}}}
 ```
 
 ## Tasks
@@ -66,7 +66,7 @@ session provides one. `run_spec.workspace_path` is runtime launch placement,
 not an extra scope path.
 
 ```json
-{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"task_create","arguments":{"plan_id":"plan-0001","title":"Update orchestration docs","objective":"Document the orchestration workflow.","include_paths":["README.md","AGENTS.md"],"exclude_paths":["target"],"notes":"Documentation-only task.","gates":["Docs updated","No unrelated files changed"]}}}
+{"jsonrpc":"2.0","id":10,"method":"tools/call","params":{"name":"task_create","arguments":{"plan_id":"plan-0001","title":"Update orchestration docs","objective":"Document the orchestration workflow.","include_paths":["README.md",".codex/skills/mmux-operator/SKILL.md",".codex/skills/mmux-operator/references/mcp-recipes.md"],"exclude_paths":["target"],"notes":"Documentation-only task.","gates":["Docs updated","No unrelated files changed"]}}}
 ```
 
 ```json
@@ -211,13 +211,13 @@ results.
 Start with dry-run cleanup:
 
 ```json
-{"jsonrpc":"2.0","id":50,"method":"tools/call","params":{"name":"orchestration_cleanup_zombies","arguments":{}}}
+{"jsonrpc":"2.0","id":50,"method":"tools/call","params":{"name":"orchestration_prune","arguments":{}}}
 ```
 
 Run explicit cleanup only after reviewing the dry-run result:
 
 ```json
-{"jsonrpc":"2.0","id":51,"method":"tools/call","params":{"name":"orchestration_cleanup_zombies","arguments":{"node":"local","dry_run":false,"older_than_seconds":300}}}
+{"jsonrpc":"2.0","id":51,"method":"tools/call","params":{"name":"orchestration_prune","arguments":{"node":"local","dry_run":false,"older_than_days":14}}}
 ```
 
 Inspect state again after cleanup:

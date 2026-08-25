@@ -338,8 +338,8 @@ update, and status chrome from supported coder CLIs to reduce token waste. Use
 `raw = true` only when compact output is insufficient and you need the exact
 tmux pane text.
 
-Use `orchestration_cleanup_zombies` only when intentionally cleaning
-orchestration-owned sessions. Start with dry-run behavior.
+Use `orchestration_prune` only when intentionally cleaning orchestration-owned
+sessions or stale durable orchestration records. Start with dry-run behavior.
 
 ## Delegation Prompts
 

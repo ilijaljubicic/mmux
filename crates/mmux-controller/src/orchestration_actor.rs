@@ -10,7 +10,10 @@ use mmux_controller_core::orchestration::{
 };
 
 use crate::store::OrchestrationStore;
-use crate::{prune_finished_plans, LocalPruneSessionCandidate, LocalPruneStoreReport};
+use crate::{
+    prune_finished_plans, task_status_allows_runtime_cleanup, LocalPruneSessionCandidate,
+    LocalPruneStoreReport,
+};
 
 #[derive(Clone)]
 pub(crate) struct OrchestrationHandle {
@@ -168,7 +171,8 @@ impl OrchestrationHandle {
         &self,
         live_local_sessions: &std::collections::HashSet<String>,
         dry_run: bool,
-        sessions_only: bool,
+        include_stale_session_records: bool,
+        include_finished_plans: bool,
         older_than_days: Option<u64>,
     ) -> Result<LocalPruneStoreReport, String> {
         let now_ms = crate::now_ms();
@@ -181,17 +185,23 @@ impl OrchestrationHandle {
             .transpose()?;
         if dry_run {
             let guard = self.lock()?;
-            let candidates = stale_session_candidates(&guard.state, live_local_sessions, cutoff_ms);
+            let candidates = if include_stale_session_records {
+                stale_session_candidates(&guard.state, live_local_sessions, cutoff_ms)
+            } else {
+                Vec::new()
+            };
             let mut preview = guard.state.clone();
             for candidate in &candidates {
                 if let Some(task) = preview.tasks.get_mut(&TaskId(candidate.task_id.clone())) {
                     task.session = None;
                 }
             }
-            let pruned_plan_count = prune_finished_plans(&mut preview, sessions_only, cutoff_ms);
+            let pruned_plan_count =
+                prune_finished_plans(&mut preview, include_finished_plans, cutoff_ms);
             return Ok(LocalPruneStoreReport {
                 dry_run,
-                sessions_only,
+                include_stale_session_records,
+                include_finished_plans,
                 pruned_session_count: candidates.len(),
                 pruned_plan_count,
                 candidates,
@@ -199,16 +209,21 @@ impl OrchestrationHandle {
         }
 
         self.mutate(|state, _now_ms| {
-            let candidates = stale_session_candidates(state, live_local_sessions, cutoff_ms);
+            let candidates = if include_stale_session_records {
+                stale_session_candidates(state, live_local_sessions, cutoff_ms)
+            } else {
+                Vec::new()
+            };
             for candidate in &candidates {
                 if let Some(task) = state.tasks.get_mut(&TaskId(candidate.task_id.clone())) {
                     task.session = None;
                 }
             }
-            let pruned_plan_count = prune_finished_plans(state, sessions_only, cutoff_ms);
+            let pruned_plan_count = prune_finished_plans(state, include_finished_plans, cutoff_ms);
             Ok(LocalPruneStoreReport {
                 dry_run,
-                sessions_only,
+                include_stale_session_records,
+                include_finished_plans,
                 pruned_session_count: candidates.len(),
                 pruned_plan_count,
                 candidates,
@@ -255,7 +270,7 @@ fn stale_session_candidates(
             if cutoff_ms.is_some_and(|cutoff_ms| session.last_seen_ms > cutoff_ms) {
                 return None;
             }
-            if !task.status.is_finished() {
+            if !task_status_allows_runtime_cleanup(task.status) {
                 return None;
             }
             Some(LocalPruneSessionCandidate {
@@ -492,14 +507,14 @@ mod tests {
 
         let live = HashSet::new();
         let dry_run = handle
-            .prune_stale_session_records(&live, true, false, None)
+            .prune_stale_session_records(&live, true, true, true, None)
             .unwrap();
         assert_eq!(dry_run.pruned_session_count, 1);
         assert_eq!(dry_run.pruned_plan_count, 1);
         assert_eq!(handle.snapshot().unwrap().plans.len(), 1);
 
         let pruned = handle
-            .prune_stale_session_records(&live, false, false, None)
+            .prune_stale_session_records(&live, false, true, true, None)
             .unwrap();
         assert_eq!(pruned.pruned_session_count, 1);
         assert_eq!(pruned.pruned_plan_count, 1);

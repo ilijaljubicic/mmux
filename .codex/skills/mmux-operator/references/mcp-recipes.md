@@ -211,13 +211,13 @@ results.
 Start with dry-run cleanup:
 
 ```json
-{"jsonrpc":"2.0","id":50,"method":"tools/call","params":{"name":"orchestration_cleanup_zombies","arguments":{}}}
+{"jsonrpc":"2.0","id":50,"method":"tools/call","params":{"name":"orchestration_prune","arguments":{}}}
 ```
 
 Run explicit cleanup only after reviewing the dry-run result:
 
 ```json
-{"jsonrpc":"2.0","id":51,"method":"tools/call","params":{"name":"orchestration_cleanup_zombies","arguments":{"node":"local","dry_run":false,"older_than_seconds":300}}}
+{"jsonrpc":"2.0","id":51,"method":"tools/call","params":{"name":"orchestration_prune","arguments":{"node":"local","dry_run":false,"older_than_days":14}}}
 ```
 
 Inspect state again after cleanup:

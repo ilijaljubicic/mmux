@@ -206,8 +206,8 @@ Use the CLI proxy for manual tmux inspection or interactive attach:
 ```bash
 mmux create-project "Release hardening" --slug release-hardening
 mmux list-projects
-mmux prune-store --dry-run
-mmux prune-store --sessions-only --older-than-days 7
+mmux prune --dry-run
+mmux prune --include-stale-session-records --older-than-days 7
 mmux tmux -- list-sessions
 mmux tmux -- list-sessions --project <project-id-or-slug>
 mmux tmux -- capture-pane -t codex -p
@@ -223,7 +223,7 @@ proxy:
 mmux controller --enable-local-node --store-path /tmp/mmux-dev
 mmux --store-path /tmp/mmux-dev create-project "Release hardening" --slug release-hardening
 mmux --store-path /tmp/mmux-dev list-projects
-mmux --store-path /tmp/mmux-dev prune-store --dry-run
+mmux --store-path /tmp/mmux-dev prune --dry-run
 mmux --store-path /tmp/mmux-dev tmux -- list-sessions
 mmux --store-path /tmp/mmux-dev attach --read-only codex
 mmux --store-path /tmp/mmux-dev attach codex
@@ -324,7 +324,7 @@ stop, snapshot, import, and export.
 | `mmux create-project <title> --description <text>` | Creates a durable orchestration project in the local mmux store. Supports optional `--slug <slug>`. |
 | `mmux delete-project <id-or-slug>` | Deletes a durable orchestration project from the local mmux store, including all contained plans, task cards, task sessions, and task edges. |
 | `mmux list-projects` | Lists durable orchestration projects from the local mmux store so project ids/slugs are discoverable. |
-| `mmux prune-store` | Prunes stale durable task sessions and finished plans from the local mmux store. Use `--dry-run` to preview, `--sessions-only` to skip plan pruning, and `--older-than-days <days>` to constrain by age. |
+| `mmux prune` | Prunes orchestration-owned live sessions, stale durable task sessions, and finished plans. Defaults to dry-run, all categories included, and `--older-than-days 14`; pass `--execute` to mutate state. |
 | `mmux tmux -- <args>` | Runs `tmux` against mmux's private local-node tmux socket. `list-sessions` accepts mmux's `--project <project-id-or-slug>` filter. |
 | `mmux attach [--read-only|-r] <session>` | Attaches to a session in mmux's private local-node tmux server. Use read-only mode for inspection without sending input. |
 
@@ -652,9 +652,8 @@ body, including objective, scope, gates, outcome/evidence, run spec, session,
 and incoming/outgoing edges. Use `plan_get` for the analogous full plan record,
 including the Markdown plan brief and optional plan instructions that the
 summary listings omit.
-`orchestration_cleanup_zombies` and
-`orchestration_prune_store` are dry-run by default; destructive
-cleanup/pruning requires explicit opt-in.
+`orchestration_prune` is dry-run by default; destructive cleanup/pruning
+requires explicit opt-in.
 
 For the full operator workflow, use the bundled `mmux-operator` skill.
 
@@ -736,8 +735,7 @@ Orchestration tools:
 | `orchestration_status` | Return compact project, plan, task, edge, task-session, cleanup, warning, and runtime-state summaries. |
 | `orchestration_report` | Read-only report of tasks that are ready or not ready for automatic orchestration. Never starts sessions. |
 | `orchestration_next` | Advance one plan by starting all currently ready tasks whose `auto_schedule` is true and `run_spec` exists. Requires `plan_id` id-or-slug. Executes by default; pass `dry_run=true` to preview. |
-| `orchestration_cleanup_zombies` | Dry-run or explicitly clean live local `mmux-*` sessions missing from durable orchestration storage. |
-| `orchestration_prune_store` | Dry-run or explicitly prune stale durable task sessions and finished plans whose contained tasks are all finished. |
+| `orchestration_prune` | Dry-run or explicitly prune orchestration-owned live sessions, stale durable task sessions, and finished plans. Defaults to all categories and `older_than_days=14`; pass include flags to scope the operation. |
 
 Backend node file tools:
 

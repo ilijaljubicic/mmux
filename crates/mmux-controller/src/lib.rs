@@ -71,6 +71,9 @@ mod store;
 
 const DEFAULT_CODING_READY_TIMEOUT_SECONDS: u64 = 120;
 const DEFAULT_NODE_EXECUTION_ACTOR_CALL_TIMEOUT: Duration = Duration::from_secs(30);
+const DEFAULT_PRUNE_OLDER_THAN_DAYS: u64 = 14;
+const SECONDS_PER_DAY: u64 = 86_400;
+const MILLIS_PER_DAY: u64 = 86_400_000;
 const ORCHESTRATION_SESSION_PREFIX: &str = "mmux";
 const MAX_ORCHESTRATION_TASK_SLUG_LEN: usize = 40;
 const MAX_ORCHESTRATION_KIND_LEN: usize = 24;
@@ -354,24 +357,16 @@ struct LocalSessionInfo {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct OrchestrationCleanupZombiesArgs {
+struct OrchestrationPruneArgs {
     #[serde(default = "default_cleanup_dry_run")]
     dry_run: bool,
-    older_than_seconds: Option<u64>,
-    #[serde(default = "default_cleanup_node")]
-    node: String,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct OrchestrationPruneStoreArgs {
-    #[serde(default = "default_cleanup_dry_run")]
-    dry_run: bool,
-    #[serde(default)]
-    sessions_only: bool,
     older_than_days: Option<u64>,
     #[serde(default = "default_cleanup_node")]
     node: String,
+    include_live_untracked_sessions: Option<bool>,
+    include_stale_session_records: Option<bool>,
+    include_finished_plans: Option<bool>,
+    include_tracked_finished_sessions: Option<bool>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -381,12 +376,27 @@ enum LocalStartupReconciliationAction {
     Historical { key: String },
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct PruneSelection {
+    pub live_untracked_sessions: bool,
+    pub stale_session_records: bool,
+    pub finished_plans: bool,
+    pub tracked_finished_sessions: bool,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
-struct OrchestrationCleanupZombiesResult {
+struct OrchestrationPruneResult {
     node: String,
     dry_run: bool,
-    candidates: Vec<SessionCleanupCandidate>,
-    killed: Vec<String>,
+    older_than_days: u64,
+    include: PruneSelection,
+    live_untracked_session_candidates: Vec<SessionCleanupCandidate>,
+    killed_live_untracked_sessions: Vec<String>,
+    tracked_finished_session_candidates: Vec<LocalPruneLiveTrackedSessionCandidate>,
+    killed_tracked_finished_sessions: Vec<String>,
+    stale_session_record_candidates: Vec<LocalPruneSessionCandidate>,
+    pruned_session_record_count: usize,
+    pruned_plan_count: usize,
     warnings: Vec<String>,
 }
 
@@ -396,6 +406,44 @@ fn default_cleanup_dry_run() -> bool {
 
 fn default_cleanup_node() -> String {
     "local".into()
+}
+
+impl Default for PruneSelection {
+    fn default() -> Self {
+        Self {
+            live_untracked_sessions: true,
+            stale_session_records: true,
+            finished_plans: true,
+            tracked_finished_sessions: true,
+        }
+    }
+}
+
+fn prune_selection(args: &OrchestrationPruneArgs) -> PruneSelection {
+    PruneSelection {
+        live_untracked_sessions: args.include_live_untracked_sessions.unwrap_or(true),
+        stale_session_records: args.include_stale_session_records.unwrap_or(true),
+        finished_plans: args.include_finished_plans.unwrap_or(true),
+        tracked_finished_sessions: args.include_tracked_finished_sessions.unwrap_or(true),
+    }
+}
+
+fn older_than_days_or_default(value: Option<u64>) -> u64 {
+    value.unwrap_or(DEFAULT_PRUNE_OLDER_THAN_DAYS)
+}
+
+fn older_than_days_to_seconds(days: u64) -> Result<u64, String> {
+    days.checked_mul(SECONDS_PER_DAY)
+        .ok_or_else(|| format!("older_than_days value {days} is too large"))
+}
+
+fn cutoff_ms_for_older_than_days(days: u64) -> Result<u64, String> {
+    let duration_ms = days
+        .checked_mul(MILLIS_PER_DAY)
+        .ok_or_else(|| format!("older_than_days value {days} is too large"))?;
+    now_ms()
+        .checked_sub(duration_ms)
+        .ok_or_else(|| format!("older_than_days value {days} is too large"))
 }
 
 fn is_orchestration_owned_session(session: &str) -> bool {
@@ -476,6 +524,92 @@ fn safe_cleanup_kill_targets(
     (targets, warnings)
 }
 
+pub(crate) fn task_status_allows_runtime_cleanup(status: TaskStatus) -> bool {
+    matches!(
+        status,
+        TaskStatus::Failed | TaskStatus::Passed | TaskStatus::Delivered | TaskStatus::Canceled
+    )
+}
+
+fn tracked_finished_session_candidates(
+    state: &mmux_controller_core::orchestration::OrchestrationState,
+    live_sessions: &[LocalSessionInfo],
+    cutoff_ms: u64,
+) -> Vec<LocalPruneLiveTrackedSessionCandidate> {
+    let live_by_session = live_sessions
+        .iter()
+        .map(|live| (live.session.as_str(), live.created_at_seconds))
+        .collect::<HashMap<_, _>>();
+    let mut candidates = state
+        .tasks
+        .values()
+        .filter_map(|task| {
+            let session = task.session.as_ref()?;
+            if session.node_id.0 != "local" {
+                return None;
+            }
+            let created_at_seconds = live_by_session.get(session.session.0.as_str()).copied()?;
+            if session.last_seen_ms > cutoff_ms {
+                return None;
+            }
+            if !task_status_allows_runtime_cleanup(task.status) {
+                return None;
+            }
+            Some(LocalPruneLiveTrackedSessionCandidate {
+                node_id: session.node_id.0.clone(),
+                session: session.session.0.clone(),
+                task_id: task.id.0.clone(),
+                task_status: format!("{:?}", task.status),
+                last_seen_ms: session.last_seen_ms,
+                created_at_ms: created_at_seconds.map(|seconds| seconds.saturating_mul(1000)),
+                reason: "live local tmux session is attached only to a finished task".into(),
+            })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        left.session
+            .cmp(&right.session)
+            .then_with(|| left.task_id.cmp(&right.task_id))
+    });
+    candidates
+}
+
+fn safe_tracked_finished_kill_targets(
+    candidates: &[LocalPruneLiveTrackedSessionCandidate],
+    state: &mmux_controller_core::orchestration::OrchestrationState,
+) -> (Vec<String>, Vec<String>) {
+    let mut targets = Vec::new();
+    let mut warnings = Vec::new();
+    for candidate in candidates {
+        let task_id = TaskId(candidate.task_id.clone());
+        let Some(task) = state.tasks.get(&task_id) else {
+            warnings.push(format!(
+                "refusing to kill tracked session '{}' because task '{}' is missing",
+                candidate.session, candidate.task_id
+            ));
+            continue;
+        };
+        if !task_status_allows_runtime_cleanup(task.status) {
+            warnings.push(format!(
+                "refusing to kill tracked session '{}' because task '{}' is not terminal",
+                candidate.session, candidate.task_id
+            ));
+            continue;
+        }
+        if !is_orchestration_owned_session(&candidate.session) {
+            warnings.push(format!(
+                "refusing to kill non-mmux session '{}'",
+                candidate.session
+            ));
+            continue;
+        }
+        targets.push(candidate.session.clone());
+    }
+    targets.sort();
+    targets.dedup();
+    (targets, warnings)
+}
+
 fn decorate_orchestration_status_with_local_runtime(
     status: &mut OrchestrationStatus,
     live_sessions: &[LocalSessionInfo],
@@ -541,7 +675,7 @@ fn active_attached_task_exists(
     state
         .tasks
         .get(task_id)
-        .is_some_and(|task| !task.status.is_finished())
+        .is_some_and(|task| !task_status_allows_runtime_cleanup(task.status))
 }
 
 fn plan_local_startup_reconciliation(
@@ -3202,25 +3336,16 @@ impl TmuxMcpServer {
                 )),
             ),
             Tool::new(
-                "orchestration_cleanup_zombies",
-                "Dry-run or explicitly clean live local mmux-* sessions absent from durable orchestration storage",
+                "orchestration_prune",
+                "Dry-run or explicitly prune orchestration-owned live sessions, stale session records, and finished plans",
                 Arc::new(tool_schema(
                     json!({
                         "dry_run": { "type": "boolean", "description": "When true, only report candidates. Default: true." },
-                        "older_than_seconds": { "type": "integer", "description": "Only include candidates at least this old." },
-                        "node": { "type": "string", "description": "Execution node id. Only local is supported in v1; default: local." }
-                    }),
-                    None,
-                )),
-            ),
-            Tool::new(
-                "orchestration_prune_store",
-                "Dry-run or explicitly prune stale durable task sessions and finished plans",
-                Arc::new(tool_schema(
-                    json!({
-                        "dry_run": { "type": "boolean", "description": "When true, only report candidates. Default: true." },
-                        "sessions_only": { "type": "boolean", "description": "Scope pruning to task sessions and skip finished plan pruning." },
-                        "older_than_days": { "type": "integer", "description": "Only include stale task sessions last seen at least this many days ago." },
+                        "older_than_days": { "type": "integer", "description": "Only include candidates at least this many days old. Default: 14." },
+                        "include_live_untracked_sessions": { "type": "boolean", "description": "Include live mmux-* sessions absent from durable storage. Default: true." },
+                        "include_stale_session_records": { "type": "boolean", "description": "Include durable task session records whose local tmux session is missing and task is finished. Default: true." },
+                        "include_finished_plans": { "type": "boolean", "description": "Include finished plans whose contained tasks are all finished. Default: true." },
+                        "include_tracked_finished_sessions": { "type": "boolean", "description": "Include live local tmux sessions attached only to finished tasks. Default: true." },
                         "node": { "type": "string", "description": "Execution node id. Only local is supported in v1; default: local." }
                     }),
                     None,
@@ -3623,39 +3748,57 @@ impl TmuxMcpServer {
         }
     }
 
-    async fn orchestration_cleanup_zombies_tool(
+    async fn orchestration_prune_tool(
         &self,
         args: Map<String, Value>,
     ) -> Result<CallToolResult, McpError> {
-        let args: OrchestrationCleanupZombiesArgs =
-            parse_tool_args("orchestration_cleanup_zombies", args)?;
+        let args: OrchestrationPruneArgs = parse_tool_args("orchestration_prune", args)?;
         if args.node != "local" {
             return Err(McpError::invalid_request(
-                "orchestration_cleanup_zombies supports only node='local' in v1",
+                "orchestration_prune supports only node='local' in v1",
                 None,
             ));
         }
 
         let mut warnings = Vec::new();
-        let live_sessions = match self.list_live_local_sessions().await {
-            Ok(live_sessions) => live_sessions,
-            Err(error) => {
-                warnings.push(format!("local runtime unavailable: {error}"));
-                Vec::new()
-            }
-        };
+        let older_than_days = older_than_days_or_default(args.older_than_days);
+        let older_than_seconds =
+            older_than_days_to_seconds(older_than_days).map_err(mcp_invalid_request)?;
+        let cutoff_ms =
+            cutoff_ms_for_older_than_days(older_than_days).map_err(mcp_invalid_request)?;
+        let include = prune_selection(&args);
+        let live_sessions = self
+            .list_live_local_sessions()
+            .await
+            .map_err(mcp_invalid_request)?;
+        let live_session_names = live_sessions
+            .iter()
+            .map(|session| session.session.clone())
+            .collect::<HashSet<_>>();
         let state = self.orchestration.snapshot().map_err(mcp_invalid_request)?;
-        let candidates = cleanup_candidates_from_live_sessions(
-            "local",
-            &live_sessions,
-            &durable_session_keys(&state),
-            args.older_than_seconds,
-            now_ms() / 1000,
-        );
-        let mut killed = Vec::new();
+        let durable_keys = durable_session_keys(&state);
+        let live_untracked_session_candidates = if include.live_untracked_sessions {
+            cleanup_candidates_from_live_sessions(
+                "local",
+                &live_sessions,
+                &durable_keys,
+                Some(older_than_seconds),
+                now_ms() / 1000,
+            )
+        } else {
+            Vec::new()
+        };
+        let tracked_finished_session_candidates = if include.tracked_finished_sessions {
+            tracked_finished_session_candidates(&state, &live_sessions, cutoff_ms)
+        } else {
+            Vec::new()
+        };
+
+        let mut killed_live_untracked_sessions = Vec::new();
+        let mut killed_tracked_finished_sessions = Vec::new();
         if !args.dry_run {
-            let durable_keys = durable_session_keys(&state);
-            let (targets, target_warnings) = safe_cleanup_kill_targets(&candidates, &durable_keys);
+            let (targets, target_warnings) =
+                safe_cleanup_kill_targets(&live_untracked_session_candidates, &durable_keys);
             warnings.extend(target_warnings);
             for target in targets {
                 match self
@@ -3666,52 +3809,74 @@ impl TmuxMcpServer {
                     )
                     .await
                 {
-                    Ok(_) => killed.push(target),
+                    Ok(_) => killed_live_untracked_sessions.push(target),
                     Err(error) => {
                         warnings.push(format!("failed to kill candidate '{}': {}", target, error))
                     }
                 }
             }
+
+            let (targets, target_warnings) =
+                safe_tracked_finished_kill_targets(&tracked_finished_session_candidates, &state);
+            warnings.extend(target_warnings);
+            for target in targets {
+                match self
+                    .node_tmux(
+                        &args.node,
+                        vec!["kill-session".into(), "-t".into(), target.clone()],
+                        Duration::from_secs(20),
+                    )
+                    .await
+                {
+                    Ok(_) => killed_tracked_finished_sessions.push(target),
+                    Err(error) => warnings.push(format!(
+                        "failed to kill tracked finished session '{}': {}",
+                        target, error
+                    )),
+                }
+            }
         }
 
-        Self::json_result(OrchestrationCleanupZombiesResult {
+        let mut live_session_names_for_store = live_session_names;
+        if include.tracked_finished_sessions && include.stale_session_records {
+            for candidate in &tracked_finished_session_candidates {
+                live_session_names_for_store.remove(&candidate.session);
+            }
+        }
+        let store_report = if include.stale_session_records || include.finished_plans {
+            self.orchestration
+                .prune_stale_session_records(
+                    &live_session_names_for_store,
+                    args.dry_run,
+                    include.stale_session_records,
+                    include.finished_plans,
+                    Some(older_than_days),
+                )
+                .map_err(mcp_invalid_request)?
+        } else {
+            LocalPruneStoreReport {
+                dry_run: args.dry_run,
+                include_stale_session_records: false,
+                include_finished_plans: false,
+                candidates: Vec::new(),
+                pruned_session_count: 0,
+                pruned_plan_count: 0,
+            }
+        };
+        Self::json_result(OrchestrationPruneResult {
             node: args.node,
             dry_run: args.dry_run,
-            candidates,
-            killed,
+            older_than_days,
+            include,
+            live_untracked_session_candidates,
+            killed_live_untracked_sessions,
+            tracked_finished_session_candidates,
+            killed_tracked_finished_sessions,
+            stale_session_record_candidates: store_report.candidates,
+            pruned_session_record_count: store_report.pruned_session_count,
+            pruned_plan_count: store_report.pruned_plan_count,
             warnings,
         })
-    }
-
-    async fn orchestration_prune_store_tool(
-        &self,
-        args: Map<String, Value>,
-    ) -> Result<CallToolResult, McpError> {
-        let args: OrchestrationPruneStoreArgs = parse_tool_args("orchestration_prune_store", args)?;
-        if args.node != "local" {
-            return Err(McpError::invalid_request(
-                "orchestration_prune_store supports only node='local' in v1",
-                None,
-            ));
-        }
-        let live_sessions = self
-            .list_live_local_sessions()
-            .await
-            .map_err(mcp_invalid_request)?;
-        let live_session_names = live_sessions
-            .into_iter()
-            .map(|session| session.session)
-            .collect::<HashSet<_>>();
-        let report = self
-            .orchestration
-            .prune_stale_session_records(
-                &live_session_names,
-                args.dry_run,
-                args.sessions_only,
-                args.older_than_days,
-            )
-            .map_err(mcp_invalid_request)?;
-        Self::json_result(report)
     }
 
     async fn orchestration_report_tool(
@@ -5857,10 +6022,7 @@ impl ServerHandler for TmuxMcpServer {
         let args = request.arguments.unwrap_or_default();
         match request.name.as_ref() {
             "orchestration_status" => return self.orchestration_status_tool_async(args).await,
-            "orchestration_cleanup_zombies" => {
-                return self.orchestration_cleanup_zombies_tool(args).await
-            }
-            "orchestration_prune_store" => return self.orchestration_prune_store_tool(args).await,
+            "orchestration_prune" => return self.orchestration_prune_tool(args).await,
             "orchestration_report" => return self.orchestration_report_tool(args).await,
             "orchestration_next" => return self.orchestration_next_tool(args).await,
             "task_start" => return self.task_start_tool(args).await,
@@ -7937,13 +8099,14 @@ pub struct LocalDeleteProjectReport {
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
 pub struct LocalPruneStoreReport {
     pub dry_run: bool,
-    pub sessions_only: bool,
+    pub include_stale_session_records: bool,
+    pub include_finished_plans: bool,
     pub candidates: Vec<LocalPruneSessionCandidate>,
     pub pruned_session_count: usize,
     pub pruned_plan_count: usize,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct LocalPruneSessionCandidate {
     pub key: String,
     pub session: String,
@@ -7952,12 +8115,62 @@ pub struct LocalPruneSessionCandidate {
     pub reason: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct LocalPruneLiveTrackedSessionCandidate {
+    pub node_id: String,
+    pub session: String,
+    pub task_id: String,
+    pub task_status: String,
+    pub last_seen_ms: u64,
+    pub created_at_ms: Option<u64>,
+    pub reason: String,
+}
+
+fn stale_session_candidates(
+    state: &OrchestrationState,
+    live_local_sessions: &HashSet<String>,
+    cutoff_ms: Option<u64>,
+) -> Vec<LocalPruneSessionCandidate> {
+    let mut candidates = state
+        .tasks
+        .values()
+        .filter_map(|task| {
+            let session = task.session.as_ref()?;
+            if session.node_id.0 != "local" {
+                return None;
+            }
+            if live_local_sessions.contains(&session.session.0) {
+                return None;
+            }
+            if cutoff_ms.is_some_and(|cutoff_ms| session.last_seen_ms > cutoff_ms) {
+                return None;
+            }
+            if !task_status_allows_runtime_cleanup(task.status) {
+                return None;
+            }
+            Some(LocalPruneSessionCandidate {
+                key: session.key(),
+                session: session.session.0.clone(),
+                task_id: task.id.0.clone(),
+                last_seen_ms: session.last_seen_ms,
+                reason: "missing local tmux session attached only to finished tasks".into(),
+            })
+        })
+        .collect::<Vec<_>>();
+    candidates.sort_by(|left, right| {
+        left.session
+            .cmp(&right.session)
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    candidates
+}
+
 pub(crate) fn prune_finished_plans(
     state: &mut OrchestrationState,
-    sessions_only: bool,
+    include_finished_plans: bool,
     cutoff_ms: Option<u64>,
 ) -> usize {
-    if sessions_only {
+    if !include_finished_plans {
         return 0;
     }
     let plan_ids = state
@@ -8003,7 +8216,8 @@ pub fn local_prune_store(
     store_path: Option<&Path>,
     live_local_sessions: &HashSet<String>,
     dry_run: bool,
-    sessions_only: bool,
+    include_stale_session_records: bool,
+    include_finished_plans: bool,
     older_than_days: Option<u64>,
 ) -> Result<LocalPruneStoreReport, String> {
     let store_path = mmux_node::resolve_store_path(store_path)?;
@@ -8011,7 +8225,8 @@ pub fn local_prune_store(
     let Some(mut state) = store.load()? else {
         return Ok(LocalPruneStoreReport {
             dry_run,
-            sessions_only,
+            include_stale_session_records,
+            include_finished_plans,
             candidates: Vec::new(),
             pruned_session_count: 0,
             pruned_plan_count: 0,
@@ -8025,32 +8240,11 @@ pub fn local_prune_store(
                 .ok_or_else(|| format!("--older-than-days value {days} is too large"))
         })
         .transpose()?;
-    let mut candidates = state
-        .tasks
-        .values()
-        .filter_map(|task| {
-            let session = task.session.as_ref()?;
-            if session.node_id.0 != "local" {
-                return None;
-            }
-            if live_local_sessions.contains(&session.session.0) {
-                return None;
-            }
-            if cutoff_ms.is_some_and(|cutoff_ms| session.last_seen_ms > cutoff_ms) {
-                return None;
-            }
-            if !task.status.is_finished() {
-                return None;
-            }
-            Some(LocalPruneSessionCandidate {
-                key: session.key(),
-                session: session.session.0.clone(),
-                task_id: task.id.0.clone(),
-                last_seen_ms: session.last_seen_ms,
-                reason: "missing local tmux session attached only to finished tasks".into(),
-            })
-        })
-        .collect::<Vec<_>>();
+    let mut candidates = if include_stale_session_records {
+        stale_session_candidates(&state, live_local_sessions, cutoff_ms)
+    } else {
+        Vec::new()
+    };
     candidates.sort_by(|left, right| {
         left.session
             .cmp(&right.session)
@@ -8064,20 +8258,21 @@ pub fn local_prune_store(
                 task.session = None;
             }
         }
-        prune_finished_plans(&mut preview, sessions_only, cutoff_ms)
+        prune_finished_plans(&mut preview, include_finished_plans, cutoff_ms)
     } else {
         for candidate in &candidates {
             if let Some(task) = state.tasks.get_mut(&TaskId(candidate.task_id.clone())) {
                 task.session = None;
             }
         }
-        let pruned_plan_count = prune_finished_plans(&mut state, sessions_only, cutoff_ms);
+        let pruned_plan_count = prune_finished_plans(&mut state, include_finished_plans, cutoff_ms);
         store.save(&state, now_ms)?;
         pruned_plan_count
     };
     Ok(LocalPruneStoreReport {
         dry_run,
-        sessions_only,
+        include_stale_session_records,
+        include_finished_plans,
         candidates,
         pruned_session_count,
         pruned_plan_count,
@@ -8113,6 +8308,49 @@ pub fn local_project_session_names(
         .map(|session| session.session.0.clone())
         .collect();
     Ok(sessions)
+}
+
+pub fn local_orchestration_session_names(
+    store_path: Option<&Path>,
+) -> Result<HashSet<String>, String> {
+    let store_path = mmux_node::resolve_store_path(store_path)?;
+    let store = store::OrchestrationStore::open(store_path)?;
+    let Some(state) = store.load()? else {
+        return Ok(HashSet::new());
+    };
+    Ok(state
+        .tasks
+        .values()
+        .filter_map(|task| task.session.as_ref())
+        .filter(|session| session.node_id.0 == "local")
+        .map(|session| session.session.0.clone())
+        .collect())
+}
+
+pub fn local_finished_orchestration_session_names(
+    store_path: Option<&Path>,
+    older_than_days: u64,
+) -> Result<HashSet<String>, String> {
+    let cutoff_ms = cutoff_ms_for_older_than_days(older_than_days)?;
+    let store_path = mmux_node::resolve_store_path(store_path)?;
+    let store = store::OrchestrationStore::open(store_path)?;
+    let Some(state) = store.load()? else {
+        return Ok(HashSet::new());
+    };
+    Ok(state
+        .tasks
+        .values()
+        .filter_map(|task| {
+            let session = task.session.as_ref()?;
+            if session.node_id.0 != "local"
+                || !task_status_allows_runtime_cleanup(task.status)
+                || session.last_seen_ms > cutoff_ms
+            {
+                return None;
+            }
+            Some(session.session.0.clone())
+        })
+        .collect())
 }
 
 pub fn main_entry_from<I, T>(args: I)
@@ -8701,7 +8939,7 @@ mod tests {
             "orchestration_status",
             "orchestration_next",
             "orchestration_report",
-            "orchestration_cleanup_zombies",
+            "orchestration_prune",
         ] {
             assert!(admin_names.contains(&expected), "missing {expected}");
         }
@@ -9197,20 +9435,30 @@ mod tests {
     }
 
     #[test]
-    fn test_finished_missing_stored_session_remains_historical() {
-        let (mut state, task_id) = state_with_task(TaskStatus::Delivered);
-        state
-            .record_session(&task_id, recorded_session("mmux-finished"), 200)
-            .unwrap();
+    fn test_finished_missing_stored_sessions_remain_historical() {
+        for status in [
+            TaskStatus::Failed,
+            TaskStatus::Passed,
+            TaskStatus::Delivered,
+            TaskStatus::Canceled,
+        ] {
+            let (mut state, task_id) = state_with_task(status);
+            state
+                .record_session(&task_id, recorded_session("mmux-finished"), 200)
+                .unwrap();
 
-        let actions =
-            plan_local_startup_reconciliation(&state, &[], &profile_registry(ready_profile()));
+            let actions =
+                plan_local_startup_reconciliation(&state, &[], &profile_registry(ready_profile()));
 
-        assert!(matches!(
-            actions.as_slice(),
-            [LocalStartupReconciliationAction::Historical { key }]
-                if key == "local:mmux-finished"
-        ));
+            assert!(
+                matches!(
+                    actions.as_slice(),
+                    [LocalStartupReconciliationAction::Historical { key }]
+                        if key == "local:mmux-finished"
+                ),
+                "status {status:?} should not be recreated on startup"
+            );
+        }
     }
 
     #[test]
@@ -9285,12 +9533,12 @@ mod tests {
         store.save(&state, 107).unwrap();
 
         let live = HashSet::new();
-        let dry_run = local_prune_store(Some(&dir), &live, true, false, None).unwrap();
+        let dry_run = local_prune_store(Some(&dir), &live, true, true, true, None).unwrap();
         assert_eq!(dry_run.pruned_session_count, 1);
         assert_eq!(dry_run.pruned_plan_count, 1);
         assert_eq!(store.load().unwrap().unwrap().plans.len(), 1);
 
-        let pruned = local_prune_store(Some(&dir), &live, false, false, None).unwrap();
+        let pruned = local_prune_store(Some(&dir), &live, false, true, true, None).unwrap();
         assert_eq!(pruned.pruned_session_count, 1);
         assert_eq!(pruned.pruned_plan_count, 1);
         let loaded = store.load().unwrap().unwrap();
@@ -11230,11 +11478,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_orchestration_cleanup_zombies_tool_dry_run_and_explicit_cleanup() {
+    async fn test_orchestration_prune_tool_dry_run_and_explicit_cleanup() {
         let dir = unique_temp_dir("mmux-mcp-cleanup-zombies");
         let local_dir = unique_temp_dir("mmux-mcp-cleanup-zombies-local");
         let server = test_coding_server(&dir, &local_dir, profile_registry(ready_profile())).await;
         let task = create_test_task(&server, "Cleanup").await;
+        call_orchestration(
+            &server,
+            "task_status_update",
+            json!({
+                "task_id": task.id.0,
+                "status": "Delivered",
+                "outcome": "done"
+            }),
+        )
+        .unwrap();
 
         for session in [
             "mmux-zombie-cleanup",
@@ -11248,9 +11506,13 @@ mod tests {
             .record_session(task.id.clone(), recorded_session("mmux-recorded-cleanup"))
             .unwrap();
 
-        let dry_run: OrchestrationCleanupZombiesResult = result_json(
+        let dry_run: OrchestrationPruneResult = result_json(
             &server
-                .orchestration_cleanup_zombies_tool(object_args(json!({})))
+                .orchestration_prune_tool(object_args(json!({
+                    "older_than_days": 0,
+                    "include_stale_session_records": false,
+                    "include_finished_plans": false
+                })))
                 .await
                 .unwrap(),
         );
@@ -11258,11 +11520,19 @@ mod tests {
         assert!(dry_run.dry_run);
         assert_eq!(
             dry_run
-                .candidates
+                .live_untracked_session_candidates
                 .iter()
                 .map(|candidate| candidate.session.as_str())
                 .collect::<Vec<_>>(),
             vec!["mmux-zombie-cleanup"]
+        );
+        assert_eq!(
+            dry_run
+                .tracked_finished_session_candidates
+                .iter()
+                .map(|candidate| candidate.session.as_str())
+                .collect::<Vec<_>>(),
+            vec!["mmux-recorded-cleanup"]
         );
         server
             .startup_warnings
@@ -11289,17 +11559,28 @@ mod tests {
             );
         }
 
-        let cleanup: OrchestrationCleanupZombiesResult = result_json(
+        let cleanup: OrchestrationPruneResult = result_json(
             &server
-                .orchestration_cleanup_zombies_tool(object_args(json!({
-                    "dry_run": false
+                .orchestration_prune_tool(object_args(json!({
+                    "dry_run": false,
+                    "older_than_days": 0,
+                    "include_stale_session_records": false,
+                    "include_finished_plans": false
                 })))
                 .await
                 .unwrap(),
         );
 
-        assert_eq!(cleanup.killed, vec!["mmux-zombie-cleanup"]);
+        assert_eq!(
+            cleanup.killed_live_untracked_sessions,
+            vec!["mmux-zombie-cleanup"]
+        );
+        assert_eq!(
+            cleanup.killed_tracked_finished_sessions,
+            vec!["mmux-recorded-cleanup"]
+        );
         assert!(!test_session_exists(&server, "mmux-zombie-cleanup").await);
+        assert!(!test_session_exists(&server, "mmux-recorded-cleanup").await);
         let status_after_cleanup: OrchestrationStatus = result_json(
             &server
                 .orchestration_status_tool_async(object_args(json!({})))
@@ -11311,7 +11592,7 @@ mod tests {
             .warnings
             .iter()
             .any(|warning| warning.contains("mmux-zombie-cleanup")));
-        for session in ["mmux-recorded-cleanup", "user-cleanup"] {
+        for session in ["user-cleanup"] {
             assert!(
                 test_session_exists(&server, session).await,
                 "{session} should not be killed"

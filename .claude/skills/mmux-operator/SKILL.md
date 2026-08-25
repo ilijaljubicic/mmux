@@ -37,8 +37,8 @@ Discovery and state tools:
   task sessions, warnings, cleanup candidates, and runtime state.
 - `task_get`: read one full stored task body, including objective, scope,
   gates, outcome/evidence, run spec, session, and incoming/outgoing edges.
-- `plan_get`: read one full stored plan body, including the Markdown brief that
-  `plan_list` omits.
+- `plan_get`: read one full stored plan body, including the Markdown brief and
+  optional plan-wide instructions that `plan_list` omits.
 - `project_list`, `list_sessions(project_id)`, `admin_list_node_sessions`,
   `session_info`, `check_state`: inspect durable and live runtime state.
 
@@ -47,7 +47,7 @@ Project, plan, and task tools:
 - `project_create`: create a project boundary through MCP.
 - `plan_create`, `plan_list`, `plan_update`, `plan_status_update`, `plan_get`:
   manage plan work-package documents and status; `plan_get` returns one full
-  stored plan body including its brief.
+  stored plan body including its brief and optional instructions.
 - `task_create`, `task_update`, `task_status_update`: manage
   task metadata, optional scheduler `run_spec`, task session, and state.
 - `task_edge_add`, `task_edge_remove`: maintain task relationships.
@@ -168,7 +168,7 @@ Use this flow when coordinating tasks through the orchestration tools:
    scraping tmux output. Pass `include_completed=true` when delivered,
    canceled, or failed tasks matter. Use `task_get` for one full stored task
    body when exporting or inspecting exact task fields, and `plan_get` for one
-   full stored plan brief.
+   full stored plan brief plus optional plan-wide instructions.
 3. Create or select a project with CLI
    `mmux create-project <title> --description <text>` for offline setup or MCP
    `project_create`/`project_list` through a running controller. Projects have
@@ -176,8 +176,11 @@ Use this flow when coordinating tasks through the orchestration tools:
    only advertised and callable when the controller starts with
    `--enable-admin-tools`; `project_list` is always available.
 4. Create a plan with `plan_create`: required `project_id`, `title`, and
-   Markdown `brief` with enough context and detail to derive tasks. Create
-   tasks with `task_create`: required `plan_id`, `title`, `objective`,
+   Markdown `brief` with enough context and detail to derive tasks. Optional
+   Markdown `instructions` are rendered into every task, validation, review,
+   and quality-guard prompt for that plan; use `plan_update` to change them,
+   or set `instructions` to an empty string to clear them. Create tasks with
+   `task_create`: required `plan_id`, `title`, `objective`,
    `include_paths`, `exclude_paths`, `notes`, optional `gates`, and optional
    scheduler `run_spec`. The response is the created task object directly;
    read `id` from the top level.
@@ -214,7 +217,8 @@ Use this flow when coordinating tasks through the orchestration tools:
 9. Record existing or manually adopted coder sessions with `session_record`.
 10. Use `coding_task_send` for initial task delegation. Pass `task_id_or_slug`
     and a concrete instruction; mmux builds deterministic task context from
-    orchestration state and appends your instruction before sending. Use
+    orchestration state, includes plan-wide instructions when configured, and
+    appends your instruction before sending. Use
     `template = "task"` for implementation/delegation, `template = "validate"`
     for gate validation, `template = "review"` for bug/risk review, and
     `template = "quality-guard"` for maintainability, architecture fit, naming,
@@ -256,11 +260,12 @@ Use this flow when coordinating tasks through the orchestration tools:
     `validation_blocked_by`, `unapproved_validator_count`, and
     `failed_validator_count`.
     Supported task edges in v1 are `DependsOn`, `ParentOf`, `Validates`,
-    `Audits`, `Refines`, `Supersedes`, and `Related`. `DependsOn`, `ParentOf`,
-    and `Validates` have orchestration semantics. `Audits` is non-gating review
-    traceability; use `Validates` when an audit must approve gates before
-    dependent work can start. `Refines`, `Supersedes`, and `Related` are durable
-    traceability/navigation relations.
+    `Audits`, `Supersedes`, and `Related`. `DependsOn`, `ParentOf`,
+    `Validates`, and `Supersedes` have orchestration semantics. `Audits` is
+    non-gating review traceability; use `Validates` when an audit must approve
+    gates before dependent work can start. `Supersedes` marks the `to` task as
+    replaced by the `from` task, so the replaced task is skipped by scheduling
+    and explicit starts. `Related` is durable traceability/navigation only.
 13. Update task state with `task_status_update`. Include `status` and a concise
     `outcome`; include `blockers` when blocked. Use `task_report` for the same
     durable result shape when an external controller is committing worker or
@@ -270,6 +275,11 @@ Use this flow when coordinating tasks through the orchestration tools:
 Task-owned `gates` are validation checks. Moving a gated task to `Passed` or
 `Delivered` requires an operator-recorded outcome. `Validates` edges give those
 checks orchestration meaning for downstream scheduling.
+
+Plan-wide `instructions` are durable guidance shared by every task in the plan.
+Use them for recurring constraints such as reporting style, scope discipline, or
+project-specific operating rules. Do not use them as substitutes for task-owned
+`gates`; gates remain the concrete acceptance checks for a specific task.
 
 `coding_task_send` templates answer different orchestration questions:
 
@@ -328,8 +338,8 @@ update, and status chrome from supported coder CLIs to reduce token waste. Use
 `raw = true` only when compact output is insufficient and you need the exact
 tmux pane text.
 
-Use `orchestration_cleanup_zombies` only when intentionally cleaning
-orchestration-owned sessions. Start with dry-run behavior.
+Use `orchestration_prune` only when intentionally cleaning orchestration-owned
+sessions or stale durable orchestration records. Start with dry-run behavior.
 
 ## Delegation Prompts
 

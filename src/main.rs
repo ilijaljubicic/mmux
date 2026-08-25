@@ -32,8 +32,8 @@ fn main() {
         Some("delete-project") => {
             std::process::exit(run_delete_project(None, &args[2..]));
         }
-        Some("prune-store") => {
-            std::process::exit(run_prune_store(None, &args[2..]));
+        Some("prune") => {
+            std::process::exit(run_prune(None, &args[2..]));
         }
         Some("--store-path") if args.get(3).and_then(|arg| arg.to_str()) == Some("tmux") => {
             std::process::exit(run_tmux_proxy_with_store(
@@ -68,8 +68,8 @@ fn main() {
                 &args[4..],
             ));
         }
-        Some("--store-path") if args.get(3).and_then(|arg| arg.to_str()) == Some("prune-store") => {
-            std::process::exit(run_prune_store(args.get(2).map(PathBuf::from), &args[4..]));
+        Some("--store-path") if args.get(3).and_then(|arg| arg.to_str()) == Some("prune") => {
+            std::process::exit(run_prune(args.get(2).map(PathBuf::from), &args[4..]));
         }
         Some(value) if value.starts_with("--store-path=") => {
             let store_path = PathBuf::from(value.trim_start_matches("--store-path="));
@@ -87,9 +87,7 @@ fn main() {
                 Some("delete-project") => {
                     std::process::exit(run_delete_project(Some(store_path), &args[3..]))
                 }
-                Some("prune-store") => {
-                    std::process::exit(run_prune_store(Some(store_path), &args[3..]))
-                }
+                Some("prune") => std::process::exit(run_prune(Some(store_path), &args[3..])),
                 _ => {}
             }
         }
@@ -124,7 +122,7 @@ fn print_root_help() {
         "  delete-project <id-or-slug>  Delete an orchestration project and its plans/tasks from mmux.db"
     );
     println!("  list-projects           List durable orchestration projects from mmux.db");
-    println!("  prune-store             Prune stale task sessions and finished plans from mmux.db");
+    println!("  prune                   Prune orchestration-owned live sessions, stale session records, and finished plans");
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -353,65 +351,151 @@ fn parse_delete_project_args(raw_args: &[OsString]) -> Result<String, String> {
     Ok(project_id_or_slug)
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct PruneStoreArgs {
-    dry_run: bool,
-    sessions_only: bool,
-    older_than_days: Option<u64>,
+const DEFAULT_PRUNE_OLDER_THAN_DAYS: u64 = 14;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct PruneInclude {
+    live_untracked_sessions: bool,
+    stale_session_records: bool,
+    finished_plans: bool,
+    tracked_finished_sessions: bool,
 }
 
-fn run_prune_store(store_path: Option<PathBuf>, raw_args: &[OsString]) -> i32 {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct PruneArgs {
+    dry_run: bool,
+    older_than_days: u64,
+    include: PruneInclude,
+}
+
+fn run_prune(store_path: Option<PathBuf>, raw_args: &[OsString]) -> i32 {
     if raw_args
         .iter()
         .any(|arg| matches!(arg.to_str(), Some("-h" | "--help")))
     {
-        print_prune_store_help();
+        print_prune_help();
         return 0;
     }
-    let args = match parse_prune_store_args(raw_args) {
+    let args = match parse_prune_args(raw_args) {
         Ok(args) => args,
         Err(error) => {
-            eprintln!("mmux prune-store: {error}");
+            eprintln!("mmux prune: {error}");
             return 2;
         }
     };
     let store_path = match mmux_node::resolve_store_path(store_path.as_deref()) {
         Ok(path) => path,
         Err(error) => {
-            eprintln!("mmux prune-store: {error}");
+            eprintln!("mmux prune: {error}");
             return 2;
         }
     };
-    let live_local_sessions = match live_local_tmux_sessions(&store_path) {
+    let live_session_infos = match live_local_tmux_session_infos(&store_path) {
         Ok(sessions) => sessions,
         Err(error) => {
-            eprintln!("mmux prune-store: {error}");
+            eprintln!("mmux prune: {error}");
             return 1;
         }
     };
+    let live_local_sessions = live_session_infos
+        .iter()
+        .map(|session| session.name.clone())
+        .collect::<HashSet<_>>();
+    let durable_session_names =
+        match mmux_controller::local_orchestration_session_names(Some(&store_path)) {
+            Ok(sessions) => sessions,
+            Err(error) => {
+                eprintln!("mmux prune: {error}");
+                return 1;
+            }
+        };
+    let finished_session_names = match mmux_controller::local_finished_orchestration_session_names(
+        Some(&store_path),
+        args.older_than_days,
+    ) {
+        Ok(sessions) => sessions,
+        Err(error) => {
+            eprintln!("mmux prune: {error}");
+            return 1;
+        }
+    };
+    let live_untracked_sessions = if args.include.live_untracked_sessions {
+        prune_live_untracked_session_names(
+            &live_session_infos,
+            &durable_session_names,
+            args.older_than_days,
+        )
+    } else {
+        Vec::new()
+    };
+    let tracked_finished_sessions = if args.include.tracked_finished_sessions {
+        let mut sessions = live_local_sessions
+            .intersection(&finished_session_names)
+            .cloned()
+            .collect::<Vec<_>>();
+        sessions.sort();
+        sessions
+    } else {
+        Vec::new()
+    };
+    let mut killed_live_untracked_sessions = Vec::new();
+    let mut killed_tracked_finished_sessions = Vec::new();
+    if !args.dry_run {
+        for session in &live_untracked_sessions {
+            match kill_local_tmux_session(&store_path, session) {
+                Ok(()) => killed_live_untracked_sessions.push(session.clone()),
+                Err(error) => eprintln!("mmux prune: failed to kill '{session}': {error}"),
+            }
+        }
+        for session in &tracked_finished_sessions {
+            match kill_local_tmux_session(&store_path, session) {
+                Ok(()) => killed_tracked_finished_sessions.push(session.clone()),
+                Err(error) => eprintln!("mmux prune: failed to kill '{session}': {error}"),
+            }
+        }
+    }
+    let mut live_sessions_for_store = live_local_sessions;
+    if args.include.tracked_finished_sessions && args.include.stale_session_records {
+        for session in &tracked_finished_sessions {
+            live_sessions_for_store.remove(session);
+        }
+    }
     let report = match mmux_controller::local_prune_store(
         Some(&store_path),
-        &live_local_sessions,
+        &live_sessions_for_store,
         args.dry_run,
-        args.sessions_only,
-        args.older_than_days,
+        args.include.stale_session_records,
+        args.include.finished_plans,
+        Some(args.older_than_days),
     ) {
         Ok(report) => report,
         Err(error) => {
-            eprintln!("mmux prune-store: {error}");
+            eprintln!("mmux prune: {error}");
             return 1;
         }
     };
     if report.dry_run {
         println!(
-            "dry-run: would prune {} stale session record(s) and {} finished plan(s)",
-            report.pruned_session_count, report.pruned_plan_count
+            "dry-run: would kill {} untracked live session(s), kill {} tracked finished session(s), prune {} stale session record(s), and prune {} finished plan(s)",
+            live_untracked_sessions.len(),
+            tracked_finished_sessions.len(),
+            report.pruned_session_count,
+            report.pruned_plan_count
         );
     } else {
         println!(
-            "pruned {} stale session record(s) and {} finished plan(s)",
-            report.pruned_session_count, report.pruned_plan_count
+            "killed {} untracked live session(s), killed {} tracked finished session(s), pruned {} stale session record(s), and pruned {} finished plan(s)",
+            killed_live_untracked_sessions.len(),
+            killed_tracked_finished_sessions.len(),
+            report.pruned_session_count,
+            report.pruned_plan_count
         );
+    }
+    for session in live_untracked_sessions {
+        println!("{session}\tlive_untracked_session");
+    }
+    for session in tracked_finished_sessions {
+        println!("{session}\ttracked_finished_session");
     }
     for candidate in report.candidates {
         println!(
@@ -422,19 +506,24 @@ fn run_prune_store(store_path: Option<PathBuf>, raw_args: &[OsString]) -> i32 {
     0
 }
 
-fn print_prune_store_help() {
-    println!("usage: mmux prune-store [--dry-run] [--sessions-only] [--older-than-days <days>]");
+fn print_prune_help() {
+    println!("usage: mmux prune [--dry-run|--execute] [--older-than-days <days>] [--include-live-untracked-sessions] [--include-stale-session-records] [--include-finished-plans] [--include-tracked-finished-sessions]");
     println!();
-    println!("Prunes stale durable task sessions and finished plans from mmux.db.");
-    println!("Only missing local sessions attached exclusively to finished tasks are eligible.");
-    println!("Finished plans are pruned only when all contained tasks are finished.");
-    println!("Use --sessions-only to skip finished plan pruning.");
+    println!(
+        "Prunes orchestration-owned live sessions, stale session records, and finished plans."
+    );
+    println!("Defaults: dry-run, all include categories enabled, --older-than-days 14.");
+    println!("Pass one or more --include-* flags to scope pruning to only those categories.");
+    println!("Use --execute to kill sessions and mutate mmux.db.");
 }
 
-fn parse_prune_store_args(raw_args: &[OsString]) -> Result<PruneStoreArgs, String> {
-    let mut dry_run = false;
-    let mut sessions_only = false;
-    let mut older_than_days = None;
+fn parse_prune_args(raw_args: &[OsString]) -> Result<PruneArgs, String> {
+    let mut dry_run = true;
+    let mut older_than_days = DEFAULT_PRUNE_OLDER_THAN_DAYS;
+    let mut include_live_untracked_sessions = false;
+    let mut include_stale_session_records = false;
+    let mut include_finished_plans = false;
+    let mut include_tracked_finished_sessions = false;
     let mut index = 0;
 
     while index < raw_args.len() {
@@ -446,8 +535,24 @@ fn parse_prune_store_args(raw_args: &[OsString]) -> Result<PruneStoreArgs, Strin
                 dry_run = true;
                 index += 1;
             }
-            "--sessions-only" => {
-                sessions_only = true;
+            "--execute" => {
+                dry_run = false;
+                index += 1;
+            }
+            "--include-live-untracked-sessions" => {
+                include_live_untracked_sessions = true;
+                index += 1;
+            }
+            "--include-stale-session-records" => {
+                include_stale_session_records = true;
+                index += 1;
+            }
+            "--include-finished-plans" => {
+                include_finished_plans = true;
+                index += 1;
+            }
+            "--include-tracked-finished-sessions" => {
+                include_tracked_finished_sessions = true;
                 index += 1;
             }
             "--older-than-days" => {
@@ -456,12 +561,12 @@ fn parse_prune_store_args(raw_args: &[OsString]) -> Result<PruneStoreArgs, Strin
                     .ok_or_else(|| "--older-than-days requires a value".to_owned())?
                     .to_str()
                     .ok_or_else(|| "--older-than-days value must be valid UTF-8".to_owned())?;
-                older_than_days = Some(parse_days(value)?);
+                older_than_days = parse_days(value)?;
                 index += 2;
             }
             _ => {
                 if let Some(value) = text.strip_prefix("--older-than-days=") {
-                    older_than_days = Some(parse_days(value)?);
+                    older_than_days = parse_days(value)?;
                     index += 1;
                 } else {
                     return Err(format!("unknown argument '{text}'"));
@@ -470,10 +575,30 @@ fn parse_prune_store_args(raw_args: &[OsString]) -> Result<PruneStoreArgs, Strin
         }
     }
 
-    Ok(PruneStoreArgs {
+    let any_include = include_live_untracked_sessions
+        || include_stale_session_records
+        || include_finished_plans
+        || include_tracked_finished_sessions;
+    let include = if any_include {
+        PruneInclude {
+            live_untracked_sessions: include_live_untracked_sessions,
+            stale_session_records: include_stale_session_records,
+            finished_plans: include_finished_plans,
+            tracked_finished_sessions: include_tracked_finished_sessions,
+        }
+    } else {
+        PruneInclude {
+            live_untracked_sessions: true,
+            stale_session_records: true,
+            finished_plans: true,
+            tracked_finished_sessions: true,
+        }
+    };
+
+    Ok(PruneArgs {
         dry_run,
-        sessions_only,
         older_than_days,
+        include,
     })
 }
 
@@ -483,27 +608,101 @@ fn parse_days(value: &str) -> Result<u64, String> {
         .map_err(|_| format!("invalid --older-than-days value '{value}'"))
 }
 
-fn live_local_tmux_sessions(store_path: &PathBuf) -> Result<HashSet<String>, String> {
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LiveTmuxSession {
+    name: String,
+    created_at_seconds: Option<u64>,
+}
+
+fn live_local_tmux_session_infos(store_path: &PathBuf) -> Result<Vec<LiveTmuxSession>, String> {
     let socket = mmux_node::local_tmux_socket_path(store_path);
     let output = Command::new("tmux")
         .arg("-S")
         .arg(socket)
-        .args(["list-sessions", "-F", "#{session_name}"])
+        .args(["list-sessions", "-F", "#{session_name}|#{session_created}"])
         .output()
         .map_err(|error| format!("tmux failed to execute: {error}"))?;
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
         if stderr.contains("no server running") || stderr.contains("failed to connect to server") {
-            return Ok(HashSet::new());
+            return Ok(Vec::new());
         }
         return Err(format!("tmux list-sessions failed: {}", stderr.trim()));
     }
-    Ok(String::from_utf8_lossy(&output.stdout)
+    Ok(parse_live_tmux_session_infos(&String::from_utf8_lossy(
+        &output.stdout,
+    )))
+}
+
+fn parse_live_tmux_session_infos(output: &str) -> Vec<LiveTmuxSession> {
+    output
         .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(ToOwned::to_owned)
-        .collect())
+        .filter_map(|line| {
+            let line = line.trim();
+            if line.is_empty() || line == "No tmux sessions running" {
+                return None;
+            }
+            let fields = line.splitn(2, '|').collect::<Vec<_>>();
+            let name = fields.first().copied().unwrap_or("").trim();
+            if name.is_empty() {
+                return None;
+            }
+            Some(LiveTmuxSession {
+                name: name.to_owned(),
+                created_at_seconds: fields
+                    .get(1)
+                    .and_then(|value| value.trim().parse::<u64>().ok()),
+            })
+        })
+        .collect()
+}
+
+fn prune_live_untracked_session_names(
+    live_sessions: &[LiveTmuxSession],
+    durable_session_names: &HashSet<String>,
+    older_than_days: u64,
+) -> Vec<String> {
+    let Some(older_than_seconds) = older_than_days.checked_mul(86_400) else {
+        return Vec::new();
+    };
+    let now_seconds = unix_now_seconds();
+    let mut sessions = live_sessions
+        .iter()
+        .filter(|session| session.name.starts_with("mmux-"))
+        .filter(|session| !durable_session_names.contains(&session.name))
+        .filter(|session| {
+            session
+                .created_at_seconds
+                .and_then(|created| now_seconds.checked_sub(created))
+                .is_some_and(|age| age >= older_than_seconds)
+        })
+        .map(|session| session.name.clone())
+        .collect::<Vec<_>>();
+    sessions.sort();
+    sessions.dedup();
+    sessions
+}
+
+fn kill_local_tmux_session(store_path: &PathBuf, session: &str) -> Result<(), String> {
+    let socket = mmux_node::local_tmux_socket_path(store_path);
+    let output = Command::new("tmux")
+        .arg("-S")
+        .arg(socket)
+        .args(["kill-session", "-t", session])
+        .output()
+        .map_err(|error| format!("tmux failed to execute: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!("tmux kill-session failed: {}", stderr.trim()))
+}
+
+fn unix_now_seconds() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_else(|_| std::time::Duration::from_secs(0))
+        .as_secs()
 }
 
 fn run_attach_proxy(raw_args: &[OsString]) -> i32 {
@@ -924,10 +1123,10 @@ mod tests {
     }
 
     #[test]
-    fn prune_store_args_parse_dry_run_sessions_and_age() {
-        let args = parse_prune_store_args(&os_args(&[
+    fn prune_args_parse_dry_run_include_and_age() {
+        let args = parse_prune_args(&os_args(&[
             "--dry-run",
-            "--sessions-only",
+            "--include-stale-session-records",
             "--older-than-days",
             "7",
         ]))
@@ -935,31 +1134,60 @@ mod tests {
 
         assert_eq!(
             args,
-            PruneStoreArgs {
+            PruneArgs {
                 dry_run: true,
-                sessions_only: true,
-                older_than_days: Some(7),
+                older_than_days: 7,
+                include: PruneInclude {
+                    live_untracked_sessions: false,
+                    stale_session_records: true,
+                    finished_plans: false,
+                    tracked_finished_sessions: false,
+                },
             }
         );
     }
 
     #[test]
-    fn prune_store_args_accept_equals_age() {
-        let args = parse_prune_store_args(&os_args(&["--older-than-days=30"])).unwrap();
+    fn prune_args_default_to_dry_run_all_categories_and_fourteen_days() {
+        let args = parse_prune_args(&os_args(&[])).unwrap();
 
         assert_eq!(
             args,
-            PruneStoreArgs {
-                dry_run: false,
-                sessions_only: false,
-                older_than_days: Some(30),
+            PruneArgs {
+                dry_run: true,
+                older_than_days: 14,
+                include: PruneInclude {
+                    live_untracked_sessions: true,
+                    stale_session_records: true,
+                    finished_plans: true,
+                    tracked_finished_sessions: true,
+                },
             }
         );
     }
 
     #[test]
-    fn prune_store_args_reject_unknown_flags() {
-        let error = parse_prune_store_args(&os_args(&["--all"])).unwrap_err();
+    fn prune_args_accept_execute_and_equals_age() {
+        let args = parse_prune_args(&os_args(&["--execute", "--older-than-days=30"])).unwrap();
+
+        assert_eq!(
+            args,
+            PruneArgs {
+                dry_run: false,
+                older_than_days: 30,
+                include: PruneInclude {
+                    live_untracked_sessions: true,
+                    stale_session_records: true,
+                    finished_plans: true,
+                    tracked_finished_sessions: true,
+                },
+            }
+        );
+    }
+
+    #[test]
+    fn prune_args_reject_unknown_flags() {
+        let error = parse_prune_args(&os_args(&["--all"])).unwrap_err();
 
         assert!(error.contains("unknown argument"));
     }
