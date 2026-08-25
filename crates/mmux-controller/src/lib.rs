@@ -8436,6 +8436,12 @@ mod tests {
         std::env::temp_dir().join(format!("{prefix}-{}-{unique}", std::process::id()))
     }
 
+    fn test_tmux_config(prefix: &str) -> PathBuf {
+        let path = unique_temp_dir(prefix);
+        fs::write(&path, "").expect("write isolated tmux config");
+        path
+    }
+
     fn test_cli() -> Cli {
         Cli {
             host: "127.0.0.1".into(),
@@ -8560,9 +8566,11 @@ mod tests {
         local_store_path: &Path,
         profiles: ProfileRegistry,
     ) -> TmuxMcpServer {
-        let backend = mmux_node::EmbeddedNodeBackend::local(Some(local_store_path), None)
-            .await
-            .expect("local backend");
+        let tmux_config = test_tmux_config("mmux-test-tmux-conf");
+        let backend =
+            mmux_node::EmbeddedNodeBackend::local(Some(local_store_path), Some(&tmux_config))
+                .await
+                .expect("local backend");
         let (registry, _registry_handle) =
             Actor::spawn(None, NodeRegistryActor, Some("Local tmux node".into()))
                 .await

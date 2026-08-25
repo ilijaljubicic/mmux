@@ -1460,7 +1460,9 @@ mod tests {
     #[test]
     fn local_node_private_socket_new_session_returns() {
         let store = unique_temp_dir("mmux-node-store");
-        let local = LocalNode::new(Some(&store), None).unwrap();
+        let config = unique_temp_file("mmux-node-tmux-conf");
+        std::fs::write(&config, "").unwrap();
+        let local = LocalNode::new(Some(&store), Some(&config)).unwrap();
         let session = format!("mmux-test-{}", std::process::id());
 
         local
@@ -1470,6 +1472,7 @@ mod tests {
 
         let _ = local.tmux(&["kill-session", "-t", &session]);
         let _ = std::fs::remove_dir_all(store);
+        let _ = std::fs::remove_file(config);
     }
 
     #[test]
