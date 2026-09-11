@@ -26,6 +26,12 @@ cargo run -- controller --enable-local-node --tmux-config ./tmux.local.conf
 `--enable-local-node` on the controller or `mmux node --backend local` for a
 distributed local node, and is not valid with Microsandbox.
 
+The embedded-local controller preserves user tmux configuration but reconciles
+its private server against the durable orchestration store during startup.
+Live `mmux-*` sessions without a durable task-session record are removed,
+including sessions recreated asynchronously by restore plugins. Recorded
+sessions and non-`mmux-*` sessions are preserved.
+
 The controller exposes MCP at:
 
 ```text

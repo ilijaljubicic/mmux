@@ -72,6 +72,10 @@ mod store;
 const DEFAULT_CODING_READY_TIMEOUT_SECONDS: u64 = 120;
 const DEFAULT_NODE_EXECUTION_ACTOR_CALL_TIMEOUT: Duration = Duration::from_secs(30);
 const DEFAULT_PRUNE_OLDER_THAN_DAYS: u64 = 14;
+const STARTUP_ZOMBIE_SWEEP_MIN_WINDOW: Duration = Duration::from_secs(2);
+const STARTUP_ZOMBIE_SWEEP_QUIET_WINDOW: Duration = Duration::from_secs(1);
+const STARTUP_ZOMBIE_SWEEP_POLL_INTERVAL: Duration = Duration::from_millis(250);
+const STARTUP_ZOMBIE_SWEEP_MAX_WINDOW: Duration = Duration::from_secs(30);
 const SECONDS_PER_DAY: u64 = 86_400;
 const MILLIS_PER_DAY: u64 = 86_400_000;
 const ORCHESTRATION_SESSION_PREFIX: &str = "mmux";
@@ -353,6 +357,25 @@ struct SessionListEntry {
 struct LocalSessionInfo {
     session: String,
     created_at_seconds: Option<u64>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct StartupZombieSweepTiming {
+    min_window: Duration,
+    quiet_window: Duration,
+    poll_interval: Duration,
+    max_window: Duration,
+}
+
+impl Default for StartupZombieSweepTiming {
+    fn default() -> Self {
+        Self {
+            min_window: STARTUP_ZOMBIE_SWEEP_MIN_WINDOW,
+            quiet_window: STARTUP_ZOMBIE_SWEEP_QUIET_WINDOW,
+            poll_interval: STARTUP_ZOMBIE_SWEEP_POLL_INTERVAL,
+            max_window: STARTUP_ZOMBIE_SWEEP_MAX_WINDOW,
+        }
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -4052,7 +4075,115 @@ impl TmuxMcpServer {
         }
     }
 
+    async fn kill_untracked_startup_local_sessions(
+        &self,
+        live_sessions: &[LocalSessionInfo],
+    ) -> (Vec<String>, Vec<String>) {
+        let state = match self.orchestration.snapshot() {
+            Ok(state) => state,
+            Err(error) => {
+                return (
+                    Vec::new(),
+                    vec![format!(
+                        "startup zombie cleanup skipped orchestration snapshot: {error}"
+                    )],
+                )
+            }
+        };
+        let durable_keys = durable_session_keys(&state);
+        let candidates = cleanup_candidates_from_live_sessions(
+            "local",
+            live_sessions,
+            &durable_keys,
+            None,
+            now_ms() / 1000,
+        );
+        let (targets, mut warnings) = safe_cleanup_kill_targets(&candidates, &durable_keys);
+        let mut killed = Vec::new();
+        for target in targets {
+            match self
+                .node_tmux(
+                    "local",
+                    vec!["kill-session".into(), "-t".into(), target.clone()],
+                    Duration::from_secs(20),
+                )
+                .await
+            {
+                Ok(_) => killed.push(target),
+                Err(error) if is_tmux_missing_session_error(&error) => {}
+                Err(error) => warnings.push(format!(
+                    "startup zombie cleanup failed to kill session '{}': {}",
+                    target, error
+                )),
+            }
+        }
+        (killed, warnings)
+    }
+
+    async fn sweep_delayed_startup_zombies(
+        &self,
+        timing: StartupZombieSweepTiming,
+    ) -> (usize, Vec<String>) {
+        let started = Instant::now();
+        let mut quiet_since = started;
+        let mut previous_names: Option<Vec<String>> = None;
+        let mut killed_count = 0;
+        let mut warnings = Vec::new();
+
+        loop {
+            tokio::time::sleep(timing.poll_interval).await;
+            let live_sessions = match self.list_live_local_sessions().await {
+                Ok(live_sessions) => live_sessions,
+                Err(error) => {
+                    warnings.push(format!(
+                        "startup zombie cleanup stopped while listing local sessions: {error}"
+                    ));
+                    break;
+                }
+            };
+            let names = live_sessions
+                .iter()
+                .map(|session| session.session.clone())
+                .collect::<Vec<_>>();
+            let observed_at = Instant::now();
+            if previous_names.as_ref() != Some(&names) {
+                previous_names = Some(names);
+                quiet_since = observed_at;
+            }
+
+            let (killed, pass_warnings) = self
+                .kill_untracked_startup_local_sessions(&live_sessions)
+                .await;
+            warnings.extend(pass_warnings);
+            if !killed.is_empty() {
+                killed_count += killed.len();
+                quiet_since = Instant::now();
+            }
+
+            let now = Instant::now();
+            if now.duration_since(started) >= timing.min_window
+                && now.duration_since(quiet_since) >= timing.quiet_window
+            {
+                break;
+            }
+            if now.duration_since(started) >= timing.max_window {
+                warnings.push(format!(
+                    "startup zombie cleanup stopped after {:?} before the local tmux session inventory became quiet",
+                    timing.max_window
+                ));
+                break;
+            }
+        }
+
+        (killed_count, warnings)
+    }
+
     async fn reconcile_startup_local_sessions(&self) {
+        self.reconcile_startup_local_sessions_with_timing(StartupZombieSweepTiming::default())
+            .await;
+    }
+
+    async fn reconcile_startup_local_sessions_with_timing(&self, timing: StartupZombieSweepTiming) {
         let mut warnings = Vec::new();
         let live_sessions = match self.list_live_local_sessions().await {
             Ok(live_sessions) => live_sessions,
@@ -4074,6 +4205,12 @@ impl TmuxMcpServer {
                 return;
             }
         };
+        let (initially_killed, cleanup_warnings) = self
+            .kill_untracked_startup_local_sessions(&live_sessions)
+            .await;
+        let mut killed_count = initially_killed.len();
+        warnings.extend(cleanup_warnings);
+        let mut recreated_count = 0;
         for action in plan_local_startup_reconciliation(&state, &live_sessions, &self.profiles) {
             match action {
                 LocalStartupReconciliationAction::Recreate { record } => {
@@ -4111,6 +4248,7 @@ impl TmuxMcpServer {
                         .await
                     {
                         Ok(_) => {
+                            recreated_count += 1;
                             warnings.push(format!(
                                 "recreated stored active session '{}'; operator may need to provide fresh task context",
                                 record.key()
@@ -4131,6 +4269,17 @@ impl TmuxMcpServer {
                 }
                 LocalStartupReconciliationAction::Historical { .. } => {}
             }
+        }
+        if killed_count > 0 || recreated_count > 0 {
+            let (delayed_killed_count, cleanup_warnings) =
+                self.sweep_delayed_startup_zombies(timing).await;
+            killed_count += delayed_killed_count;
+            warnings.extend(cleanup_warnings);
+        }
+        if killed_count > 0 {
+            warnings.push(format!(
+                "startup zombie cleanup removed {killed_count} untracked mmux-* session(s) absent from durable task-session storage"
+            ));
         }
         self.extend_startup_warnings(warnings);
     }
@@ -11612,6 +11761,50 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_startup_reconciliation_removes_only_untracked_mmux_sessions() {
+        let dir = unique_temp_dir("mmux-mcp-reconcile-cleanup");
+        let local_dir = unique_temp_dir("mmux-mcp-reconcile-cleanup-local");
+        let server = test_coding_server(&dir, &local_dir, profile_registry(ready_profile())).await;
+        let task = create_test_task(&server, "Recorded").await;
+        for session in [
+            "mmux-startup-zombie",
+            "mmux-startup-recorded",
+            "user-startup-session",
+        ] {
+            test_create_session(&server, session, "sleep 30").await;
+        }
+        server
+            .orchestration
+            .record_session(task.id.clone(), recorded_session("mmux-startup-recorded"))
+            .unwrap();
+
+        server
+            .reconcile_startup_local_sessions_with_timing(StartupZombieSweepTiming {
+                min_window: Duration::from_millis(50),
+                quiet_window: Duration::from_millis(20),
+                poll_interval: Duration::from_millis(5),
+                max_window: Duration::from_secs(1),
+            })
+            .await;
+
+        assert!(!test_session_exists(&server, "mmux-startup-zombie").await);
+        assert!(test_session_exists(&server, "mmux-startup-recorded").await);
+        assert!(test_session_exists(&server, "user-startup-session").await);
+        assert!(server
+            .startup_warnings
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|warning| warning.contains("removed 1 untracked mmux-* session")));
+
+        for session in ["mmux-startup-recorded", "user-startup-session"] {
+            test_kill_session(&server, session).await;
+        }
+        let _ = fs::remove_dir_all(local_dir);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn test_startup_reconciliation_recreates_missing_active_recorded_session() {
         let dir = unique_temp_dir("mmux-mcp-reconcile");
         let local_dir = unique_temp_dir("mmux-mcp-reconcile-local");
@@ -11641,9 +11834,24 @@ mod tests {
             .record_session(task.id.clone(), record)
             .unwrap();
 
-        server.reconcile_startup_local_sessions().await;
+        let delayed_server = server.clone();
+        let delayed_restore = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            test_create_session(&delayed_server, "mmux-delayed-startup-zombie", "sleep 30").await;
+        });
+
+        server
+            .reconcile_startup_local_sessions_with_timing(StartupZombieSweepTiming {
+                min_window: Duration::from_millis(100),
+                quiet_window: Duration::from_millis(30),
+                poll_interval: Duration::from_millis(10),
+                max_window: Duration::from_secs(1),
+            })
+            .await;
+        delayed_restore.await.unwrap();
 
         assert!(test_session_exists(&server, "mmux-reconcile-active").await);
+        assert!(!test_session_exists(&server, "mmux-delayed-startup-zombie").await);
         assert!(server
             .startup_warnings
             .lock()

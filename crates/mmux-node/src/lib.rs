@@ -20,7 +20,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::Arc;
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 pub const DEFAULT_STORE_DIR_NAME: &str = ".mmux";
 const LOCAL_TMUX_QUICK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -421,7 +421,7 @@ impl EmbeddedNodeBackend {
         tmux_config: Option<&Path>,
     ) -> Result<Self, String> {
         let local = LocalNode::new(store_path, tmux_config)?;
-        ensure_local_tmux_backend_available(&local)?;
+        ensure_local_tmux_backend_available()?;
         Ok(Self {
             backend: NodeExecutionBackend::Local(local),
         })
@@ -446,27 +446,30 @@ impl EmbeddedNodeBackend {
     }
 }
 
-fn ensure_local_tmux_backend_available(local: &LocalNode) -> Result<(), String> {
-    let suffix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_nanos();
-    let session = format!("mmux-health-{}-{suffix}", std::process::id());
-    let probe_socket =
-        short_socket_dir().join(format!("mmux-health-{}-{suffix}.sock", std::process::id()));
-    tmux_with_socket(
-        Some(&probe_socket),
-        local.tmux_config_path(),
-        &["new-session", "-d", "-s", &session, "sleep 30"],
+fn ensure_local_tmux_backend_available() -> Result<(), String> {
+    let mut command = Command::new("tmux");
+    command.arg("-V");
+    let output = run_output_command_with_timeout(
+        command,
+        "tmux availability check",
+        LOCAL_TMUX_QUICK_TIMEOUT,
     )
-    .map_err(|error| format!("failed to start local tmux backend: {error}"))?;
-    let _ = tmux_with_socket(
-        Some(&probe_socket),
-        local.tmux_config_path(),
-        &["kill-session", "-t", &session],
-    );
-    let _ = std::fs::remove_file(probe_socket);
-    Ok(())
+    .map_err(|error| format!("failed to check local tmux backend: {error}"))?;
+    if output.status.success() {
+        return Ok(());
+    }
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    Err(format!(
+        "failed to check local tmux backend: tmux -V exited with code {}{}{}",
+        output.status.code().unwrap_or(-1),
+        if stdout.is_empty() && stderr.is_empty() {
+            ""
+        } else {
+            ": "
+        },
+        format!("{}{}", stdout, stderr).trim()
+    ))
 }
 
 #[derive(Clone)]
@@ -1403,6 +1406,27 @@ mod tests {
 
         let _ = std::fs::remove_dir_all(store);
         let _ = std::fs::remove_file(config);
+    }
+
+    #[test]
+    fn local_backend_availability_check_does_not_start_tmux_or_load_config() {
+        let store = unique_temp_dir("mmux-node-store");
+        let config = unique_temp_file("mmux-node-tmux-conf");
+        let marker = unique_temp_file("mmux-node-tmux-config-loaded");
+        std::fs::write(&config, format!("run-shell 'touch {}'\n", marker.display())).unwrap();
+        let local = LocalNode::new(Some(&store), Some(&config)).unwrap();
+
+        ensure_local_tmux_backend_available().unwrap();
+
+        assert!(!marker.exists(), "availability check loaded tmux config");
+        assert!(
+            !local.socket_path().exists(),
+            "availability check started the private tmux server"
+        );
+
+        let _ = std::fs::remove_dir_all(store);
+        let _ = std::fs::remove_file(config);
+        let _ = std::fs::remove_file(marker);
     }
 
     #[test]

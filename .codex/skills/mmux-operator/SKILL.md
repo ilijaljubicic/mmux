@@ -213,7 +213,11 @@ Use this flow when coordinating tasks through the orchestration tools:
    with `tmux kill-session` through the previous session's recorded node when
    it still exists. Recording the same `node_id`/`session` only refreshes
    metadata.
-8. Do not assume non-`mmux-*` sessions are orchestration-owned.
+8. Do not assume non-`mmux-*` sessions are orchestration-owned. Embedded-local
+   controller startup automatically removes live `mmux-*` sessions that are
+   absent from durable task-session storage, including sessions recreated
+   asynchronously by tmux restore plugins. Recorded sessions remain eligible
+   for continuation, and non-`mmux-*` sessions are preserved.
 9. Record existing or manually adopted coder sessions with `session_record`.
 10. Use `coding_task_send` for initial task delegation. Pass `task_id_or_slug`
     and a concrete instruction; mmux builds deterministic task context from

@@ -152,7 +152,9 @@ Warning: the local backend is not sandboxed. Tools run tmux commands and file
 operations on the same host as the controller, with the controller process
 user's permissions. Use it only for trusted clients and trusted workspaces.
 When `--enable-local-node` is set, controller startup checks the local tmux
-backend and fails early if the system `tmux` binary is unavailable.
+backend with `tmux -V` and fails early if the system `tmux` binary is
+unavailable. This availability check does not start a temporary tmux server or
+load tmux configuration.
 
 #### Local tmux access
 
@@ -180,6 +182,15 @@ backend config file, for example the repo's `tmux.local.conf`:
 ```bash
 mmux controller --enable-local-node --tmux-config ./tmux.local.conf
 ```
+
+User tmux configuration may restore saved sessions when the private server
+starts. Embedded-local controller startup therefore treats the `mmux-*`
+namespace as orchestration-owned: after reconciling durable task-session
+records, it removes every live `mmux-*` session absent from the durable store.
+It performs a short settling sweep to catch asynchronous restore plugins such
+as tmux-continuum. Recorded sessions remain available for continuation, and
+sessions outside the `mmux-*` namespace are never removed by this startup
+cleanup.
 
 For distributed local nodes, pass the same flag to the node process:
 
