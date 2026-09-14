@@ -24,6 +24,14 @@ pub struct Project {
     pub slug: String,
     pub title: String,
     pub description: String,
+    #[serde(default)]
+    pub codex_home: Option<String>,
+    #[serde(default)]
+    pub claude_home: Option<String>,
+    #[serde(default)]
+    pub opencode_home: Option<String>,
+    #[serde(default)]
+    pub kimi_home: Option<String>,
     pub status: ProjectStatus,
     pub created_at_ms: u64,
     pub updated_at_ms: u64,
@@ -221,6 +229,14 @@ pub struct ProjectSummary {
     pub slug: String,
     pub title: String,
     pub description: String,
+    #[serde(default)]
+    pub codex_home: Option<String>,
+    #[serde(default)]
+    pub claude_home: Option<String>,
+    #[serde(default)]
+    pub opencode_home: Option<String>,
+    #[serde(default)]
+    pub kimi_home: Option<String>,
     pub status: ProjectStatus,
     pub plan_count: usize,
     pub active_plan_count: usize,
@@ -375,13 +391,85 @@ pub struct CreateTask {
     pub run_spec: Option<TaskRunSpec>,
 }
 
-#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[derive(Clone, Debug, Default, Eq, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CreateProject {
     pub title: String,
     pub description: String,
     #[serde(default)]
     pub slug: Option<String>,
+    #[serde(default)]
+    pub codex_home: Option<String>,
+    #[serde(default)]
+    pub claude_home: Option<String>,
+    #[serde(default)]
+    pub opencode_home: Option<String>,
+    #[serde(default)]
+    pub kimi_home: Option<String>,
+}
+
+/// An omitted home keeps its current value; an explicit null clears it.
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UpdateProject {
+    #[serde(
+        default,
+        deserialize_with = "deserialize_home_update",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub codex_home: Option<Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_home_update",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub claude_home: Option<Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_home_update",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub opencode_home: Option<Option<String>>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_home_update",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub kimi_home: Option<Option<String>>,
+}
+
+fn deserialize_home_update<'de, D: serde::Deserializer<'de>>(
+    deserializer: D,
+) -> Result<Option<Option<String>>, D::Error> {
+    Option::<String>::deserialize(deserializer).map(Some)
+}
+
+fn validate_coder_home(field: &str, home: Option<&str>) -> Result<(), String> {
+    if let Some(home) = home {
+        if home.trim().is_empty() || home.chars().any(char::is_control) {
+            return Err(format!(
+                "{field} must be a non-empty path without control characters"
+            ));
+        }
+        if !home.starts_with('/') && home != "~" && !home.starts_with("~/") {
+            return Err(format!(
+                "{field} must be an absolute path or start with ~/ on the execution node"
+            ));
+        }
+    }
+    Ok(())
+}
+
+impl Project {
+    pub fn coder_home(&self, profile: &str) -> Option<&str> {
+        match profile {
+            "codex" => self.codex_home.as_deref(),
+            "claude" => self.claude_home.as_deref(),
+            "opencode" => self.opencode_home.as_deref(),
+            "kimi" => self.kimi_home.as_deref(),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -636,6 +724,10 @@ impl OrchestrationState {
                     slug: project.slug.clone(),
                     title: project.title.clone(),
                     description: project.description.clone(),
+                    codex_home: project.codex_home.clone(),
+                    claude_home: project.claude_home.clone(),
+                    opencode_home: project.opencode_home.clone(),
+                    kimi_home: project.kimi_home.clone(),
                     status: project.status,
                     plan_count: plan_count_by_project
                         .get(&project.id)
@@ -972,6 +1064,14 @@ impl OrchestrationState {
         if input.description.trim().is_empty() {
             return Err("project description must not be empty".into());
         }
+        for (field, home) in [
+            ("codex_home", input.codex_home.as_deref()),
+            ("claude_home", input.claude_home.as_deref()),
+            ("opencode_home", input.opencode_home.as_deref()),
+            ("kimi_home", input.kimi_home.as_deref()),
+        ] {
+            validate_coder_home(field, home)?;
+        }
         let id = ProjectId(Uuid::new_v4().to_string());
         let base_slug = input.slug.as_deref().unwrap_or(&input.title);
         let slug = self.unique_project_slug(base_slug);
@@ -980,12 +1080,50 @@ impl OrchestrationState {
             slug,
             title: input.title,
             description: input.description,
+            codex_home: input.codex_home,
+            claude_home: input.claude_home,
+            opencode_home: input.opencode_home,
+            kimi_home: input.kimi_home,
             status: ProjectStatus::Active,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
         };
         self.projects.insert(id, project.clone());
         Ok(project)
+    }
+
+    pub fn update_project(
+        &mut self,
+        project_id: &ProjectId,
+        update: UpdateProject,
+        now_ms: u64,
+    ) -> Result<Project, String> {
+        for (field, home) in [
+            ("codex_home", &update.codex_home),
+            ("claude_home", &update.claude_home),
+            ("opencode_home", &update.opencode_home),
+            ("kimi_home", &update.kimi_home),
+        ] {
+            validate_coder_home(field, home.as_ref().and_then(|value| value.as_deref()))?;
+        }
+        let project = self
+            .projects
+            .get_mut(project_id)
+            .ok_or_else(|| format!("project '{}' not found", project_id.0))?;
+        if let Some(home) = update.codex_home {
+            project.codex_home = home;
+        }
+        if let Some(home) = update.claude_home {
+            project.claude_home = home;
+        }
+        if let Some(home) = update.opencode_home {
+            project.opencode_home = home;
+        }
+        if let Some(home) = update.kimi_home {
+            project.kimi_home = home;
+        }
+        project.updated_at_ms = now_ms;
+        Ok(project.clone())
     }
 
     pub fn update_project_status(
@@ -1737,6 +1875,10 @@ mod tests {
                 slug: "project".into(),
                 title: "Project".into(),
                 description: "Test project".into(),
+                codex_home: None,
+                claude_home: None,
+                opencode_home: None,
+                kimi_home: None,
                 status: ProjectStatus::Active,
                 created_at_ms: 1,
                 updated_at_ms: 1,
@@ -1762,6 +1904,66 @@ mod tests {
     }
 
     #[test]
+    fn project_homes_are_optional_validated_and_clearable() {
+        let mut state = OrchestrationState::new();
+        let project = state
+            .create_project(
+                CreateProject {
+                    title: "Homes".into(),
+                    description: "Config homes".into(),
+                    ..Default::default()
+                },
+                100,
+            )
+            .unwrap();
+        assert!(project.codex_home.is_none());
+        let mut legacy = serde_json::to_value(&project).unwrap();
+        for field in ["codex_home", "claude_home", "opencode_home", "kimi_home"] {
+            legacy.as_object_mut().unwrap().remove(field);
+        }
+        assert_eq!(serde_json::from_value::<Project>(legacy).unwrap(), project);
+        let update: UpdateProject = serde_json::from_value(serde_json::json!({
+            "codex_home": "/node/codex", "claude_home": "~/claude",
+            "opencode_home": "/node/opencode", "kimi_home": "/node/kimi"
+        }))
+        .unwrap();
+        let configured = state.update_project(&project.id, update, 101).unwrap();
+        assert_eq!(configured.coder_home("codex"), Some("/node/codex"));
+        assert_eq!(configured.coder_home("claude"), Some("~/claude"));
+        assert_eq!(configured.coder_home("opencode"), Some("/node/opencode"));
+        assert_eq!(configured.coder_home("kimi"), Some("/node/kimi"));
+        for invalid in ["", "  ", "relative", "/path\ncommand", "/nul\0"] {
+            let update: UpdateProject = serde_json::from_value(serde_json::json!({
+                "codex_home": "/would-change", "kimi_home": invalid
+            }))
+            .unwrap();
+            assert!(state.update_project(&project.id, update, 102).is_err());
+            assert_eq!(state.projects[&project.id], configured);
+            assert!(state
+                .create_project(
+                    CreateProject {
+                        title: "Invalid".into(),
+                        description: "Invalid".into(),
+                        codex_home: Some(invalid.into()),
+                        ..Default::default()
+                    },
+                    102
+                )
+                .is_err());
+        }
+        let update: UpdateProject =
+            serde_json::from_value(serde_json::json!({"codex_home": null})).unwrap();
+        let cleared = state.update_project(&project.id, update, 103).unwrap();
+        assert!(cleared.codex_home.is_none());
+        assert_eq!(cleared.claude_home, configured.claude_home);
+        assert_eq!(cleared.opencode_home, configured.opencode_home);
+        assert_eq!(cleared.kimi_home, configured.kimi_home);
+        assert_eq!(cleared.updated_at_ms, 103);
+        let summary = state.orchestration_status(103).projects.remove(0);
+        assert_eq!(summary.kimi_home, cleared.kimi_home);
+    }
+
+    #[test]
     fn project_creation_uses_uuid_ids_and_unique_slugs() {
         let mut state = OrchestrationState::new();
 
@@ -1771,6 +1973,7 @@ mod tests {
                     title: "Project".into(),
                     description: "First test project".into(),
                     slug: None,
+                    ..Default::default()
                 },
                 100,
             )
@@ -1781,6 +1984,7 @@ mod tests {
                     title: "Project".into(),
                     description: "Second test project".into(),
                     slug: None,
+                    ..Default::default()
                 },
                 101,
             )
@@ -1802,6 +2006,7 @@ mod tests {
                     title: "Project".into(),
                     description: "Test project".into(),
                     slug: None,
+                    ..Default::default()
                 },
                 100,
             )

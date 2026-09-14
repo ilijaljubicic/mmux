@@ -266,6 +266,7 @@ mod tests {
             title: "Project".into(),
             description: "Store test project".into(),
             slug: None,
+            ..Default::default()
         }
     }
 

@@ -274,8 +274,8 @@ curl -X POST "http://<controller-host>:3000/mcp" \
 Raw MCP clients must check for JSON-RPC `error` and tool-level `isError`
 before parsing a response as a successful tool result. Tool failures are clear
 but still returned in the MCP response envelope. For example, a task-aware
-`start_coding_session` without `node` returns an error such as
-`task-aware start_coding_session requires explicit node`; client wrappers
+`start_coding_session` without `node` returns a missing-field error;
+client wrappers
 should surface that error instead of parsing the missing success payload.
 
 ### Microsandbox backend
@@ -332,7 +332,7 @@ stop, snapshot, import, and export.
 | ------- | ------- |
 | `mmux controller` | Runs the MCP control plane and node registry. |
 | `mmux node` | Registers to a controller and executes node-side tmux/file commands. |
-| `mmux create-project <title> --description <text>` | Creates a durable orchestration project in the local mmux store. Supports optional `--slug <slug>`. |
+| `mmux create-project <title> --description <text>` | Creates a durable orchestration project in the local mmux store. Supports optional `--slug <slug>` and per-profile `--codex-home`, `--claude-home`, `--opencode-home`, `--kimi-home` paths. |
 | `mmux delete-project <id-or-slug>` | Deletes a durable orchestration project from the local mmux store, including all contained plans, task cards, task sessions, and task edges. |
 | `mmux list-projects` | Lists durable orchestration projects from the local mmux store so project ids/slugs are discoverable. |
 | `mmux prune` | Prunes orchestration-owned live sessions, stale durable task sessions, and finished plans. Defaults to dry-run, all categories included, and `--older-than-days 14`; pass `--execute` to mutate state. |
@@ -540,7 +540,7 @@ There are two common session patterns:
 
 | Session type | Created by | Used with | Meaning |
 | ------------ | ---------- | --------- | ------- |
-| Shell session | `exec` when needed, or an existing tmux session | `send_input`, `send_key`, `capture_output`, `wait_start`, `wait_status`, `wait_cancel`, `session_info`, `list_panes`, `resize_pane` | Generic terminal session with no profile-specific readiness rules. |
+| Shell session | Manually created and attached to a task with `session_record` | `send_input`, `send_key`, `capture_output`, `wait_start`, `wait_status`, `wait_cancel`, `session_info`, `list_panes`, `resize_pane` | Generic terminal session with no profile-specific readiness rules. |
 | Coder session | `start_coding_session` | `coding_task_send` for initial task delegation, `coding_send` for follow-ups, `wait_start` with `kind = "coding-ready"`, `wait_status`, `coding_read`, `coding_action`, `check_state` | A tmux session running a coding CLI and interpreted through a coder profile. |
 
 A coder session is not a separate storage object. It is identified by:
@@ -563,15 +563,23 @@ The same tmux session can be inspected with generic session tools, but coding
 tools need the profile so mmux can detect prompts, busy states, startup/update
 prompts, and approval actions correctly.
 
-Task-aware `start_coding_session` uses the same create/adopt behavior as
-ordinary coder sessions. It does not wait for the coding CLI to become ready;
-start readiness tracking explicitly with `wait_start` using
-`kind = "coding-ready"`. When you provide task metadata, the operator must also provide
-explicit runtime choices: `node`, `profile`, `workspace_path`,
-`bypass_permissions`, `task_id`, `role`, `kind`, and `skills`. Use either
-`session` or `generate_session_name = true`. If `task_id` is present, `node` is
-mandatory and must be supplied by the caller, for example `node = "local"` for
-the embedded local node.
+`start_coding_session` requires an existing `task_id` for every launch or
+adoption. **No task, no session.** Missing, null, empty, malformed, or unknown
+task IDs are rejected before mmux contacts the execution node. The task's plan
+identifies its project; a workspace directory alone never selects a project.
+
+Provide explicit `node`, `profile`, `workspace_path`, `bypass_permissions`,
+`role`, and `kind`. `skills` defaults to an empty list. Use either `session`
+or `generate_session_name = true`. The returned `session_record` is always
+attached to the task. Start readiness tracking with `wait_start` using
+`kind = "coding-ready"`; launching does not wait for readiness.
+
+`exec` only executes commands in an existing live session attached to a task.
+It requires `session` and `command`, never creates a session, and does not
+accept `workspace_path`. Use `start_coding_session` with a valid task to launch
+a coder. `session_record` also requires a valid task when adopting a manually
+started session.
+
 Generated orchestration-owned names use the `mmux-*` prefix and include the
 task slug, session kind, and a short suffix; non-`mmux-*` sessions are never
 treated as orchestration-owned cleanup targets.
@@ -588,6 +596,73 @@ Task scope is separate from runtime placement: `include_paths` and
 interpreted from the runtime workspace when a `run_spec` or recorded session
 provides one. Prefer scope paths inside that workspace unless the operator
 intentionally scopes external files.
+
+## Per-project coder homes
+
+Projects can store an optional configuration home for each supported profile:
+
+| Project field / MCP argument | `create-project` flag | CLI environment variable |
+| --- | --- | --- |
+| `codex_home` | `--codex-home` | `CODEX_HOME` |
+| `claude_home` | `--claude-home` | `CLAUDE_CONFIG_DIR` |
+| `opencode_home` | `--opencode-home` | `OPENCODE_CONFIG_DIR` |
+| `kimi_home` | `--kimi-home` | `KIMI_CODE_HOME` |
+
+All four fields default to `null`. Omitting them, or supplying `null` to MCP
+`project_create`, makes mmux pass **no home override** for that CLI. The CLI
+uses its inherited environment or its own default home. Projects already in
+an existing store behave the same way until a home is explicitly configured.
+
+Use absolute paths on the execution node, or `~/...` to resolve against that
+node's home. mmux stores these paths without checking or canonicalizing them
+on the controller. Provision the directory and the CLI configuration or login
+on the node before use; mmux does not copy credentials or configuration.
+
+```bash
+mmux create-project example --description "Example project" \
+  --codex-home /home/user/.codex-example \
+  --claude-home /home/user/.claude-example
+```
+
+MCP `project_create` accepts the same optional fields. To update an existing
+project through a running controller with `--enable-admin-tools`, call:
+
+```json
+{
+  "name": "project_update",
+  "arguments": {
+    "project_id": "example",
+    "codex_home": "/home/user/.codex-example",
+    "claude_home": "/home/user/.claude-example"
+  }
+}
+```
+
+`project_id` accepts the UUID or slug. An omitted update field keeps its current
+value; an explicit `null` clears that override. `project_list` and
+`orchestration_status` include the current homes. Updates are persisted and take
+effect in the running controller immediately: **no controller restart is
+needed** for subsequent launches.
+
+`start_coding_session`, `task_start`, `orchestration_next`, and
+recovery of missing recorded sessions resolve the home from the task's project
+at launch time. Only the matching profile's variable is supplied, scoped to
+that CLI process. Existing or adopted live sessions keep their launch
+environment; a home change does not restart them. Starts without a valid
+`task_id` are rejected. A task whose project has no home override uses the
+CLI's inherited/default home.
+
+These variables follow each CLI's own semantics:
+[Codex](https://developers.openai.com/codex/config-advanced/),
+[Claude](https://code.claude.com/docs/en/env-vars), and
+[Kimi Code](https://moonshotai.github.io/kimi-code/en/configuration/data-locations.html)
+use them for configuration and local state.
+[OpenCode](https://opencode.ai/docs/config/#custom-directory) loads the custom
+configuration directory in addition to its other configuration sources; this
+field does not relocate all OpenCode state. The process `HOME` is unchanged.
+Model selection remains in each CLI's configuration. For example, to make
+Astra the Codex default, set `model = "gpt-6-astra"` in the selected home's
+`config.toml`.
 
 ## Orchestration
 
@@ -694,14 +769,14 @@ Interaction tools:
 | `wait_status` | Inspect a wait job as `pending`, `completed`, `failed`, or `canceled`. |
 | `wait_cancel` | Cancel a pending wait job without killing or interrupting the tmux session. |
 | `interact` | Send input and wait for stable output in one call. |
-| `exec` | Run a shell command in a session and return cleaned output. |
+| `exec` | Run a shell command in an existing live task-owned session and return cleaned output; never creates sessions. |
 
 Profile-aware coding tools:
 
 | Tool | Purpose |
 | ---- | ------- |
 | `list_coder_profiles` | List enabled built-in coder profiles. |
-| `start_coding_session` | Create or adopt a CLI session from its profile command, or from `permission_bypass_cmd` when `bypass_permissions = true`; returns without waiting for readiness. Optional task metadata records one `TaskSession` on the task. |
+| `start_coding_session` | Create or adopt a CLI session from its profile command, or from `permission_bypass_cmd` when `bypass_permissions = true`; returns without waiting for readiness. Requires an existing `task_id` and explicit runtime metadata; always records one `TaskSession` on the task. |
 | `coding_send` | Send a prompt to a coding CLI; rejects blank prompts and placeholder strings such as `null` or `undefined`. |
 | `coding_task_send` | Send an initial task-scoped prompt by rendering task context from orchestration state with template `task`, `validate`, `review`, or `quality-guard`, including optional plan-wide instructions when configured, optionally adding `context_task_ids` task cards for multi-task validation/review, then appending the provided instruction. The template selects the operating mode; the instruction supplies the concrete focus. |
 | `coding_read` | Read recent CLI output through profile-aware compaction by default; pass `raw = true` for the full tmux pane text. |
@@ -727,6 +802,7 @@ Orchestration tools:
 | Tool | Purpose |
 | ---- | ------- |
 | `project_create` | Create a durable orchestration project boundary with required `title` and `description`, a UUID id, and globally unique slug. Requires `--enable-admin-tools`. |
+| `project_update` | Update optional `codex_home`, `claude_home`, `opencode_home`, and `kimi_home` by project UUID or slug; omitted fields stay unchanged and `null` clears an override. Applies immediately to future launches. Requires `--enable-admin-tools`. |
 | `project_list` | List orchestration projects with total, active, and per-status plan/task counts. |
 | `project_status_update` | Set project status to `Active` or `Archived`; `project_id` accepts UUID id or slug. Requires `--enable-admin-tools`. |
 | `plan_create` | Create a durable plan brief under a project; `project_id` accepts UUID id or slug. Optional `instructions` stores Markdown instructions rendered into every task prompt for the plan. |
@@ -740,7 +816,7 @@ Orchestration tools:
 | `task_start` | Explicitly start one task using its `run_spec`; does not require `auto_schedule=true`. |
 | `task_edge_add` | Add a task dependency or relationship edge. |
 | `task_edge_remove` | Remove a task dependency or relationship edge. |
-| `session_record` | Record durable runtime placement for an existing or manually started coder session; task-attached records require a live node/session. |
+| `session_record` | Record durable runtime placement for an existing or manually started session; requires a valid task and a live node/session. |
 | `task_status_update` | Update task status with operator outcome and blockers. |
 | `task_report` | Submit durable task result status, outcome, blockers, and evidence; intended for operator/external-controller result commits. |
 | `orchestration_status` | Return compact project, plan, task, edge, task-session, cleanup, warning, and runtime-state summaries. |

@@ -53,6 +53,15 @@ impl BuiltinProfile {
         }
     }
 
+    pub fn home_env_var(self) -> &'static str {
+        match self {
+            Self::Codex => codex::HOME_ENV_VAR,
+            Self::Claude => claude::HOME_ENV_VAR,
+            Self::Opencode => opencode::HOME_ENV_VAR,
+            Self::Kimi => kimi::HOME_ENV_VAR,
+        }
+    }
+
     fn startup_dismiss_key(self, active_region: &str) -> Option<&'static str> {
         match self {
             Self::Codex => codex::startup_dismiss_key(active_region),
@@ -122,6 +131,34 @@ pub fn launch_strategy(profile: &CliProfile) -> Result<&str, String> {
             profile.name, other
         )),
     }
+}
+
+/// Scope an explicit configuration home to this CLI process. Resolve ~/ on the
+/// execution node, never against the controller's filesystem or environment.
+pub fn launch_command_with_home(
+    profile: &CliProfile,
+    bypass_permissions: bool,
+    home: Option<&str>,
+) -> Result<String, String> {
+    let command = launch_command(profile, bypass_permissions)?;
+    let Some(home) = home else {
+        return Ok(command.to_owned());
+    };
+    let builtin = BuiltinProfile::from_name(&profile.name)
+        .ok_or_else(|| format!("unsupported profile '{}'", profile.name))?;
+    let home = if home == "~" {
+        "\"$HOME\"".to_owned()
+    } else if let Some(suffix) = home.strip_prefix("~/") {
+        format!("\"$HOME\"/{}", super::shell_quote(suffix))
+    } else {
+        super::shell_quote(home)
+    };
+    Ok(format!(
+        "env {}={} {}",
+        builtin.home_env_var(),
+        home,
+        command
+    ))
 }
 
 pub fn text_mode(profile: &CliProfile) -> Result<&str, String> {
@@ -281,6 +318,51 @@ fn is_common_noise_line(_line: &str, lower: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn project_homes_scope_native_variables_and_preserve_default_commands() {
+        use std::process::Command;
+        for (builtin, variable) in [
+            (BuiltinProfile::Codex, "CODEX_HOME"),
+            (BuiltinProfile::Claude, "CLAUDE_CONFIG_DIR"),
+            (BuiltinProfile::Opencode, "OPENCODE_CONFIG_DIR"),
+            (BuiltinProfile::Kimi, "KIMI_CODE_HOME"),
+        ] {
+            let mut profile = builtin.config();
+            assert_eq!(builtin.home_env_var(), variable);
+            assert_eq!(
+                launch_command_with_home(&profile, false, None).unwrap(),
+                profile.cmd.as_ref().unwrap().as_str()
+            );
+            if profile.permission_bypass_cmd.is_some() {
+                let command =
+                    launch_command_with_home(&profile, true, Some("/project config")).unwrap();
+                assert!(command.ends_with(profile.permission_bypass_cmd.as_deref().unwrap()));
+            }
+            // Run a harmless stand-in CLI to test actual shell parsing, including
+            // quotes and command substitutions that must remain literal path text.
+            profile.cmd = Some(format!("sh -c 'printf \"%s\" \"${variable}\"'"));
+            let explicit = "/project's config/$(printf injected); `printf bad`";
+            for (home, expected) in [(None, "/inherited/config"), (Some(explicit), explicit)] {
+                let command = launch_command_with_home(&profile, false, home).unwrap();
+                let output = Command::new("sh")
+                    .args(["-c", &command])
+                    .env(variable, "/inherited/config")
+                    .output()
+                    .unwrap();
+                assert!(output.status.success());
+                assert_eq!(String::from_utf8(output.stdout).unwrap(), expected);
+            }
+            let command =
+                launch_command_with_home(&profile, false, Some("~/project's config")).unwrap();
+            let output = Command::new("sh").args(["-c", &command]).output().unwrap();
+            assert!(output.status.success());
+            assert_eq!(
+                String::from_utf8(output.stdout).unwrap(),
+                format!("{}/project's config", std::env::var("HOME").unwrap())
+            );
+        }
+    }
 
     #[test]
     fn builtins_have_stable_metadata() {

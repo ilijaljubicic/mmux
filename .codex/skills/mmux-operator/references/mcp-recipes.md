@@ -19,9 +19,11 @@ values:
 
 When calling MCP directly, check both JSON-RPC `error` and tool-level
 `isError` before parsing the result as a success payload. Tool failures are
-returned clearly inside the MCP envelope. For task-aware `start_coding_session`,
-`node` is mandatory when `task_id` is present; pass `node: "local"` for the
-embedded local node.
+returned clearly inside the MCP envelope. Every `start_coding_session` call
+requires a valid existing `task_id`, explicit `node`, `profile`,
+`workspace_path`, `bypass_permissions`, `role`, and `kind`. Pass `node: "local"`
+for the embedded local node. Missing/invalid tasks are rejected before node
+access. `skills` defaults to an empty list.
 
 ## Discovery
 
@@ -51,6 +53,29 @@ local store setup, use
 ```json
 {"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"project_list","arguments":{}}}
 ```
+
+Optional project fields: `codex_home`, `claude_home`, `opencode_home`, and
+`kimi_home`. They map to `CODEX_HOME`, `CLAUDE_CONFIG_DIR`,
+`OPENCODE_CONFIG_DIR`, and `KIMI_CODE_HOME` respectively. Omitted/null fields
+on creation pass no home override. Configure absolute execution-node paths or
+`~/...`; mmux does not provision homes or copy authentication.
+
+Update an existing project (requires `--enable-admin-tools`):
+
+```json
+{"jsonrpc":"2.0","id":51,"method":"tools/call","params":{"name":"project_update","arguments":{"project_id":"example","codex_home":"/home/user/.codex-example","claude_home":"/home/user/.claude-example"}}}
+```
+
+Clear just the Codex override; other homes remain unchanged:
+
+```json
+{"jsonrpc":"2.0","id":52,"method":"tools/call","params":{"name":"project_update","arguments":{"project_id":"example","codex_home":null}}}
+```
+
+The running controller uses updates immediately for the next task session
+launch (manual, scheduled, or recovery), without a restart. Already live or
+adopted sessions keep their original environment. `project_list` and
+`orchestration_status` return the current home fields.
 
 ## Plans
 
@@ -132,6 +157,12 @@ the plan with `orchestration_next`:
 ```
 
 ## Sessions
+
+Create/select the task before launching a session. No task, no session:
+`start_coding_session` rejects a profile and directory without `task_id`.
+Every successful launch/adoption returns a durable `session_record` on that
+task. `exec` requires an existing live session attached to a task and never
+creates a session; it accepts no `workspace_path` argument.
 
 ```json
 {"jsonrpc":"2.0","id":20,"method":"tools/call","params":{"name":"start_coding_session","arguments":{"node":"local","profile":"codex","bypass_permissions":false,"task_id":"task-0001","role":"editable-worker","kind":"codex","skills":["docs","mmux"],"workspace_path":"/mnt/Radni/mmux","generate_session_name":true}}}

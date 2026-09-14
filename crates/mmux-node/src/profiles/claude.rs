@@ -1,5 +1,7 @@
 use mmux_shared::CliProfile;
 
+pub(super) const HOME_ENV_VAR: &str = "CLAUDE_CONFIG_DIR";
+
 pub(crate) fn config() -> CliProfile {
     CliProfile {
         name: "claude".into(),

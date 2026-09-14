@@ -125,12 +125,7 @@ fn print_root_help() {
     println!("  prune                   Prune orchestration-owned live sessions, stale session records, and finished plans");
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-struct CreateProjectArgs {
-    title: String,
-    description: String,
-    slug: Option<String>,
-}
+type CreateProjectArgs = mmux_controller::CreateProject;
 
 fn run_create_project(store_path: Option<PathBuf>, raw_args: &[OsString]) -> i32 {
     if raw_args
@@ -154,12 +149,7 @@ fn run_create_project(store_path: Option<PathBuf>, raw_args: &[OsString]) -> i32
             return 2;
         }
     };
-    let project = match mmux_controller::local_create_project(
-        Some(&store_path),
-        args.title,
-        args.description,
-        args.slug,
-    ) {
+    let project = match mmux_controller::local_create_project(Some(&store_path), args) {
         Ok(project) => project,
         Err(error) => {
             eprintln!("mmux create-project: {error}");
@@ -179,7 +169,8 @@ fn run_create_project(store_path: Option<PathBuf>, raw_args: &[OsString]) -> i32
 }
 
 fn print_create_project_help() {
-    println!("usage: mmux create-project <title> --description <text> [--slug <slug>]");
+    println!("usage: mmux create-project <title> --description <text> [--slug <slug>] [--codex-home <path>] [--claude-home <path>] [--opencode-home <path>] [--kimi-home <path>]");
+    println!("Optional coder homes are paths on the execution node. Omitted homes use the CLI's inherited/default home.");
     println!();
     println!("Creates a durable orchestration project in mmux.db.");
 }
@@ -188,12 +179,36 @@ fn parse_create_project_args(raw_args: &[OsString]) -> Result<CreateProjectArgs,
     let mut title = None;
     let mut description = None;
     let mut slug = None;
+    let mut homes = CreateProjectArgs::default();
     let mut index = 0;
 
     while index < raw_args.len() {
         let text = raw_args[index]
             .to_str()
             .ok_or_else(|| "arguments must be valid UTF-8".to_owned())?;
+        let (flag, inline_value) = text
+            .split_once('=')
+            .map_or((text, None), |(flag, value)| (flag, Some(value)));
+        let home = match flag {
+            "--codex-home" => Some(&mut homes.codex_home),
+            "--claude-home" => Some(&mut homes.claude_home),
+            "--opencode-home" => Some(&mut homes.opencode_home),
+            "--kimi-home" => Some(&mut homes.kimi_home),
+            _ => None,
+        };
+        if let Some(home) = home {
+            let value = match inline_value {
+                Some(value) => value,
+                None => raw_args
+                    .get(index + 1)
+                    .and_then(|value| value.to_str())
+                    .filter(|value| !value.starts_with("--"))
+                    .ok_or_else(|| format!("{flag} requires a UTF-8 path"))?,
+            };
+            *home = Some(value.to_owned());
+            index += if inline_value.is_some() { 1 } else { 2 };
+            continue;
+        }
         match text {
             "--description" => {
                 let value = raw_args
@@ -244,6 +259,7 @@ fn parse_create_project_args(raw_args: &[OsString]) -> Result<CreateProjectArgs,
         title,
         description,
         slug,
+        ..homes
     })
 }
 
@@ -1077,8 +1093,36 @@ mod tests {
                 title: "My Project".into(),
                 description: "Long-running work".into(),
                 slug: Some("custom-project".into()),
+                ..Default::default()
             }
         );
+    }
+
+    #[test]
+    fn create_project_args_accept_optional_coder_homes() {
+        let args = parse_create_project_args(&os_args(&[
+            "Homes",
+            "--description",
+            "Per-project configuration",
+            "--codex-home",
+            "/node/codex",
+            "--claude-home=/node/claude",
+            "--opencode-home",
+            "/node/opencode",
+            "--kimi-home=~/kimi",
+        ]))
+        .unwrap();
+        assert_eq!(args.codex_home.as_deref(), Some("/node/codex"));
+        assert_eq!(args.claude_home.as_deref(), Some("/node/claude"));
+        assert_eq!(args.opencode_home.as_deref(), Some("/node/opencode"));
+        assert_eq!(args.kimi_home.as_deref(), Some("~/kimi"));
+        assert!(parse_create_project_args(&os_args(&[
+            "Homes",
+            "--description",
+            "Test",
+            "--codex-home"
+        ]))
+        .is_err());
     }
 
     #[test]

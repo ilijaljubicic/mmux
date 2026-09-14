@@ -44,7 +44,8 @@ Discovery and state tools:
 
 Project, plan, and task tools:
 
-- `project_create`: create a project boundary through MCP.
+- `project_create`: create a project boundary through MCP, optionally with per-profile homes.
+- `project_update`: update or clear project coder homes through admin MCP; future launches use changes immediately without a controller restart.
 - `plan_create`, `plan_list`, `plan_update`, `plan_status_update`, `plan_get`:
   manage plan work-package documents and status; `plan_get` returns one full
   stored plan body including its brief and optional instructions.
@@ -58,10 +59,11 @@ Project, plan, and task tools:
 
 Session and coder tools:
 
-- `start_coding_session`: create or adopt a profile-driven coder session.
+- `start_coding_session`: create or adopt a profile-driven coder session for a required existing task. No task, no session.
+- `exec`: execute a command only in an existing live task-owned session; never creates sessions.
 - `session_record`: attach an existing session to durable task state.
 - `coding_task_send`: send initial task-aware work using rendered task context.
-- `coding_send`: send follow-up steering or non-task prompts.
+- `coding_send`: send follow-up steering.
 - `wait_start`, `wait_status`, `wait_cancel`: supervise waits.
 - `coding_read`, `capture_output`: read compact or raw session output.
 - `coding_action`, `send_key`, `kill_session`: handle prompts, interrupts, and
@@ -71,9 +73,10 @@ Profile selection:
 
 - `list_coder_profiles` reports only profiles enabled for the running
   controller.
-- If a tool omits `profile`, mmux uses `--default-coder-profile` when
-  configured, otherwise the first enabled built-in profile in canonical order:
-  `codex`, `opencode`, `kimi`, then `claude`.
+- `start_coding_session` always requires an explicit `profile`. Other tools
+  that allow omitting `profile` use `--default-coder-profile` when configured,
+  otherwise the first enabled built-in profile in canonical order: `codex`,
+  `opencode`, `kimi`, then `claude`.
 
 Read `references/mcp-recipes.md` when exact JSON-RPC request bodies, headers,
 or troubleshooting examples are needed.
@@ -87,7 +90,7 @@ or troubleshooting examples are needed.
 5. For project-scoped sessions, call `list_sessions(project_id)` with a project
    UUID id or globally unique slug. Use `admin_list_node_sessions` only for
    raw node/tmux admin debugging.
-6. For task-aware starts, choose the actual runtime values up front:
+6. For every start, create/select the task first and choose the runtime values:
    `node`, `profile`, `workspace_path`, `bypass_permissions`, `task_id`,
    `role`, `kind`, `skills`.
 
@@ -98,10 +101,18 @@ or troubleshooting examples are needed.
 - Keep secrets out of prompts, transcripts, and final answers. Refer to secret
   env vars by name only. Never ask a coder to print API keys or tokens.
 - Prefer mmux MCP tools over direct terminal driving for interactive coder CLIs.
-- Remember that local-node coder sessions inherit environment from the mmux
-  controller or distributed local node process. mmux does not set a separate
-  `CODEX_HOME`; Codex uses the inherited value, or Codex's default `~/.codex`
-  when it is unset.
+- Projects have optional `codex_home`, `claude_home`, `opencode_home`, and
+  `kimi_home` fields. When explicitly configured, task session launches set
+  `CODEX_HOME`, `CLAUDE_CONFIG_DIR`, `OPENCODE_CONFIG_DIR`, or `KIMI_CODE_HOME`
+  for the matching CLI process. Omitted/null homes pass no override and retain
+  the CLI's inherited/default home. These are execution-node paths (absolute
+  or `~/`), not controller-host paths. OpenCode's directory adds configuration
+  sources and does not relocate all state.
+- Admin MCP `project_update` changes take effect immediately for new manual,
+  scheduled, or recovered task sessions. Omitted fields stay unchanged; `null`
+  clears an override. Existing/adopted live sessions keep their original
+  environment. Starts without a valid task are rejected before node access.
+  Use `project_list` to inspect the persisted home fields.
 - Use `mmux attach --read-only <session>` or `mmux tmux -- <tmux args>` only as
   a manual inspection escape hatch when MCP output is not enough. Use writable
   `mmux attach <session>` only when interactive input is intended.
@@ -135,10 +146,15 @@ or troubleshooting examples are needed.
 
 ## Default Workflow
 
-1. Start or reuse the right coder session:
-   `start_coding_session(node, profile, session, workspace_path)`.
-   This creates or adopts the tmux session and returns without waiting for the
-   coding CLI to become ready.
+1. Create or select an existing task, then start or reuse its coder session:
+   `start_coding_session(task_id, node, profile, session, workspace_path,
+   bypass_permissions, role, kind, skills)`.
+   A valid `task_id` and explicit runtime choices are mandatory. Use
+   `generate_session_name=true` instead of `session` to generate a name.
+   `skills` defaults to an empty list. The tool creates/adopts and records the
+   task's session without waiting for the coding CLI to become ready.
+   A profile and directory alone are rejected. `exec` cannot create sessions
+   and only operates on an existing live session attached to a task.
 2. Wait for readiness:
    `wait_start` with `kind = "coding-ready"` and `profile`, then `wait_status`;
    for quick checks use `check_state` or `capture_output`.
@@ -146,7 +162,7 @@ or troubleshooting examples are needed.
    steering text related to the current active turn. Do not send a new task or
    unrelated prompt until `turn_idle=true` or the `coding-ready` wait completes.
 3. Delegate initial task work with `coding_task_send`; use `coding_send` for
-   follow-up steering or non-task prompts.
+   follow-up steering.
 4. Wait, read, and steer:
    `wait_start`, `wait_status`, `wait_cancel`, `coding_read`,
    `coding_action`, `capture_output`.
@@ -172,7 +188,7 @@ Use this flow when coordinating tasks through the orchestration tools:
 3. Create or select a project with CLI
    `mmux create-project <title> --description <text>` for offline setup or MCP
    `project_create`/`project_list` through a running controller. Projects have
-   required descriptions. MCP `project_create` and `project_status_update` are
+   required descriptions. MCP `project_create`, `project_update`, and `project_status_update` are
    only advertised and callable when the controller starts with
    `--enable-admin-tools`; `project_list` is always available.
 4. Create a plan with `plan_create`: required `project_id`, `title`, and
@@ -199,12 +215,12 @@ Use this flow when coordinating tasks through the orchestration tools:
    paths inside that workspace unless the operator intentionally scopes
    external files.
 6. Maintain dependency edges with `task_edge_add` and `task_edge_remove`.
-7. Start task-aware coder sessions with `start_coding_session`. Provide
+7. Start coder sessions with `start_coding_session`. Provide
    explicit `node`, `profile`, `workspace_path`, boolean `bypass_permissions`,
    `task_id`, `role`, `kind`, `skills`. Provide `session`, or
    request `generate_session_name = true`.
-   When `task_id` is present, `node` is mandatory. Pass the selected runtime
-   node explicitly, such as `node = "local"` for the embedded local node.
+   Both `task_id` and `node` are mandatory. Pass the selected runtime node
+   explicitly, such as `node = "local"` for the embedded local node.
    Treat `workspace_path` as session start/adoption placement, not task scope;
    do not recreate a live session only because its current working directory
    changed.
@@ -233,8 +249,7 @@ Use this flow when coordinating tasks through the orchestration tools:
     outcome/evidence, scope, blockers, edges, and session. Do
     not rely on the validator's primary task context, local artifacts alone, or
     worker-side mmux calls to recover prior task results.
-    Use `coding_send` only for follow-up prompts, steering, corrections, or
-    non-task sessions.
+    Use `coding_send` only for follow-up prompts, steering, or corrections.
 11. Use `task_start` to explicitly start one task from its `run_spec`.
     `task_start` does not require `auto_schedule = true`.
 12. Use `orchestration_report` when the operator or external MCP controller

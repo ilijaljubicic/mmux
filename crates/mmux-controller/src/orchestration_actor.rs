@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use mmux_controller_core::orchestration::{
     CreatePlan, CreateProject, CreateTask, CreateTaskEdge, OrchestrationState, OrchestrationStatus,
     Plan, PlanId, PlanStatus, Project, ProjectId, ProjectStatus, Task, TaskEdge, TaskEdgeKind,
-    TaskId, TaskSession, TaskStatus, UpdatePlan, UpdateTask,
+    TaskId, TaskSession, TaskStatus, UpdatePlan, UpdateProject, UpdateTask,
 };
 
 use crate::store::OrchestrationStore;
@@ -48,6 +48,14 @@ impl OrchestrationHandle {
 
     pub(crate) fn create_project(&self, input: CreateProject) -> Result<Project, String> {
         self.mutate(|state, now_ms| state.create_project(input, now_ms))
+    }
+
+    pub(crate) fn update_project(
+        &self,
+        project_id: ProjectId,
+        update: UpdateProject,
+    ) -> Result<Project, String> {
+        self.mutate(|state, now_ms| state.update_project(&project_id, update, now_ms))
     }
 
     pub(crate) fn update_project_status(
@@ -336,6 +344,7 @@ mod tests {
             title: "Project".into(),
             description: "Actor test project".into(),
             slug: None,
+            ..Default::default()
         }
     }
 

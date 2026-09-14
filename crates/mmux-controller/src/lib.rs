@@ -1,3 +1,5 @@
+pub use mmux_controller_core::orchestration::CreateProject;
+
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use clap::{CommandFactory, Parser};
 use connectrpc::{
@@ -6,11 +8,10 @@ use connectrpc::{
 };
 use mmux_controller_core::{
     orchestration::{
-        CreatePlan, CreateProject, CreateTask, CreateTaskEdge, NodeId, OrchestrationCounts,
-        OrchestrationState, OrchestrationStatus, PlanId, PlanStatus, ProjectId, ProjectStatus,
-        SessionCleanupCandidate, SessionId, Task, TaskDependencyBlocker, TaskEdge, TaskEdgeKind,
-        TaskId, TaskRunSpec, TaskScope, TaskSession, TaskStatus, UpdatePlan, UpdateTask,
-        UpdateTaskScope,
+        CreatePlan, CreateTask, CreateTaskEdge, NodeId, OrchestrationCounts, OrchestrationState,
+        OrchestrationStatus, PlanId, PlanStatus, ProjectId, ProjectStatus, SessionCleanupCandidate,
+        SessionId, Task, TaskDependencyBlocker, TaskEdge, TaskEdgeKind, TaskId, TaskRunSpec,
+        TaskScope, TaskSession, TaskStatus, UpdatePlan, UpdateProject, UpdateTask, UpdateTaskScope,
     },
     NodeRegistry, NodeWireAuthContext, NodeWireAuthMode, NodeWireAuthPolicy, NodeWireIdentity,
 };
@@ -394,9 +395,17 @@ struct OrchestrationPruneArgs {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 enum LocalStartupReconciliationAction {
-    Recreate { record: TaskSession },
-    Missing { key: String, reason: String },
-    Historical { key: String },
+    Recreate {
+        task_id: TaskId,
+        record: TaskSession,
+    },
+    Missing {
+        key: String,
+        reason: String,
+    },
+    Historical {
+        key: String,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, Deserialize)]
@@ -744,6 +753,7 @@ fn plan_local_startup_reconciliation(
         }
 
         actions.push(LocalStartupReconciliationAction::Recreate {
+            task_id: task_id.clone(),
             record: record.clone(),
         });
     }
@@ -758,7 +768,7 @@ fn plan_local_startup_reconciliation(
 
 fn reconciliation_action_key(action: &LocalStartupReconciliationAction) -> String {
     match action {
-        LocalStartupReconciliationAction::Recreate { record } => record.key(),
+        LocalStartupReconciliationAction::Recreate { record, .. } => record.key(),
         LocalStartupReconciliationAction::Missing { key, .. }
         | LocalStartupReconciliationAction::Historical { key } => key.clone(),
     }
@@ -800,6 +810,31 @@ fn save_file_impl(
 
 fn profile_launch_command(profile: &CliProfile, bypass_permissions: bool) -> Result<&str, String> {
     mmux_node::profiles::launch_command(profile, bypass_permissions)
+}
+
+fn task_profile_launch_command(
+    state: &OrchestrationState,
+    task_id: &TaskId,
+    profile: &CliProfile,
+    bypass_permissions: bool,
+) -> Result<String, String> {
+    let task = state
+        .tasks
+        .get(task_id)
+        .ok_or_else(|| format!("task '{}' not found", task_id.0))?;
+    let plan = state
+        .plans
+        .get(&task.plan_id)
+        .ok_or_else(|| format!("plan '{}' not found", task.plan_id.0))?;
+    let project = state
+        .projects
+        .get(&plan.project_id)
+        .ok_or_else(|| format!("project '{}' not found", plan.project_id.0))?;
+    mmux_node::profiles::launch_command_with_home(
+        profile,
+        bypass_permissions,
+        project.coder_home(&profile.name),
+    )
 }
 
 fn profile_launch_strategy(profile: &CliProfile) -> Result<&str, String> {
@@ -1084,26 +1119,6 @@ fn short_session_suffix() -> String {
         suffix = suffix[suffix.len() - MAX_ORCHESTRATION_SUFFIX_LEN..].to_owned();
     }
     suffix
-}
-
-fn string_vec_arg(args: &Map<String, Value>, field: &str) -> Result<Vec<String>, McpError> {
-    let Some(value) = args.get(field) else {
-        return Ok(Vec::new());
-    };
-    let Some(values) = value.as_array() else {
-        return Err(McpError::invalid_request(
-            format!("{field} must be an array of strings"),
-            None,
-        ));
-    };
-    values
-        .iter()
-        .map(|value| {
-            value.as_str().map(str::to_owned).ok_or_else(|| {
-                McpError::invalid_request(format!("{field} must be an array of strings"), None)
-            })
-        })
-        .collect()
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1726,12 +1741,14 @@ async fn scheduler_start_task(
 ) -> Result<OrchestrationScheduledTask, String> {
     let profile = scheduler_resolve_profile(scheduler, &run_spec.profile)
         .ok_or_else(|| format!("profile '{}' is not enabled", run_spec.profile))?;
-    let command = profile_launch_command(&profile, run_spec.bypass_permissions)?;
+    let state = scheduler.orchestration.snapshot()?;
+    let command =
+        task_profile_launch_command(&state, &task.id, &profile, run_spec.bypass_permissions)?;
     scheduler_create_coding_session_with_command(
         &scheduler.node_executor,
         &run_spec.node_id.0,
         &scheduled.session,
-        command,
+        &command,
         Some(run_spec.workspace_path.as_str()),
         &profile,
     )
@@ -2599,14 +2616,6 @@ enum RuntimeWaitTarget {
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ProjectCreateArgs {
-    title: String,
-    description: String,
-    slug: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(deny_unknown_fields)]
 struct ProjectStatusUpdateArgs {
     project_id: String,
     status: ProjectStatus,
@@ -2858,7 +2867,27 @@ struct NodeWaitOptions<'a> {
     stability: f64,
 }
 
-struct TaskAwareStart {
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct StartCodingSessionArgs {
+    task_id: String,
+    node: String,
+    profile: String,
+    workspace_path: String,
+    bypass_permissions: bool,
+    role: String,
+    kind: String,
+    #[serde(default)]
+    skills: Vec<String>,
+    session: Option<String>,
+    #[serde(default)]
+    generate_session_name: bool,
+}
+
+struct CodingSessionStart {
+    node: String,
+    profile: CliProfile,
+    bypass_permissions: bool,
     session_name: String,
     workspace_path: String,
     task_id: TaskId,
@@ -3101,6 +3130,47 @@ impl TmuxMcpServer {
         Self::json_result(job.snapshot.clone())
     }
 
+    fn start_coding_session_tool_definition() -> Tool {
+        let mut schema = tool_schema(
+            json!({
+                "task_id": { "type": "string", "minLength": 1, "description": "Required existing task ID. Every session is attached to this task and uses its project's home for the selected profile." },
+                "profile": { "type": "string", "minLength": 1, "description": "Explicit enabled CLI profile name" },
+                "session": { "type": "string", "minLength": 1, "description": "Session name to create or adopt; alternatively set generate_session_name=true" },
+                "node": { "type": "string", "minLength": 1, "description": "Explicit execution node id, such as local" },
+                "workspace_path": { "type": "string", "minLength": 1, "description": "Required backend-owned workspace/start directory on the execution node" },
+                "bypass_permissions": { "type": "boolean", "description": "Explicitly choose whether to use the profile's permission_bypass_cmd, which may disable approvals or sandboxing" },
+                "role": { "type": "string", "minLength": 1, "description": "Task session role to persist" },
+                "kind": { "type": "string", "minLength": 1, "description": "Task participant kind to persist and use in generated session names" },
+                "skills": { "type": "array", "items": { "type": "string" }, "description": "Task session skills (default: empty list)" },
+                "generate_session_name": { "type": "boolean", "description": "Generate an orchestration-owned name mmux-{task_slug}-{kind}-{short_suffix}" }
+            }),
+            Some(vec![
+                "task_id",
+                "node",
+                "profile",
+                "workspace_path",
+                "bypass_permissions",
+                "role",
+                "kind",
+            ]),
+        );
+        schema.insert("additionalProperties".into(), json!(false));
+        schema.insert("anyOf".into(), json!([
+            {"required": ["session"]},
+            {"required": ["generate_session_name"], "properties": {"generate_session_name": {"const": true}}}
+        ]));
+        Tool::new("start_coding_session", "Create or adopt a coding CLI session for an existing task. A valid task_id is mandatory before any session is created or adopted. Returns without waiting for readiness; use wait_start kind=coding-ready.", Arc::new(schema))
+    }
+
+    fn project_home_properties() -> Map<String, Value> {
+        mmux_node::profiles::BuiltinProfile::all().into_iter().map(|profile| {
+            (format!("{}_home", profile.name()), json!({
+                "type": ["string", "null"],
+                "description": format!("Optional configuration home on the execution node (absolute path or ~/). Sets {} only for newly launched {} sessions. Omitted/null on create uses the CLI's inherited/default home; null on update clears the override.", profile.home_env_var(), profile.name())
+            }))
+        }).collect()
+    }
+
     fn orchestration_tool_definitions(enable_admin_tools: bool) -> Vec<Tool> {
         let mut tools = Vec::new();
         if enable_admin_tools {
@@ -3108,13 +3178,26 @@ impl TmuxMcpServer {
                 "project_create",
                 "Create an orchestration project boundary and return the created Project object directly",
                 Arc::new(tool_schema(
-                    json!({
-                        "title": { "type": "string" },
-                        "description": { "type": "string" },
-                        "slug": { "type": "string" }
-                    }),
+                    {
+                        let mut properties = Self::project_home_properties();
+                        properties.extend(json!({
+                            "title": { "type": "string" },
+                            "description": { "type": "string" },
+                            "slug": { "type": "string" }
+                        }).as_object().unwrap().clone());
+                        Value::Object(properties)
+                    },
                     Some(vec!["title", "description"]),
                 )),
+            ));
+        }
+        if enable_admin_tools {
+            let mut properties = Self::project_home_properties();
+            properties.insert("project_id".into(), json!({"type": "string", "description": "Project UUID id or globally unique project slug"}));
+            tools.push(Tool::new(
+                "project_update",
+                "Update project coder homes. Omitted fields remain unchanged; null clears an override. Applies to future launches, including recovery, without changing live sessions.",
+                Arc::new(tool_schema(Value::Object(properties), Some(vec!["project_id"]))),
             ));
         }
         tools.push(Tool::new(
@@ -3385,6 +3468,7 @@ impl TmuxMcpServer {
     ) -> Option<Result<CallToolResult, McpError>> {
         let result = match name {
             "project_create" => self.project_create_tool(args),
+            "project_update" => self.project_update_tool(args),
             "project_list" => self.project_list_tool(args),
             "project_status_update" => self.project_status_update_tool(args),
             "plan_create" => self.plan_create_tool(args),
@@ -3407,14 +3491,30 @@ impl TmuxMcpServer {
 
     fn project_create_tool(&self, args: Map<String, Value>) -> Result<CallToolResult, McpError> {
         self.policy.ensure_admin_tools_enabled("project_create")?;
-        let args: ProjectCreateArgs = parse_tool_args("project_create", args)?;
+        let args: CreateProject = parse_tool_args("project_create", args)?;
         let project = self
             .orchestration
-            .create_project(CreateProject {
-                title: args.title,
-                description: args.description,
-                slug: args.slug,
-            })
+            .create_project(args)
+            .map_err(mcp_invalid_request)?;
+        Self::json_result(project)
+    }
+
+    fn project_update_tool(
+        &self,
+        mut args: Map<String, Value>,
+    ) -> Result<CallToolResult, McpError> {
+        self.policy.ensure_admin_tools_enabled("project_update")?;
+        let project_id = args
+            .remove("project_id")
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .ok_or_else(|| mcp_invalid_request("project_id must be a string"))?;
+        let update: UpdateProject = parse_tool_args("project_update", args)?;
+        let state = self.orchestration.snapshot().map_err(mcp_invalid_request)?;
+        let project_id =
+            resolve_project_id_or_slug(&state, &project_id).map_err(mcp_invalid_request)?;
+        let project = self
+            .orchestration
+            .update_project(project_id, update)
             .map_err(mcp_invalid_request)?;
         Self::json_result(project)
     }
@@ -3629,6 +3729,16 @@ impl TmuxMcpServer {
         if self.resolve_profile(Some(&args.profile)).is_none() {
             return Err(McpError::invalid_request("unknown profile", None));
         }
+        let task_id = TaskId(args.task_id);
+        let previous_session = self
+            .orchestration
+            .snapshot()
+            .map_err(mcp_invalid_request)?
+            .tasks
+            .get(&task_id)
+            .ok_or_else(|| mcp_invalid_request(format!("task '{}' not found", task_id.0)))?
+            .session
+            .clone();
         if !self
             .node_session_exists(&args.node_id, &args.session)
             .await
@@ -3642,16 +3752,6 @@ impl TmuxMcpServer {
                 None,
             ));
         }
-        let task_id = TaskId(args.task_id);
-        let previous_session = self
-            .orchestration
-            .snapshot()
-            .map_err(mcp_invalid_request)?
-            .tasks
-            .get(&task_id)
-            .ok_or_else(|| mcp_invalid_request(format!("task '{}' not found", task_id.0)))?
-            .session
-            .clone();
         self.stop_replaced_task_session(previous_session.as_ref(), &args.node_id, &args.session)
             .await
             .map_err(mcp_invalid_request)?;
@@ -4213,7 +4313,7 @@ impl TmuxMcpServer {
         let mut recreated_count = 0;
         for action in plan_local_startup_reconciliation(&state, &live_sessions, &self.profiles) {
             match action {
-                LocalStartupReconciliationAction::Recreate { record } => {
+                LocalStartupReconciliationAction::Recreate { task_id, record } => {
                     let profile = match self.resolve_profile(Some(&record.profile)) {
                         Some(profile) => profile,
                         None => {
@@ -4225,8 +4325,12 @@ impl TmuxMcpServer {
                             continue;
                         }
                     };
-                    let command = match profile_launch_command(&profile, record.bypass_permissions)
-                    {
+                    let command = match task_profile_launch_command(
+                        &state,
+                        &task_id,
+                        &profile,
+                        record.bypass_permissions,
+                    ) {
                         Ok(command) => command,
                         Err(error) => {
                             warnings.push(format!(
@@ -4295,121 +4399,64 @@ impl TmuxMcpServer {
         }
     }
 
-    fn task_aware_start_metadata(
+    fn prepare_coding_session_start(
         &self,
-        args: &Map<String, Value>,
-    ) -> Result<Option<TaskAwareStart>, McpError> {
-        let has_task_metadata = ["task_id", "role", "kind", "skills"]
-            .iter()
-            .any(|field| args.contains_key(*field))
-            || args
-                .get("generate_session_name")
-                .and_then(|value| value.as_bool())
-                .unwrap_or(false);
-        if !has_task_metadata {
-            return Ok(None);
-        }
-
-        for field in ["profile", "node", "workspace_path", "bypass_permissions"] {
-            if !args.contains_key(field) {
-                return Err(McpError::invalid_request(
-                    format!("task-aware start_coding_session requires explicit {field}"),
-                    None,
-                ));
+        args: Map<String, Value>,
+    ) -> Result<CodingSessionStart, McpError> {
+        let args: StartCodingSessionArgs = parse_tool_args("start_coding_session", args)?;
+        for (field, value) in [
+            ("task_id", &args.task_id),
+            ("node", &args.node),
+            ("profile", &args.profile),
+            ("workspace_path", &args.workspace_path),
+            ("role", &args.role),
+            ("kind", &args.kind),
+        ] {
+            if value.trim().is_empty() {
+                return Err(mcp_invalid_request(format!(
+                    "{field} must be a non-empty string"
+                )));
             }
         }
-        for field in ["profile", "node", "workspace_path"] {
-            if args
-                .get(field)
-                .and_then(|value| value.as_str())
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .is_none()
-            {
-                return Err(McpError::invalid_request(
-                    format!("{field} must be a non-empty string"),
-                    None,
-                ));
-            }
-        }
-        if args
-            .get("bypass_permissions")
-            .and_then(|value| value.as_bool())
-            .is_none()
-        {
-            return Err(McpError::invalid_request(
-                "bypass_permissions must be a boolean",
-                None,
-            ));
-        }
-
-        let task_id = args
-            .get("task_id")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| McpError::invalid_request("task_id is required", None))?
-            .to_owned();
-        let role = args
-            .get("role")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| McpError::invalid_request("role is required", None))?
-            .to_owned();
-        let kind = args
-            .get("kind")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .ok_or_else(|| McpError::invalid_request("kind is required", None))?
-            .to_owned();
-        let skills = string_vec_arg(args, "skills")?;
-        let workspace_path = args
-            .get("workspace_path")
-            .and_then(|value| value.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned)
-            .ok_or_else(|| McpError::invalid_request("workspace_path is required", None))?;
-        let generate_session_name = args
-            .get("generate_session_name")
-            .and_then(|value| value.as_bool())
-            .unwrap_or(false);
-        if !generate_session_name && !args.contains_key("session") {
-            return Err(McpError::invalid_request(
-                "task-aware start_coding_session requires session or generate_session_name",
-                None,
-            ));
-        }
-
+        let task_id = TaskId(args.task_id.trim().to_owned());
         let state = self.orchestration.snapshot().map_err(mcp_invalid_request)?;
-        let task_id = TaskId(task_id);
         let task = state
             .tasks
             .get(&task_id)
             .ok_or_else(|| mcp_invalid_request(format!("task '{}' not found", task_id.0)))?;
-
-        let session_name = if generate_session_name {
-            generated_orchestration_session_name(&task.slug, &kind, &short_session_suffix())
+        let profile = self
+            .resolve_profile(Some(&args.profile))
+            .ok_or_else(|| mcp_invalid_request("unknown profile"))?;
+        let session_name = if args.generate_session_name {
+            generated_orchestration_session_name(
+                &task.slug,
+                args.kind.trim(),
+                &short_session_suffix(),
+            )
         } else {
-            args.get("session")
-                .and_then(|value| value.as_str())
+            args.session
+                .as_deref()
                 .map(str::trim)
                 .filter(|value| !value.is_empty())
-                .ok_or_else(|| McpError::invalid_request("session is required", None))?
+                .ok_or_else(|| {
+                    mcp_invalid_request(
+                        "start_coding_session requires session or generate_session_name=true",
+                    )
+                })?
                 .to_owned()
         };
-
-        Ok(Some(TaskAwareStart {
+        Ok(CodingSessionStart {
+            node: args.node.trim().to_owned(),
+            profile,
+            bypass_permissions: args.bypass_permissions,
             session_name,
-            workspace_path,
+            workspace_path: args.workspace_path.trim().to_owned(),
             task_id,
-            role,
-            kind,
-            skills,
+            role: args.role.trim().to_owned(),
+            kind: args.kind.trim().to_owned(),
+            skills: args.skills,
             previous_session: task.session.clone(),
-        }))
+        })
     }
 
     fn default_profile_name(&self) -> Option<&str> {
@@ -4440,75 +4487,58 @@ impl TmuxMcpServer {
                 None,
             ));
         }
-        let profile = self
-            .resolve_profile(args.get("profile").and_then(|v| v.as_str()))
-            .ok_or_else(|| McpError::invalid_request("unknown profile", None))?;
-        let task_metadata = self.task_aware_start_metadata(&args)?;
-        let node = args.get("node").and_then(|v| v.as_str()).unwrap_or("local");
-        let session_name = task_metadata
-            .as_ref()
-            .map(|metadata| metadata.session_name.as_str())
-            .or_else(|| args.get("session").and_then(|v| v.as_str()))
-            .unwrap_or(profile.name.as_str())
-            .to_owned();
-        let workspace_path = args
-            .get("workspace_path")
-            .and_then(|v| v.as_str())
-            .map(str::trim)
-            .filter(|value| !value.is_empty())
-            .map(str::to_owned);
-        let bypass_permissions = args
-            .get("bypass_permissions")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(false);
-        let cmd = profile_launch_command(&profile, bypass_permissions)
-            .map_err(|error| McpError::invalid_request(error, None))?;
-
+        let CodingSessionStart {
+            node,
+            profile,
+            bypass_permissions,
+            session_name,
+            workspace_path,
+            task_id,
+            role,
+            kind,
+            skills,
+            previous_session,
+        } = self.prepare_coding_session_start(args)?;
+        let state = self.orchestration.snapshot().map_err(mcp_invalid_request)?;
+        // Resolve the owning project before touching the node, even when the
+        // requested session already exists and would otherwise be adopted.
+        let cmd = task_profile_launch_command(&state, &task_id, &profile, bypass_permissions)
+            .map_err(mcp_invalid_request)?;
         let message = match self
             .create_coding_session_with_command(
-                node,
+                &node,
                 &session_name,
-                cmd,
-                workspace_path.as_deref(),
+                &cmd,
+                Some(&workspace_path),
                 &profile,
             )
             .await
         {
             Ok(message) => message,
-            Err(e) => return Ok(Self::error_result(e)),
+            Err(error) => return Ok(Self::error_result(error)),
         };
-
-        let session_record = if let Some(metadata) = task_metadata {
-            self.stop_replaced_task_session(
-                metadata.previous_session.as_ref(),
-                node,
-                &session_name,
-            )
+        self.stop_replaced_task_session(previous_session.as_ref(), &node, &session_name)
             .await
             .map_err(mcp_invalid_request)?;
-            Some(
-                self.orchestration
-                    .record_session(
-                        metadata.task_id,
-                        TaskSession {
-                            node_id: NodeId(node.to_owned()),
-                            session: SessionId(session_name.clone()),
-                            profile: profile.name.clone(),
-                            workspace_path: metadata.workspace_path,
-                            bypass_permissions,
-                            role: metadata.role,
-                            kind: metadata.kind,
-                            skills: metadata.skills,
-                            created_at_ms: 0,
-                            updated_at_ms: 0,
-                            last_seen_ms: 0,
-                        },
-                    )
-                    .map_err(mcp_invalid_request)?,
+        let session_record = self
+            .orchestration
+            .record_session(
+                task_id,
+                TaskSession {
+                    node_id: NodeId(node.clone()),
+                    session: SessionId(session_name.clone()),
+                    profile: profile.name.clone(),
+                    workspace_path: workspace_path.clone(),
+                    bypass_permissions,
+                    role,
+                    kind,
+                    skills,
+                    created_at_ms: 0,
+                    updated_at_ms: 0,
+                    last_seen_ms: 0,
+                },
             )
-        } else {
-            None
-        };
+            .map_err(mcp_invalid_request)?;
 
         Self::json_result(json!({
             "message": message,
@@ -4525,6 +4555,129 @@ impl TmuxMcpServer {
             },
             "session_record": session_record,
         }))
+    }
+
+    async fn exec_tool(&self, args: Map<String, Value>) -> Result<CallToolResult, McpError> {
+        let node = args.get("node").and_then(|v| v.as_str()).unwrap_or("local");
+        let command = args
+            .get("command")
+            .and_then(|v| v.as_str())
+            .ok_or_else(|| McpError::invalid_request("missing command", None))?;
+        let session = args
+            .get("session")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| mcp_invalid_request("exec requires an existing task-owned session"))?;
+        if args.contains_key("workspace_path") {
+            return Err(mcp_invalid_request("exec does not create sessions or accept workspace_path; use start_coding_session with a task_id"));
+        }
+        let state = self.orchestration.snapshot().map_err(mcp_invalid_request)?;
+        if !state.tasks.values().any(|task| {
+            task.session
+                .as_ref()
+                .is_some_and(|record| record.node_id.0 == node && record.session.0 == session)
+        }) {
+            return Err(mcp_invalid_request(format!(
+                "session '{session}' on node '{node}' is not attached to a task"
+            )));
+        }
+        let timeout = self
+            .policy
+            .clamp_timeout(
+                args.get("timeout_seconds")
+                    .and_then(|v| v.as_f64())
+                    .unwrap_or(30.0),
+            )
+            .map_err(|e| McpError::invalid_request(e, None))?;
+        let lines = args.get("lines").and_then(|v| v.as_u64()).unwrap_or(40) as usize;
+        let exists = match self.node_session_exists(node, session).await {
+            Ok(exists) => exists,
+            Err(error) => return Ok(Self::error_result(error)),
+        };
+        if !exists {
+            return Err(mcp_invalid_request(format!("session '{session}' on node '{node}' is not live; use start_coding_session with its task_id")));
+        }
+        let sentinel = format!(
+            "__MMUX_{}__",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap_or_default()
+                .as_nanos()
+        );
+        for text in [format!("echo '{}'", sentinel), command.to_owned()] {
+            let delay = coding_prompt_submit_delay(&text);
+            if let Err(error) = self
+                .node_tmux(
+                    node,
+                    vec![
+                        "send-keys".into(),
+                        "-l".into(),
+                        "-t".into(),
+                        session.into(),
+                        text,
+                    ],
+                    Duration::from_secs(20),
+                )
+                .await
+            {
+                return Ok(Self::error_result(error));
+            }
+            tokio::time::sleep(delay).await;
+            if let Err(error) = self
+                .node_tmux(
+                    node,
+                    vec![
+                        "send-keys".into(),
+                        "-t".into(),
+                        session.into(),
+                        "Enter".into(),
+                    ],
+                    Duration::from_secs(20),
+                )
+                .await
+            {
+                return Ok(Self::error_result(error));
+            }
+        }
+        if let Err(error) = self
+            .node_wait_for(
+                node,
+                session,
+                NodeWaitOptions {
+                    mode: "stable",
+                    sentinel: None,
+                    prompt: None,
+                    timeout,
+                    poll: 0.5,
+                    stability: 1.0,
+                },
+            )
+            .await
+        {
+            return Ok(Self::error_result(error));
+        }
+        match self.node_session_capture(node, session, None, true).await {
+            Ok(output) => {
+                let all_lines: Vec<&str> = output.lines().collect();
+                let sentinel_idx = all_lines
+                    .iter()
+                    .enumerate()
+                    .filter_map(|(i, line)| (line.trim() == sentinel).then_some(i))
+                    .next_back();
+                let result_lines: Vec<&str> = if let Some(idx) = sentinel_idx {
+                    all_lines.iter().skip(idx + 1).copied().collect()
+                } else {
+                    let start = all_lines.len().saturating_sub(lines);
+                    all_lines[start..].to_vec()
+                };
+                Ok(Self::text_result(
+                    self.policy
+                        .limit_capture_output(clean_exec_output(result_lines)),
+                ))
+            }
+            Err(e) => Ok(Self::error_result(e)),
+        }
     }
 
     async fn create_session_with_command(
@@ -6022,32 +6175,16 @@ impl ServerHandler for TmuxMcpServer {
                 ),
                 Tool::new(
                     "exec",
-                    "Execute a shell command in a session and return the output. Creates the session if it does not exist.",
+                    "Execute a shell command in an existing task-owned session. Never creates sessions; use start_coding_session with a valid task_id to launch a coder.",
                     Arc::new(tool_schema(json!({
                         "node": { "type": "string", "description": "Execution node id (default: local)" },
-                        "session": { "type": "string", "description": "Session name (default: mmux_shell)" },
+                        "session": { "type": "string", "description": "Required live session attached to a task" },
                         "command": { "type": "string", "description": "Shell command to execute" },
-                        "workspace_path": { "type": "string", "description": "Backend-owned workspace/start directory, only used when creating the session" },
                         "timeout_seconds": { "type": "number", "description": "Max seconds to wait for output (default: 30)" },
                         "lines": { "type": "integer", "description": "Lines of output to capture (default: 40)" }
-                    }), Some(vec!["command"]))),
+                    }), Some(vec!["session", "command"]))),
                 ),
-                Tool::new(
-                    "start_coding_session",
-                    "Create or adopt a coding CLI session from a profile-defined command. Does not wait for readiness; use wait_start kind=coding-ready.",
-                    Arc::new(tool_schema(json!({
-                        "profile": { "type": "string", "description": "CLI profile name (default: controller default coder profile)" },
-                        "session": { "type": "string", "description": "Session name (default: profile name)" },
-                        "node": { "type": "string", "description": "Execution node id (default: local)" },
-                        "workspace_path": { "type": "string", "description": "Backend-owned workspace/start directory for the selected node/backend. Used as the tmux start directory when creating the session." },
-                        "bypass_permissions": { "type": "boolean", "description": "Use the profile's explicit permission_bypass_cmd for this session. This may disable the coder CLI's approval prompts or sandboxing. Default: false." },
-                        "task_id": { "type": "string", "description": "Task ID to record this coder session against. Enables task-aware recording." },
-                        "role": { "type": "string", "description": "Task session role to persist when task_id is provided." },
-                        "kind": { "type": "string", "description": "Task participant kind to persist and use in generated orchestration session names." },
-                        "skills": { "type": "array", "items": { "type": "string" }, "description": "Task session skills to persist when task_id is provided." },
-                        "generate_session_name": { "type": "boolean", "description": "Generate an orchestration-owned session name mmux-{task_slug}-{kind}-{short_suffix}." }
-                    }), None)),
-                ),
+                Self::start_coding_session_tool_definition(),
                 // ── Session introspection ──
                 Tool::new(
                     "session_info",
@@ -6412,126 +6549,7 @@ impl ServerHandler for TmuxMcpServer {
                     Err(e) => Ok(Self::error_result(e)),
                 }
             }
-            "exec" => {
-                let command = args
-                    .get("command")
-                    .and_then(|v| v.as_str())
-                    .ok_or_else(|| McpError::invalid_request("missing command", None))?;
-                let session = args
-                    .get("session")
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("mmux_shell");
-                let workspace_path = args
-                    .get("workspace_path")
-                    .and_then(|v| v.as_str())
-                    .map(str::to_owned);
-                let timeout = self
-                    .policy
-                    .clamp_timeout(
-                        args.get("timeout_seconds")
-                            .and_then(|v| v.as_f64())
-                            .unwrap_or(30.0),
-                    )
-                    .map_err(|e| McpError::invalid_request(e, None))?;
-                let lines = args.get("lines").and_then(|v| v.as_u64()).unwrap_or(40) as usize;
-                let exists = match self.node_session_exists(node, session).await {
-                    Ok(exists) => exists,
-                    Err(error) => return Ok(Self::error_result(error)),
-                };
-                if !exists {
-                    if let Err(error) = self
-                        .create_session_with_command(
-                            node,
-                            session,
-                            "bash",
-                            workspace_path.as_deref(),
-                        )
-                        .await
-                    {
-                        return Ok(Self::error_result(error));
-                    }
-                }
-                let sentinel = format!(
-                    "__MMUX_{}__",
-                    std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_nanos()
-                );
-                for text in [format!("echo '{}'", sentinel), command.to_owned()] {
-                    let delay = coding_prompt_submit_delay(&text);
-                    if let Err(error) = self
-                        .node_tmux(
-                            node,
-                            vec![
-                                "send-keys".into(),
-                                "-l".into(),
-                                "-t".into(),
-                                session.into(),
-                                text,
-                            ],
-                            Duration::from_secs(20),
-                        )
-                        .await
-                    {
-                        return Ok(Self::error_result(error));
-                    }
-                    tokio::time::sleep(delay).await;
-                    if let Err(error) = self
-                        .node_tmux(
-                            node,
-                            vec![
-                                "send-keys".into(),
-                                "-t".into(),
-                                session.into(),
-                                "Enter".into(),
-                            ],
-                            Duration::from_secs(20),
-                        )
-                        .await
-                    {
-                        return Ok(Self::error_result(error));
-                    }
-                }
-                if let Err(error) = self
-                    .node_wait_for(
-                        node,
-                        session,
-                        NodeWaitOptions {
-                            mode: "stable",
-                            sentinel: None,
-                            prompt: None,
-                            timeout,
-                            poll: 0.5,
-                            stability: 1.0,
-                        },
-                    )
-                    .await
-                {
-                    return Ok(Self::error_result(error));
-                }
-                match self.node_session_capture(node, session, None, true).await {
-                    Ok(output) => {
-                        let all_lines: Vec<&str> = output.lines().collect();
-                        let sentinel_idx = all_lines
-                            .iter()
-                            .enumerate()
-                            .filter_map(|(i, line)| (line.trim() == sentinel).then_some(i))
-                            .next_back();
-                        let result_lines: Vec<&str> = if let Some(idx) = sentinel_idx {
-                            all_lines.iter().skip(idx + 1).copied().collect()
-                        } else {
-                            let start = all_lines.len().saturating_sub(lines);
-                            all_lines[start..].to_vec()
-                        };
-                        Ok(Self::text_result(
-                            self.policy
-                                .limit_capture_output(clean_exec_output(result_lines)),
-                        ))
-                    }
-                    Err(e) => Ok(Self::error_result(e)),
-                }
-            }
+            "exec" => self.exec_tool(args).await,
             // ── File operations ──
             "read_file" => {
                 let path = args
@@ -7128,7 +7146,7 @@ impl ServerHandler for TmuxMcpServer {
                             PromptMessageRole::User,
                             PromptMessageContent::Text {
                                 text: format!(
-                                    "You are driving a coding CLI via mmux.\n\nProfile: {}\nSession: {}\n\nWorkflow:\n1. Start the session with start_coding_session using the profile-defined command\n2. For initial task delegation, use coding_task_send with task_id_or_slug, template, and a concrete instruction; for follow-up or non-task prompts, use coding_send\n3. For validation/review spanning multiple tasks, pass context_task_ids so mmux renders operator-supplied task cards; do not ask the worker to call mmux for missing prior task results\n4. Start a coding-ready wait with wait_start kind=coding-ready and this profile\n5. Poll wait_status until completed, failed, or canceled\n6. Use coding_read to capture the output\n7. Use coding_action (approve/reject/cancel/escape) to interact\n\ncoding_task_send templates:\n- task: initial implementation/delegation\n- validate: task gates and objective validation; for task sets require field_coverage_table over supplied context_task_ids\n- review: correctness, regression, risk, missing-test, and scope-drift review\n- quality-guard: maintainability, architecture fit, naming, boundaries, lifecycle, API shape, and operator/project quality preferences\n\nTips:\n- orchestration_status is compact; use task_get when you need one full stored task body with objective, scope, gates, result fields, run spec, session, and edges\n- check_state is a quick non-blocking way to inspect has_prompt, promptable, busy, and turn_idle\n- promptable means the CLI can accept text; turn_idle means foreground work has settled\n- resize_pane can help if the TUI layout is broken\n- capture_output with scrollback:true gets full history\n- Use wait_start with sentinel or prompt kind to detect specific output strings",
+                                    "You are driving a coding CLI via mmux.\n\nProfile: {}\nSession: {}\n\nWorkflow:\n1. Create or select a task, then call start_coding_session with its task_id and explicit node, profile, workspace_path, bypass_permissions, role, and kind\n2. For initial task delegation, use coding_task_send with task_id_or_slug, template, and a concrete instruction; for follow-ups, use coding_send\n3. For validation/review spanning multiple tasks, pass context_task_ids so mmux renders operator-supplied task cards; do not ask the worker to call mmux for missing prior task results\n4. Start a coding-ready wait with wait_start kind=coding-ready and this profile\n5. Poll wait_status until completed, failed, or canceled\n6. Use coding_read to capture the output\n7. Use coding_action (approve/reject/cancel/escape) to interact\n\ncoding_task_send templates:\n- task: initial implementation/delegation\n- validate: task gates and objective validation; for task sets require field_coverage_table over supplied context_task_ids\n- review: correctness, regression, risk, missing-test, and scope-drift review\n- quality-guard: maintainability, architecture fit, naming, boundaries, lifecycle, API shape, and operator/project quality preferences\n\nTips:\n- orchestration_status is compact; use task_get when you need one full stored task body with objective, scope, gates, result fields, run spec, session, and edges\n- check_state is a quick non-blocking way to inspect has_prompt, promptable, busy, and turn_idle\n- promptable means the CLI can accept text; turn_idle means foreground work has settled\n- resize_pane can help if the TUI layout is broken\n- capture_output with scrollback:true gets full history\n- Use wait_start with sentinel or prompt kind to detect specific output strings",
                                     profile, session
                                 ),
                             },
@@ -8143,22 +8161,13 @@ fn local_project_entry(
 
 pub fn local_create_project(
     store_path: Option<&Path>,
-    title: String,
-    description: String,
-    slug: Option<String>,
+    input: CreateProject,
 ) -> Result<LocalProjectEntry, String> {
     let store_path = mmux_node::resolve_store_path(store_path)?;
     let store = store::OrchestrationStore::open(store_path)?;
     let mut state = store.load()?.unwrap_or_default();
     let now_ms = now_ms();
-    let project = state.create_project(
-        CreateProject {
-            title,
-            description,
-            slug,
-        },
-        now_ms,
-    )?;
+    let project = state.create_project(input, now_ms)?;
     store.save(&state, now_ms)?;
     Ok(local_project_entry(&state, &project))
 }
@@ -8893,6 +8902,10 @@ mod tests {
                 slug: project.slug,
                 title: project.title,
                 description: project.description,
+                codex_home: project.codex_home,
+                claude_home: project.claude_home,
+                opencode_home: project.opencode_home,
+                kimi_home: project.kimi_home,
                 status: project.status,
                 created_at_ms: 0,
                 updated_at_ms: project.updated_at_ms,
@@ -9108,7 +9121,22 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(non_admin_names.contains(&"project_list"));
         assert!(!non_admin_names.contains(&"project_create"));
+        assert!(admin_names.contains(&"project_update"));
+        assert!(!non_admin_names.contains(&"project_update"));
         assert!(!non_admin_names.contains(&"project_status_update"));
+        for (name, required) in [
+            ("project_create", json!(["title", "description"])),
+            ("project_update", json!(["project_id"])),
+        ] {
+            let tool = admin_tools.iter().find(|tool| tool.name == name).unwrap();
+            assert_eq!(tool.input_schema["required"], required);
+            for field in ["codex_home", "claude_home", "opencode_home", "kimi_home"] {
+                assert_eq!(
+                    tool.input_schema["properties"][field]["type"],
+                    json!(["string", "null"])
+                );
+            }
+        }
     }
 
     #[tokio::test]
@@ -9165,6 +9193,16 @@ mod tests {
             create_error.message.contains("--enable-admin-tools"),
             "{create_error}"
         );
+
+        let update_error = call_orchestration(
+            &server,
+            "project_update",
+            json!({
+                "project_id": "missing", "codex_home": "/node/codex"
+            }),
+        )
+        .unwrap_err();
+        assert!(update_error.message.contains("--enable-admin-tools"));
 
         let status_error = call_orchestration(
             &server,
@@ -9229,6 +9267,7 @@ mod tests {
                     title: "Project".into(),
                     description: "Test project".into(),
                     slug: None,
+                    ..Default::default()
                 },
                 90,
             )
@@ -9356,6 +9395,7 @@ mod tests {
                     title: "Delete Project".into(),
                     description: "Project to delete".into(),
                     slug: Some("delete-project".into()),
+                    ..Default::default()
                 },
                 90,
             )
@@ -9366,6 +9406,7 @@ mod tests {
                     title: "Kept Project".into(),
                     description: "Project to keep".into(),
                     slug: Some("kept-project".into()),
+                    ..Default::default()
                 },
                 91,
             )
@@ -9485,6 +9526,7 @@ mod tests {
                     title: "Project".into(),
                     description: "Test project".into(),
                     slug: None,
+                    ..Default::default()
                 },
                 90,
             )
@@ -9569,7 +9611,7 @@ mod tests {
 
         assert!(matches!(
             actions.as_slice(),
-            [LocalStartupReconciliationAction::Recreate { record }]
+            [LocalStartupReconciliationAction::Recreate { record, .. }]
                 if record.session.0 == "mmux-active"
         ));
     }
@@ -9629,6 +9671,7 @@ mod tests {
                     title: "Project".into(),
                     description: "Test project".into(),
                     slug: None,
+                    ..Default::default()
                 },
                 90,
             )
@@ -11901,7 +11944,7 @@ mod tests {
             .await
             .unwrap_err();
 
-        assert!(error.message.contains("explicit workspace_path"), "{error}");
+        assert!(error.message.contains("workspace_path"), "{error}");
         assert!(server
             .orchestration
             .snapshot()
@@ -11915,38 +11958,382 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_start_coding_session_without_task_fields_returns_nonblocking_metadata() {
-        let dir = unique_temp_dir("mmux-mcp-start");
-        let local_dir = unique_temp_dir("mmux-mcp-start-local");
-        let workspace = unique_temp_dir("mmux-mcp-start-workspace");
+    async fn test_project_homes_mcp_updates_persist_and_apply_without_restart() {
+        let dir = unique_temp_dir("mmux-project-homes");
+        let local_dir = unique_temp_dir("mmux-project-homes-local");
+        let workspace = unique_temp_dir("mmux-project-homes-workspace");
         fs::create_dir_all(&workspace).unwrap();
-        let server = test_coding_server(&dir, &local_dir, profile_registry(ready_profile())).await;
-
-        let result = server
+        let mut profile = ready_profile();
+        profile.cmd = Some("sh -c 'printf \"%s\" \"$CODEX_HOME\" > observed-home; printf READY; while IFS= read -r line; do printf READY; done'".into());
+        let server = test_coding_server(&dir, &local_dir, profile_registry(profile.clone())).await;
+        let project: Project = result_json(
+            &call_orchestration(
+                &server,
+                "project_create",
+                json!({
+                    "title": "Project homes", "description": "Configuration per project",
+                    "codex_home": "/node/first codex", "claude_home": "/node/claude",
+                    "opencode_home": "/node/opencode", "kimi_home": "/node/kimi"
+                }),
+            )
+            .unwrap(),
+        );
+        let task = create_test_task_in_project(&server, &project, "Homes task").await;
+        let other = create_test_project(&server, "Other project").await;
+        let other_task = create_test_task_in_project(&server, &other, "Defaults task").await;
+        let state = server.orchestration.snapshot().unwrap();
+        assert_eq!(
+            task_profile_launch_command(&state, &other_task.id, &profile, false).unwrap(),
+            profile.cmd.as_deref().unwrap()
+        );
+        let started = server
             .start_coding_session_tool(object_args(json!({
-                "profile": "codex",
-                "session": "plain-start",
-                "node": "local",
-                "workspace_path": workspace.to_string_lossy()
+                "profile": "codex", "session": "mmux-project-homes", "node": "local",
+                "workspace_path": workspace, "bypass_permissions": false,
+                "task_id": task.id.0, "role": "worker", "kind": "implementation", "skills": []
             })))
             .await
             .unwrap();
+        assert!(
+            !started.is_error.unwrap_or(false),
+            "{}",
+            result_text(&started)
+        );
+        assert_eq!(
+            fs::read_to_string(workspace.join("observed-home")).unwrap(),
+            "/node/first codex"
+        );
 
-        let payload: Value = result_json(&result);
-        assert_eq!(payload["session"], "plain-start");
-        assert_eq!(payload["profile"], "codex");
-        assert_eq!(payload["readiness"]["status"], "not_waited");
-        assert_eq!(payload["readiness"]["next_tool"], "wait_start");
-        assert!(payload["session_record"].is_null());
-        assert!(server
-            .orchestration
-            .snapshot()
+        // An update changes live controller state immediately, but does not
+        // restart an existing CLI. Scheduler starts use the updated project.
+        call_orchestration(
+            &server,
+            "project_update",
+            json!({
+                "project_id": project.slug, "codex_home": "/node/second's codex"
+            }),
+        )
+        .unwrap();
+        assert!(test_session_exists(&server, "mmux-project-homes").await);
+        assert_eq!(
+            fs::read_to_string(workspace.join("observed-home")).unwrap(),
+            "/node/first codex"
+        );
+        test_kill_session(&server, "mmux-project-homes").await;
+        call_orchestration(
+            &server,
+            "task_update",
+            json!({
+                "task_id": task.id.0, "run_spec": {
+                    "node_id": "local", "profile": "codex", "workspace_path": workspace,
+                    "bypass_permissions": false, "role": "worker", "kind": "implementation",
+                    "skills": [], "template": "task", "instruction": "Check configuration home."
+                }
+            }),
+        )
+        .unwrap();
+        let started: TaskStartReport = result_json(
+            &server
+                .task_start_tool(object_args(json!({
+                    "task_id_or_slug": task.id.0
+                })))
+                .await
+                .unwrap(),
+        );
+        assert_eq!(started.action, "started");
+        let session = started.task.unwrap().session;
+        assert_eq!(
+            fs::read_to_string(workspace.join("observed-home")).unwrap(),
+            "/node/second's codex"
+        );
+        test_kill_session(&server, &session).await;
+
+        call_orchestration(
+            &server,
+            "project_update",
+            json!({
+                "project_id": project.id.0, "codex_home": "/node/recovery"
+            }),
+        )
+        .unwrap();
+        server
+            .reconcile_startup_local_sessions_with_timing(StartupZombieSweepTiming {
+                min_window: Duration::from_millis(10),
+                poll_interval: Duration::from_millis(10),
+                quiet_window: Duration::from_millis(10),
+                max_window: Duration::from_secs(1),
+            })
+            .await;
+        assert!(test_session_exists(&server, &session).await);
+        assert_eq!(
+            fs::read_to_string(workspace.join("observed-home")).unwrap(),
+            "/node/recovery"
+        );
+        test_kill_session(&server, &session).await;
+        let reloaded = orchestration_actor::OrchestrationHandle::open(Some(&dir)).unwrap();
+        assert_eq!(
+            reloaded.snapshot().unwrap().projects[&project.id]
+                .codex_home
+                .as_deref(),
+            Some("/node/recovery")
+        );
+        let projects: Vec<ProjectSummary> =
+            result_json(&call_orchestration(&server, "project_list", json!({})).unwrap());
+        assert_eq!(
+            projects
+                .iter()
+                .find(|p| p.id == project.id)
+                .unwrap()
+                .codex_home
+                .as_deref(),
+            Some("/node/recovery")
+        );
+        call_orchestration(
+            &server,
+            "project_update",
+            json!({"project_id": project.slug, "codex_home": null}),
+        )
+        .unwrap();
+        let state = server.orchestration.snapshot().unwrap();
+        assert_eq!(
+            task_profile_launch_command(&state, &task.id, &profile, false).unwrap(),
+            profile.cmd.as_deref().unwrap()
+        );
+        assert_eq!(
+            state.projects[&project.id].claude_home.as_deref(),
+            Some("/node/claude")
+        );
+        let persisted = orchestration_actor::OrchestrationHandle::open(Some(&dir))
             .unwrap()
-            .tasks
-            .values()
-            .all(|task| task.session.is_none()));
-        test_kill_session(&server, "plain-start").await;
+            .snapshot()
+            .unwrap();
+        assert!(persisted.projects[&project.id].codex_home.is_none());
+        assert!(call_orchestration(
+            &server,
+            "project_update",
+            json!({"project_id": project.id.0, "codex_home": 3})
+        )
+        .is_err());
+        assert!(call_orchestration(
+            &server,
+            "project_update",
+            json!({"project_id": project.id.0, "unknown_home": "/bad"})
+        )
+        .is_err());
         let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(local_dir);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn test_start_coding_session_schema_requires_task_and_runtime_choices() {
+        let tool = TmuxMcpServer::start_coding_session_tool_definition();
+        let required = tool.input_schema["required"].as_array().unwrap();
+        for field in [
+            "task_id",
+            "node",
+            "profile",
+            "workspace_path",
+            "bypass_permissions",
+            "role",
+            "kind",
+        ] {
+            assert!(required.contains(&json!(field)), "missing {field}");
+        }
+        assert_eq!(tool.input_schema["properties"]["task_id"]["type"], "string");
+        assert_eq!(tool.input_schema["properties"]["task_id"]["minLength"], 1);
+        assert_eq!(tool.input_schema["additionalProperties"], false);
+        assert_eq!(
+            tool.input_schema["anyOf"][0]["required"],
+            json!(["session"])
+        );
+        assert_eq!(
+            tool.input_schema["anyOf"][1]["properties"]["generate_session_name"]["const"],
+            true
+        );
+    }
+
+    #[tokio::test]
+    async fn test_start_coding_session_rejects_invalid_tasks_before_creation_or_adoption() {
+        let dir = unique_temp_dir("mmux-start-task-required");
+        let local_dir = unique_temp_dir("mmux-start-task-required-local");
+        let profiles = Arc::new(
+            mmux_node::profiles::BuiltinProfile::all()
+                .into_iter()
+                .map(|builtin| {
+                    let mut profile = ready_profile();
+                    profile.name = builtin.name().into();
+                    (profile.name.clone(), profile)
+                })
+                .collect(),
+        );
+        let server = test_coding_server(&dir, &local_dir, profiles).await;
+        test_create_session(&server, "existing-unowned", "sleep 30").await;
+        for profile in ["codex", "claude", "kimi", "opencode"] {
+            // Reproduce the original profile-and-directory-only launch.
+            let error = server
+                .start_coding_session_tool(object_args(json!({
+                    "profile": profile, "workspace_path": "/tmp"
+                })))
+                .await
+                .unwrap_err();
+            assert!(error.message.contains("task_id"), "{error}");
+            for session in ["must-not-create", "existing-unowned"] {
+                for task_id in [
+                    None,
+                    Some(Value::Null),
+                    Some(json!("")),
+                    Some(json!("  ")),
+                    Some(json!(17)),
+                    Some(json!("missing-task")),
+                ] {
+                    let mut args = object_args(json!({
+                        "profile": profile, "node": "local", "session": session,
+                        "workspace_path": "/tmp", "bypass_permissions": false,
+                        "role": "worker", "kind": "coder"
+                    }));
+                    if let Some(task_id) = task_id {
+                        args.insert("task_id".into(), task_id);
+                    }
+                    let error = server.start_coding_session_tool(args).await.unwrap_err();
+                    assert!(
+                        error.message.contains("task") || error.message.contains("invalid type"),
+                        "{error}"
+                    );
+                }
+            }
+            assert!(!test_session_exists(&server, "must-not-create").await);
+            assert!(!test_session_exists(&server, profile).await);
+        }
+        assert!(test_session_exists(&server, "existing-unowned").await);
+        assert!(server.orchestration.snapshot().unwrap().tasks.is_empty());
+        test_kill_session(&server, "existing-unowned").await;
+        let _ = fs::remove_dir_all(local_dir);
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn test_start_coding_session_rejects_incomplete_runtime_metadata() {
+        let dir = unique_temp_dir("mmux-start-metadata-required");
+        let server =
+            test_orchestration_server_with_profiles(&dir, profile_registry(ready_profile())).await;
+        let task = create_test_task(&server, "Runtime required").await;
+        let base = object_args(json!({
+            "task_id": task.id.0, "profile": "codex", "node": "unreachable",
+            "workspace_path": "/tmp", "bypass_permissions": false, "role": "worker",
+            "kind": "coder", "generate_session_name": true
+        }));
+        for field in [
+            "node",
+            "profile",
+            "workspace_path",
+            "bypass_permissions",
+            "role",
+            "kind",
+        ] {
+            let mut args = base.clone();
+            args.remove(field);
+            let error = server.start_coding_session_tool(args).await.unwrap_err();
+            assert!(error.message.contains(field), "{error}");
+        }
+        for invalid in [Value::Null, json!(false), json!("true")] {
+            let mut args = base.clone();
+            args.insert("generate_session_name".into(), invalid);
+            assert!(server.start_coding_session_tool(args).await.is_err());
+        }
+        assert!(server.orchestration.snapshot().unwrap().tasks[&task.id]
+            .session
+            .is_none());
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn test_session_record_rejects_unknown_task_before_node_access() {
+        let dir = unique_temp_dir("mmux-record-task-required");
+        let server =
+            test_orchestration_server_with_profiles(&dir, profile_registry(ready_profile())).await;
+        let error = server
+            .session_record_tool(object_args(json!({
+                "task_id": "missing-task", "profile": "codex", "node_id": "unreachable",
+                "session": "existing-worker", "workspace_path": "/tmp",
+                "bypass_permissions": false, "role": "worker", "kind": "coder"
+            })))
+            .await
+            .unwrap_err();
+        assert!(
+            error.message.contains("task 'missing-task' not found"),
+            "{error}"
+        );
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn test_exec_requires_a_live_task_owned_session_and_never_creates_one() {
+        let dir = unique_temp_dir("mmux-exec-task-required");
+        let local_dir = unique_temp_dir("mmux-exec-task-required-local");
+        let server = test_coding_server(&dir, &local_dir, profile_registry(ready_profile())).await;
+        test_create_session(&server, "shell-worker", "bash --noprofile --norc").await;
+        let error = server
+            .exec_tool(object_args(json!({
+                "node": "local", "session": "shell-worker", "command": "printf FORBIDDEN"
+            })))
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("not attached to a task"), "{error}");
+        let output = server
+            .node_session_capture("local", "shell-worker", None, true)
+            .await
+            .unwrap();
+        assert!(!output.contains("FORBIDDEN"));
+        assert!(server
+            .exec_tool(object_args(json!({"command": "printf FORBIDDEN"})))
+            .await
+            .is_err());
+        assert!(!test_session_exists(&server, "mmux_shell").await);
+        let error = server
+            .exec_tool(object_args(json!({
+                "session": "must-not-create", "command": "printf FORBIDDEN"
+            })))
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("not attached to a task"), "{error}");
+        assert!(!test_session_exists(&server, "must-not-create").await);
+        let task = create_test_task(&server, "Shell task").await;
+        call_session_record(
+            &server,
+            json!({
+                "task_id": task.id.0, "node_id": "local", "session": "shell-worker",
+                "profile": "codex", "workspace_path": "/tmp", "bypass_permissions": false,
+                "role": "worker", "kind": "shell"
+            }),
+        )
+        .await
+        .unwrap();
+        let result = server
+            .exec_tool(object_args(json!({
+                "session": "shell-worker", "command": "echo TASK_EXEC_OK", "timeout_seconds": 3
+            })))
+            .await
+            .unwrap();
+        assert!(
+            !result.is_error.unwrap_or(false),
+            "{}",
+            result_text(&result)
+        );
+        assert!(
+            result_text(&result).contains("TASK_EXEC_OK"),
+            "{}",
+            result_text(&result)
+        );
+        test_kill_session(&server, "shell-worker").await;
+        let error = server
+            .exec_tool(object_args(json!({
+                "session": "shell-worker", "command": "printf FORBIDDEN"
+            })))
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("not live"), "{error}");
+        assert!(!test_session_exists(&server, "shell-worker").await);
         let _ = fs::remove_dir_all(local_dir);
         let _ = fs::remove_dir_all(dir);
     }
@@ -12071,6 +12458,7 @@ mod tests {
                     title: "MMUX".into(),
                     description: "Test project".into(),
                     slug: None,
+                    ..Default::default()
                 },
                 100,
             )
@@ -12160,6 +12548,7 @@ mod tests {
                     title: "MMUX".into(),
                     description: "Test project".into(),
                     slug: None,
+                    ..Default::default()
                 },
                 100,
             )
@@ -12206,6 +12595,7 @@ mod tests {
                     title: "MMUX".into(),
                     description: "Test project".into(),
                     slug: None,
+                    ..Default::default()
                 },
                 100,
             )
@@ -12261,6 +12651,7 @@ mod tests {
                     title: "MMUX".into(),
                     description: "Test project".into(),
                     slug: None,
+                    ..Default::default()
                 },
                 100,
             )
@@ -12352,6 +12743,7 @@ mod tests {
                     title: "MMUX".into(),
                     description: "Test project".into(),
                     slug: None,
+                    ..Default::default()
                 },
                 100,
             )
@@ -12419,6 +12811,7 @@ mod tests {
                     title: "First".into(),
                     description: "Test project".into(),
                     slug: None,
+                    ..Default::default()
                 },
                 100,
             )
@@ -12429,6 +12822,7 @@ mod tests {
                     title: "Second".into(),
                     description: "Test project".into(),
                     slug: None,
+                    ..Default::default()
                 },
                 101,
             )
